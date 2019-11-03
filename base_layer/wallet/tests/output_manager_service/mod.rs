@@ -43,6 +43,7 @@ use tari_wallet::output_manager_service::{
     error::{OutputManagerError, OutputManagerStorageError},
     handle::OutputManagerHandle,
     storage::memory_db::OutputManagerMemoryDatabase,
+    MasterKeyType,
     OutputManagerConfig,
     OutputManagerServiceInitializer,
 };
@@ -72,8 +73,7 @@ fn sending_transaction_and_confirmation() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -153,8 +153,7 @@ fn send_not_enough_funds() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -182,8 +181,7 @@ fn send_no_change() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -254,8 +252,7 @@ fn send_not_enough_for_change() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -291,8 +288,7 @@ fn receiving_and_confirmation() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -324,8 +320,7 @@ fn cancel_transaction() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -360,8 +355,7 @@ fn timeout_transaction() {
 
     let runtime = Runtime::new().unwrap();
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -403,8 +397,7 @@ fn test_get_balance() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -434,8 +427,7 @@ fn test_confirming_received_output() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: Some(secret_key),
-        seed_words: None,
+        master_key: MasterKeyType::MasterSeed(secret_key),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });
@@ -464,8 +456,7 @@ fn test_seed_words() {
     let runtime = Runtime::new().unwrap();
 
     let (mut oms, _shutdown) = setup_output_manager_service(&runtime, OutputManagerConfig {
-        master_key: None,
-        seed_words: Some(seed_words.clone()),
+        master_key: MasterKeyType::SeedWords(seed_words.clone()),
         branch_seed: "".to_string(),
         primary_key_index: 0,
     });

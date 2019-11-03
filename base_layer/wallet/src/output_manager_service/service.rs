@@ -25,6 +25,7 @@ use crate::{
         error::OutputManagerError,
         handle::{OutputManagerRequest, OutputManagerResponse},
         storage::database::{OutputManagerBackend, OutputManagerDatabase, PendingTransactionOutputs},
+        MasterKeyType,
         OutputManagerConfig,
         TxId,
     },
@@ -75,30 +76,25 @@ where T: OutputManagerBackend
         db: OutputManagerDatabase<T>,
     ) -> Result<OutputManagerService<T>, OutputManagerError>
     {
-        if config.master_key.is_none() && config.seed_words.is_none() {
-            return Err(OutputManagerError::InvalidConfig);
-        }
-
-        if config.master_key.is_some() {
-            Ok(OutputManagerService {
+        match config.master_key {
+            MasterKeyType::MasterSeed(k) => Ok(OutputManagerService {
                 key_manager: Mutex::new(KeyManager::<PrivateKey, KeyDigest>::from(
-                    config.master_key.ok_or(OutputManagerError::InvalidConfig)?,
+                    k,
                     config.branch_seed,
                     config.primary_key_index,
                 )),
                 db,
                 request_stream: Some(request_stream),
-            })
-        } else {
-            Ok(OutputManagerService {
+            }),
+            MasterKeyType::SeedWords(sw) => Ok(OutputManagerService {
                 key_manager: Mutex::new(KeyManager::<PrivateKey, KeyDigest>::from_mnemonic(
-                    &config.seed_words.ok_or(OutputManagerError::InvalidConfig)?,
+                    &sw,
                     config.branch_seed,
                     config.primary_key_index,
                 )?),
                 db,
                 request_stream: Some(request_stream),
-            })
+            }),
         }
     }
 

@@ -59,6 +59,7 @@ use tari_wallet::{
         handle::OutputManagerHandle,
         service::OutputManagerService,
         storage::{database::OutputManagerDatabase, memory_db::OutputManagerMemoryDatabase},
+        MasterKeyType,
         OutputManagerConfig,
         OutputManagerServiceInitializer,
     },
@@ -86,8 +87,7 @@ pub fn setup_transaction_service(
         .add_initializer(CommsOutboundServiceInitializer::new(dht.outbound_requester()))
         .add_initializer(OutputManagerServiceInitializer::new(
             OutputManagerConfig {
-                master_key: Some(master_key),
-                seed_words: None,
+                master_key: MasterKeyType::MasterSeed(master_key),
                 branch_seed: "".to_string(),
                 primary_key_index: 0,
             },
@@ -124,8 +124,7 @@ pub fn setup_transaction_service_no_comms(
     let output_manager_service = OutputManagerService::new(
         oms_request_receiver,
         OutputManagerConfig {
-            master_key: Some(master_key),
-            seed_words: None,
+            master_key: MasterKeyType::MasterSeed(master_key),
             branch_seed: "".to_string(),
             primary_key_index: 0,
         },
@@ -265,7 +264,7 @@ fn manage_single_transaction() {
     }
     for (k, v) in bob_pending_inbound_tx.iter() {
         assert_eq!(*k, alice_tx_id);
-        if let RecipientState::Finalized(rsm) = &v.state {
+        if let RecipientState::Finalized(rsm) = &v.receiver_protocol.state {
             runtime
                 .block_on(bob_oms.confirm_received_output(alice_tx_id, rsm.output.clone()))
                 .unwrap();
