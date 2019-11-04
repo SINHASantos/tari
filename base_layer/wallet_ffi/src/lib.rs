@@ -45,9 +45,10 @@ use tari_transactions::tari_amount::MicroTari;
 use tari_utilities::ByteArray;
 use tari_wallet::wallet::{Wallet, WalletConfig};
 
+use core::ptr;
 use std::{sync::Arc, time::Duration};
 use tari_comms::{connection::NetAddress, control_service::ControlServiceConfig, peer_manager::PeerFeatures};
-use tari_crypto::keys::PublicKey;
+use tari_crypto::{keys::PublicKey, ristretto::RistrettoPublicKey};
 use tari_utilities::hex::Hex;
 use tari_wallet::{
     contacts_service::storage::database::Contact,
@@ -55,6 +56,7 @@ use tari_wallet::{
     test_utils::generate_wallet_test_data,
 };
 use tokio::runtime::Runtime;
+use tari_wallet::transaction_service::storage::database::{CompletedTransaction, OutboundTransaction, InboundTransaction};
 
 pub type TariWallet = tari_wallet::wallet::Wallet<WalletMemoryDatabase>;
 pub type TariWalletConfig = tari_wallet::wallet::WalletConfig;
@@ -63,7 +65,12 @@ pub type TariPublicKey = tari_comms::types::CommsPublicKey;
 pub type TariPrivateKey = tari_comms::types::CommsSecretKey;
 pub type TariCommsConfig = tari_p2p::initialization::CommsConfig;
 pub type TariContact = tari_wallet::contacts_service::storage::database::Contact;
-
+pub type TariCompletedTransaction = tari_wallet::transaction_service::storage::database::CompletedTransaction;
+pub struct TariCompletedTransactions(Vec<TariCompletedTransaction>);
+pub type TariPendingInboundTransaction = tari_wallet::transaction_service::storage::database::InboundTransaction;
+pub struct TariPendingInboundTransactions(Vec<TariPendingInboundTransaction>);
+pub type TariPendingOutboundTransaction = tari_wallet::transaction_service::storage::database::OutboundTransaction;
+pub struct TariPendingOutboundTransactions(Vec<TariPendingOutboundTransaction>);
 pub struct TariContacts(Vec<TariContact>);
 pub struct ByteVector(Vec<c_uchar>); // declared like this so that it can be exposed to external header
 
@@ -84,6 +91,9 @@ pub unsafe extern "C" fn byte_vector_create(byte_array: *const c_uchar, element_
     if !byte_array.is_null() {
         let array: &[c_uchar] = slice::from_raw_parts(byte_array, element_count as usize);
         bytes.0 = array.to_vec();
+        if bytes.0.len() != element_count as usize {
+            return ptr::null_mut();
+        }
     }
     Box::into_raw(Box::new(bytes))
 }
@@ -97,8 +107,20 @@ pub unsafe extern "C" fn byte_vector_destroy(bytes: *mut ByteVector) {
 
 /// returns c_uchar at position in internal vector
 #[no_mangle]
-pub unsafe extern "C" fn byte_vector_get_at(ptr: *mut ByteVector, i: c_int) -> c_uchar {
-    // TODO Bound checking the length of these vectors
+pub unsafe extern "C" fn byte_vector_get_at(ptr: *mut ByteVector, position: c_int) -> c_uchar {
+    if ptr.is_null() {
+        return 0 as c_uchar;
+    }
+    let mut i = byte_vector_get_length(ptr)-1; // clamp to length
+    if i < 0
+    {
+        return 0 as c_uchar;
+    }
+    if position < 0 {
+        i = 0; // clamp
+    } else if position <= i {
+        i = position;
+    }
     (*ptr).0.clone()[i as usize]
 }
 
@@ -117,12 +139,17 @@ pub unsafe extern "C" fn byte_vector_get_length(vec: *const ByteVector) -> c_int
 
 #[no_mangle]
 pub unsafe extern "C" fn public_key_create(bytes: *mut ByteVector) -> *mut TariPublicKey {
-    let mut v = Vec::new();
+    let v;
     if !bytes.is_null() {
         v = (*bytes).0.clone();
+    } else {
+        return ptr::null_mut();
     }
-    let pk = TariPublicKey::from_bytes(&v).unwrap();
-    Box::into_raw(Box::new(pk))
+    let pk = TariPublicKey::from_bytes(&v);
+    match pk {
+        Ok(pk) => Box::into_raw(Box::new(pk)),
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -137,29 +164,53 @@ pub unsafe extern "C" fn public_key_get_key(pk: *mut TariPublicKey) -> *mut Byte
     let mut bytes = ByteVector(Vec::new());
     if !pk.is_null() {
         bytes.0 = (*pk).to_vec();
+    } else {
+        return ptr::null_mut();
     }
     Box::into_raw(Box::new(bytes))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn public_key_from_private_key(secret_key: *mut TariPrivateKey) -> *mut TariPublicKey {
+    if secret_key.is_null() {
+        return ptr::null_mut();
+    }
     let m = TariPublicKey::from_secret_key(&(*secret_key));
-    //    println!("PK: {:?}", m);
     Box::into_raw(Box::new(m))
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn public_key_from_hex(key: *const c_char) -> *mut TariPublicKey {
+    let key_str;
+    if !key.is_null() {
+        key_str = CStr::from_ptr(key).to_str().unwrap().to_owned();
+    } else {
+        return ptr::null_mut();
+    }
+
+    let public_key = TariPublicKey::from_hex(key_str.as_str());
+    match public_key {
+        Ok(public_key) => Box::into_raw(Box::new(public_key)),
+        Err(_) => ptr::null_mut(),
+    }
+}
 /// -------------------------------------------------------------------------------------------- ///
 
 /// -------------------------------- Private Key ----------------------------------------------- ///
 
 #[no_mangle]
 pub unsafe extern "C" fn private_key_create(bytes: *mut ByteVector) -> *mut TariPrivateKey {
-    let mut v = Vec::new();
+    let v;
     if !bytes.is_null() {
         v = (*bytes).0.clone();
+    } else {
+        return ptr::null_mut();
     }
-    let pk = TariPrivateKey::from_bytes(&v).unwrap();
-    Box::into_raw(Box::new(pk))
+    let pk = TariPrivateKey::from_bytes(&v);
+    match pk {
+        Ok(pk) => Box::into_raw(Box::new(pk)),
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -174,6 +225,8 @@ pub unsafe extern "C" fn private_key_get_byte_vector(pk: *mut TariPrivateKey) ->
     let mut bytes = ByteVector(Vec::new());
     if !pk.is_null() {
         bytes.0 = (*pk).to_vec();
+    } else {
+        return ptr::null_mut();
     }
     Box::into_raw(Box::new(bytes))
 }
@@ -187,13 +240,19 @@ pub unsafe extern "C" fn private_key_generate() -> *mut TariPrivateKey {
 
 #[no_mangle]
 pub unsafe extern "C" fn private_key_from_hex(key: *const c_char) -> *mut TariPrivateKey {
-    let mut key_str = CString::new("").unwrap().to_str().unwrap().to_owned();
+    let key_str;
     if !key.is_null() {
         key_str = CStr::from_ptr(key).to_str().unwrap().to_owned();
+    } else {
+        return ptr::null_mut();
     }
 
-    let secret_key = TariPrivateKey::from_hex(key_str.as_str()).unwrap();
-    Box::into_raw(Box::new(secret_key))
+    let secret_key = TariPrivateKey::from_hex(key_str.as_str());
+
+    match secret_key {
+        Ok(secret_key) => Box::into_raw(Box::new(secret_key)),
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 /// -------------------------------------------------------------------------------------------- ///
@@ -202,25 +261,22 @@ pub unsafe extern "C" fn private_key_from_hex(key: *const c_char) -> *mut TariPr
 
 #[no_mangle]
 pub unsafe extern "C" fn contact_create(alias: *const c_char, public_key: *mut TariPublicKey) -> *mut TariContact {
-    let mut alias_string = CString::new("").unwrap().to_str().unwrap().to_owned();
+    let alias_string;
     if !alias.is_null() {
         alias_string = CStr::from_ptr(alias).to_str().unwrap().to_owned();
+    } else {
+        return ptr::null_mut();
     }
 
-    // TODO check if the public key is null and then deal with it.
+    if public_key.is_null() {
+        return ptr::null_mut();
+    }
 
     let contact = Contact {
         alias: alias_string.to_string(),
         public_key: (*public_key).clone(),
     };
     Box::into_raw(Box::new(contact))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn contact_destroy(contact: *mut TariContact) {
-    if !contact.is_null() {
-        Box::from_raw(contact);
-    }
 }
 
 #[no_mangle]
@@ -234,13 +290,26 @@ pub unsafe extern "C" fn contact_get_alias(contact: *mut TariContact) -> *mut c_
 
 #[no_mangle]
 pub unsafe extern "C" fn contact_get_public_key(contact: *mut TariContact) -> *mut TariPublicKey {
-    // TODO What do we do if its null?
-    // if c.is_null() {}
+    if contact.is_null() {
+        return ptr::null_mut();
+    }
     Box::into_raw(Box::new((*contact).public_key.clone()))
 }
 
+
 #[no_mangle]
-pub unsafe extern "C" fn contact_len(contact: *mut TariContacts) -> c_int {
+pub unsafe extern "C" fn contact_destroy(contact: *mut TariContact) {
+    if !contact.is_null() {
+        Box::from_raw(contact);
+    }
+}
+
+/// ----------------------------------- Contacts -------------------------------------------------///
+
+//no create since cloned from wallet, never passed to wallet
+
+#[no_mangle]
+pub unsafe extern "C" fn contacts_get_length(contact: *mut TariContacts) -> c_int {
     let mut len = 0;
     if !contact.is_null() {
         len = (*contact).0.len();
@@ -249,14 +318,183 @@ pub unsafe extern "C" fn contact_len(contact: *mut TariContacts) -> c_int {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn contact_get_at(contacts: *mut TariContacts, position: c_int) -> *mut TariContact {
-    // TODO What do we do if its null?
-    // if c.is_null() {}
-    // TODO Bounds checking, still not sure what to do if there is a problem so leaving as TODO
-    Box::into_raw(Box::new((*contacts).0[position as usize].clone()))
+pub unsafe extern "C" fn contacts_get_at(contacts: *mut TariContacts, position: c_int) -> *mut TariContact {
+    if contacts.is_null() {
+        return ptr::null_mut();
+    }
+    let mut i = contacts_get_length(contacts)-1;
+    if i < 0
+    {
+        return ptr::null_mut()
+    }
+    if position < 0 {
+        i = 0
+    }
+    if position <= i-1 {
+        i = position
+    }
+    Box::into_raw(Box::new((*contacts).0[i as usize].clone()))
+}
+
+// destructor since cloned from wallet
+#[no_mangle]
+pub unsafe extern "C" fn contacts_destroy(contacts: *mut TariContacts) {
+    if !contacts.is_null() {
+        Box::from_raw(contacts);
+    }
 }
 
 /// -------------------------------------------------------------------------------------------- ///
+
+
+/// ----------------------------------- CompletedTransactions ----------------------------------- ///
+#[no_mangle]
+pub unsafe extern "C" fn completed_transactions_get_length(transactions: *mut TariCompletedTransactions) -> c_int {
+    let mut len = 0;
+    if !transactions.is_null() {
+        len = (*transactions).0.len();
+    }
+    len as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ccompleted_transactions_get_at(transactions: *mut TariCompletedTransactions, position: c_int) -> *mut TariCompletedTransaction {
+    if transactions.is_null() {
+        return ptr::null_mut();
+    }
+    let mut i = completed_transactions_get_length(transactions)-1;
+    if i < 0
+    {
+        return ptr::null_mut()
+    }
+    if position < 0 {
+        i = 0
+    }
+    if position <= i-1 {
+        i = position
+    }
+    Box::into_raw(Box::new((*transactions).0[i as usize].clone()))
+}
+
+// destructor since cloned from wallet
+#[no_mangle]
+pub unsafe extern "C" fn completed_transactions_destroy(transactions: *mut TariCompletedTransactions) {
+    if !transactions.is_null() {
+        Box::from_raw(transactions);
+    }
+}
+
+/// -------------------------------------------------------------------------------------------- ///
+
+/// ----------------------------------- OutboundTransactions ------------------------------------ ///
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transactions_get_length(transactions: *mut TariPendingOutboundTransactions) -> c_int {
+    let mut len = 0;
+    if !transactions.is_null() {
+        len = (*transactions).0.len();
+    }
+    len as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transactions_get_at(transactions: *mut TariPendingOutboundTransactions, position: c_int) -> *mut TariPendingOutboundTransaction {
+    if transactions.is_null() {
+        return ptr::null_mut();
+    }
+    let mut i = pending_outbound_transactions_get_length(transactions)-1;
+    if i < 0
+    {
+        return ptr::null_mut()
+    }
+    if position < 0 {
+        i = 0
+    }
+    if position <= i-1 {
+        i = position
+    }
+    Box::into_raw(Box::new((*transactions).0[i as usize].clone()))
+}
+
+// destructor since cloned from wallet
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transactions_destroy(transactions: *mut TariPendingOutboundTransactions) {
+    if !transactions.is_null() {
+        Box::from_raw(transactions);
+    }
+}
+
+/// -------------------------------------------------------------------------------------------- ///
+
+
+/// ----------------------------------- InboundTransactions ------------------------------------- ///
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transactions_get_length(transactions: *mut TariPendingInboundTransactions) -> c_int {
+    let mut len = 0;
+    if !transactions.is_null() {
+        len = (*transactions).0.len();
+    }
+    len as c_int
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transactions_get_at(transactions: *mut TariPendingInboundTransactions, position: c_int) -> *mut TariPendingInboundTransaction {
+    if transactions.is_null() {
+        return ptr::null_mut();
+    }
+    let mut i = pending_inbound_transactions_get_length(transactions)-1;
+    if i < 0
+    {
+        return ptr::null_mut()
+    }
+    if position < 0 {
+        i = 0
+    }
+    if position <= i-1 {
+        i = position
+    }
+    Box::into_raw(Box::new((*transactions).0[i as usize].clone()))
+}
+
+// destructor since cloned from wallet
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transactions_destroy(transactions: *mut TariPendingInboundTransactions) {
+    if !transactions.is_null() {
+        Box::from_raw(transactions);
+    }
+}
+
+/// -------------------------------------------------------------------------------------------- ///
+
+/*
+#[derive(Debug, Clone)]
+pub struct InboundTransaction {
+    pub tx_id: TxId,
+    pub source_public_key: CommsPublicKey,
+    pub amount: MicroTari,
+    pub receiver_protocol: ReceiverTransactionProtocol,
+    pub timestamp: NaiveDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboundTransaction {
+    pub tx_id: TxId,
+    pub destination_public_key: CommsPublicKey,
+    pub amount: MicroTari,
+    pub fee: MicroTari,
+    pub sender_protocol: SenderTransactionProtocol,
+    pub timestamp: NaiveDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedTransaction {
+    pub tx_id: TxId,
+    pub destination_public_key: CommsPublicKey,
+    pub amount: MicroTari,
+    pub fee: MicroTari,
+    pub transaction: Transaction,
+    pub timestamp: NaiveDateTime,
+}
+*/
 
 /// ----------------------------------- CommsConfig ---------------------------------------------///
 
@@ -268,46 +506,56 @@ pub unsafe extern "C" fn comms_config_create(
     secret_key: *mut TariPrivateKey,
 ) -> *mut TariCommsConfig
 {
-    let mut address_string = CString::new("").unwrap().to_str().unwrap().to_owned();
+    let address_string;
     if !address.is_null() {
         address_string = CStr::from_ptr(address).to_str().unwrap().to_owned();
+    } else {
+        return ptr::null_mut();
     }
-    let mut database_name_string = CString::new("").unwrap().to_str().unwrap().to_owned();
+    let database_name_string;
     if !database_name.is_null() {
         database_name_string = CStr::from_ptr(database_name).to_str().unwrap().to_owned();
+    } else {
+        return ptr::null_mut();
     }
-    let mut datastore_path_string = CString::new("").unwrap().to_str().unwrap().to_owned();
+    let datastore_path_string;
     if !datastore_path.is_null() {
         datastore_path_string = CStr::from_ptr(datastore_path).to_str().unwrap().to_owned();
+    } else {
+        return ptr::null_mut();
     }
 
-    // TODO Handle this unwrap gracefully
-    let net_address = address_string.parse::<NetAddress>().unwrap();
+    let net_address = address_string.parse::<NetAddress>();
 
-    let ni = NodeIdentity::new(
-        (*secret_key).clone(),
-        net_address.clone(),
-        PeerFeatures::COMMUNICATION_CLIENT,
-    )
-    .unwrap();
+    match net_address {
+        Ok(net_address) => {
+            let ni = NodeIdentity::new(
+                (*secret_key).clone(),
+                net_address.clone(),
+                PeerFeatures::COMMUNICATION_CLIENT,
+            )
+            .unwrap();
 
-    let config = TariCommsConfig {
-        node_identity: Arc::new(ni.clone()),
-        host: net_address.host().parse().unwrap(),
-        socks_proxy_address: None,
-        control_service: ControlServiceConfig {
-            listener_address: ni.control_service_address(),
-            socks_proxy_address: None,
-            requested_connection_timeout: Duration::from_millis(2000),
+            let config = TariCommsConfig {
+                node_identity: Arc::new(ni.clone()),
+                host: net_address.host().parse().unwrap(),
+                socks_proxy_address: None,
+                control_service: ControlServiceConfig {
+                    listener_address: ni.control_service_address(),
+                    socks_proxy_address: None,
+                    requested_connection_timeout: Duration::from_millis(2000),
+                },
+                datastore_path: datastore_path_string,
+                peer_database_name: database_name_string,
+                inbound_buffer_size: 100,
+                outbound_buffer_size: 100,
+                dht: Default::default(),
+            };
+
+            Box::into_raw(Box::new(config))
         },
-        datastore_path: datastore_path_string,
-        peer_database_name: database_name_string,
-        inbound_buffer_size: 100,
-        outbound_buffer_size: 100,
-        dht: Default::default(),
-    };
-
-    Box::into_raw(Box::new(config))
+        Err(_) => ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
@@ -323,29 +571,28 @@ pub unsafe extern "C" fn comms_config_destroy(wc: *mut TariCommsConfig) {
 
 #[no_mangle]
 pub unsafe extern "C" fn wallet_create(config: *mut TariCommsConfig) -> *mut TariWallet {
-    // TODO Check that the config is not null, how do you deal with the case that it is null?
-
-    // TODO Gracefully handle the case where these expects would fail
-    let runtime = Runtime::new().expect("Could not create a Tokio runtime.");
-    let w = TariWallet::new(
-        WalletConfig {
-            comms_config: (*config).clone(),
-        },
-        WalletMemoryDatabase::new(),
-        runtime,
-    )
-    .expect("Could not create wallet"); // expect needs to change due to it panicking.
-    Box::into_raw(Box::new(w))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
-    if wallet.is_null() {
-        return;
+    if config.is_null() {
+        return ptr::null_mut();
     }
-
-    let m = Box::from_raw(wallet);
-    m.shutdown().unwrap()
+    // TODO Gracefully handle the case where these expects would fail
+    let runtime = Runtime::new();
+    let w;
+    match runtime {
+        Ok(runtime) => {
+            w = TariWallet::new(
+                WalletConfig {
+                    comms_config: (*config).clone(),
+                },
+                WalletMemoryDatabase::new(),
+                runtime,
+            );
+            match w {
+                Ok(w) => Box::into_raw(Box::new(w)),
+                Err(_) => ptr::null_mut(),
+            }
+        },
+        Err(_) => ptr::null_mut()
+    }
 }
 
 #[no_mangle]
@@ -353,16 +600,11 @@ pub unsafe extern "C" fn wallet_generate_test_data(wallet: *mut TariWallet) -> b
     if wallet.is_null() {
         return false;
     }
-
     match generate_wallet_test_data(&mut *wallet) {
         Ok(_) => true,
         _ => false,
     }
 }
-
-// ------------------------------------------------------------------------------------------------
-// API Functions
-// ------------------------------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn wallet_add_base_node_peer(
@@ -379,9 +621,11 @@ pub unsafe extern "C" fn wallet_add_base_node_peer(
         return false;
     }
 
-    let mut address_string = CString::new("").unwrap().to_str().unwrap().to_owned();
+    let address_string;
     if !address.is_null() {
         address_string = CStr::from_ptr(address).to_str().unwrap().to_owned();
+    } else {
+        return false;
     }
 
     match (*wallet).add_base_node_peer((*public_key).clone(), address_string) {
@@ -390,8 +634,54 @@ pub unsafe extern "C" fn wallet_add_base_node_peer(
     }
 }
 
+pub unsafe extern "C" fn wallet_add_contact(
+    wallet: *mut TariWallet,
+    contact: *mut TariContact,
+) -> bool
+{
+    if wallet.is_null()
+    {
+        return false;
+    }
+    if contact.is_null()
+    {
+        return false;
+    }
+
+    match (*wallet)
+    .runtime
+    .block_on((*wallet).contacts_service.save_contact((*contact).clone()))
+        {
+            Ok(_) => true,
+            Err(_) => false
+        }
+}
+
+pub unsafe extern "C" fn wallet_remove_contact(
+    wallet: *mut TariWallet,
+    contact: *mut TariContact,
+) -> bool
+{
+    if wallet.is_null()
+    {
+        return false;
+    }
+    if contact.is_null()
+    {
+        return false;
+    }
+
+    match  (*wallet)
+        .runtime
+        .block_on((*wallet).contacts_service.remove_contact((*contact).public_key.clone()))
+        {
+            Ok(_) => true,
+            Err(_) => false
+        }
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn wallet_get_balance(wallet: *mut Wallet<WalletMemoryDatabase>) -> c_ulonglong {
+pub unsafe extern "C" fn wallet_get_balance(wallet: *mut TariWallet) -> c_ulonglong {
     if wallet.is_null() {
         return 0;
     }
@@ -405,26 +695,27 @@ pub unsafe extern "C" fn wallet_get_balance(wallet: *mut Wallet<WalletMemoryData
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn wallet_get_num_completed_tx(wallet: *mut Wallet<WalletMemoryDatabase>) -> c_ulonglong {
-    if wallet.is_null() {
-        return 0;
-    }
-
-    match (*wallet)
-        .runtime
-        .block_on((*wallet).transaction_service.get_completed_transactions())
-    {
-        Ok(c) => c.len() as u64,
-        Err(_) => 0,
-    }
-}
+// test code
+// #[no_mangle]
+// pub unsafe extern "C" fn wallet_get_num_completed_tx(wallet: *mut TariWallet) -> c_ulonglong {
+// if wallet.is_null() {
+// return 0;
+// }
+//
+// match (*wallet)
+// .runtime
+// .block_on((*wallet).transaction_service.get_completed_transactions())
+// {
+// Ok(c) => c.len() as u64,
+// Err(_) => 0,
+// }
+// }
 
 // Create and send the first stage of a transaction to the specified wallet for the specified amount and with the
 // specified fee.
 #[no_mangle]
 pub unsafe extern "C" fn wallet_send_transaction(
-    wallet: *mut Wallet<WalletMemoryDatabase>,
+    wallet: *mut TariWallet,
     dest_public_key: *mut TariPublicKey,
     amount: c_ulonglong,
     fee_per_gram: c_ulonglong,
@@ -446,30 +737,101 @@ pub unsafe extern "C" fn wallet_send_transaction(
             MicroTari::from(fee_per_gram),
         )) {
         Ok(_) => true,
-        _ => false,
+        Err(_) => false,
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wallet_get_contacts(wallet: *mut Wallet<WalletMemoryDatabase>) -> *mut TariContacts {
+pub unsafe extern "C" fn wallet_get_contacts(wallet: *mut TariWallet) -> *mut TariContacts {
     let mut contacts = Vec::new();
-    if !wallet.is_null() {
-        // TODO gracefully check this unwrap
-        let retrieved_contacts = (*wallet)
-            .runtime
-            .block_on((*wallet).contacts_service.get_contacts())
-            .unwrap();
-        contacts.append(&mut retrieved_contacts.clone());
+    if wallet.is_null() {
+        return ptr::null_mut();
     }
-    Box::into_raw(Box::new(TariContacts(contacts)))
+
+    let retrieved_contacts = (*wallet).runtime.block_on((*wallet).contacts_service.get_contacts());
+    match retrieved_contacts {
+        Ok(retrieved_contacts) => {
+            contacts.append(&mut retrieved_contacts.clone());
+            Box::into_raw(Box::new(TariContacts(contacts)))
+        },
+        Err(_) => ptr::null_mut(),
+    }
 }
 
-// TODO Get and destructuring a list of contacts
-// TODO Add Contact to Contacts Service
-// TODO Delete Contact to Contacts Service
-// TODO Get and destructure list of completed transactions from Transaction Service
-// TODO Get and destructure list of pending_inbound_transactions from Transaction Service
-// TODO Get and destructure list pending_outbound_transactions from Transaction Service
+#[no_mangle]
+pub unsafe extern "C" fn wallet_get_completed_transactions(wallet: *mut TariWallet) -> *mut TariCompletedTransactions {
+    let mut completed = Vec::new();
+    if wallet.is_null() {
+        return ptr::null_mut();
+    }
+
+    let completed_transactions = (*wallet).runtime.block_on((*wallet).transaction_service.get_completed_transactions());
+    match completed_transactions {
+        Ok(completed_transactions) => {
+            for (_id, tx) in &completed_transactions {
+                completed.push( tx.clone());
+            }
+            Box::into_raw(Box::new(TariCompletedTransactions(completed)))
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wallet_get_pending_inbound_transactions(wallet: *mut TariWallet) -> *mut TariPendingInboundTransactions {
+    let mut pending = Vec::new();
+    if wallet.is_null() {
+        return ptr::null_mut();
+    }
+
+    let pending_transactions = (*wallet).runtime.block_on((*wallet).transaction_service.get_pending_inbound_transactions());
+    match pending_transactions {
+        Ok(pending_transactions) => {
+            for (_id, tx) in &pending_transactions {
+                pending.push( tx.clone());
+            }
+            Box::into_raw(Box::new(TariPendingInboundTransactions(pending)))
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wallet_get_pending_outbound_transactions(wallet: *mut TariWallet) -> *mut TariPendingOutboundTransactions {
+    let mut pending = Vec::new();
+    if wallet.is_null() {
+        return ptr::null_mut();
+    }
+
+    let pending_transactions = (*wallet).runtime.block_on((*wallet).transaction_service.get_pending_outbound_transactions());
+    match pending_transactions {
+        Ok(pending_transactions) => {
+            for (_id, tx) in &pending_transactions {
+                pending.push(tx.clone());
+            }
+            Box::into_raw(Box::new(TariPendingOutboundTransactions(pending)))
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
+    if !wallet.is_null() {
+        let m = Box::from_raw(wallet);
+        let l = m.shutdown();
+        match l {
+            Ok(_l) => {},
+            Err(_) => {},
+        }
+    }
+}
+
+// TODO Get and destructure a completed transactions from Transaction Service
+// TODO Get and destructure a pending_inbound_transactions from Transaction Service
+// TODO Get and destructure a pending_outbound_transactions from Transaction Service
+
+// TODO (Potentially) Add optional error parameter to methods which can return null
 
 // Callback Definition - Example
 
@@ -611,7 +973,7 @@ mod test {
             wallet_generate_test_data(alice_wallet);
 
             let contacts = wallet_get_contacts(alice_wallet);
-            assert_eq!(contact_len(contacts), 4);
+            assert_eq!(contacts_get_length(contacts), 4);
 
             // free string memory
             free_string(db_name_alice_str as *mut c_char);
