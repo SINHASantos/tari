@@ -39,12 +39,15 @@ pub enum TransactionServiceRequest {
     GetPendingOutboundTransactions,
     GetCompletedTransactions,
     SendTransaction((CommsPublicKey, MicroTari, MicroTari)),
+    RegisterCallbackReceivedTransaction((extern "C" fn(*mut InboundTransaction))),
+    RegisterCallbackReceivedTransactionReply((extern "C" fn(*mut CompletedTransaction)))
 }
 
 /// API Response enum
 #[derive(Debug)]
 pub enum TransactionServiceResponse {
     TransactionSent,
+    CallbackRegistered,
     PendingInboundTransactions(HashMap<u64, InboundTransaction>),
     PendingOutboundTransactions(HashMap<u64, OutboundTransaction>),
     CompletedTransactions(HashMap<u64, CompletedTransaction>),
@@ -133,6 +136,30 @@ impl TransactionServiceHandle {
             .await??
         {
             TransactionServiceResponse::CompletedTransactions(c) => Ok(c),
+            _ => Err(TransactionServiceError::UnexpectedApiResponse),
+        }
+    }
+
+    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
+    {
+       match self
+            .handle
+            .call(TransactionServiceRequest::RegisterCallbackReceivedTransaction(call))
+            .await??
+        {
+            TransactionServiceResponse::CallbackRegistered => Ok(()),
+            _ => Err(TransactionServiceError::UnexpectedApiResponse),
+        }
+    }
+
+    pub async fn register_callback_received_transaction_reply(&mut self, call: extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
+    {
+        match self
+            .handle
+            .call(TransactionServiceRequest::RegisterCallbackReceivedTransactionReply(call))
+            .await??
+        {
+            TransactionServiceResponse::CallbackRegistered  => Ok(()),
             _ => Err(TransactionServiceError::UnexpectedApiResponse),
         }
     }

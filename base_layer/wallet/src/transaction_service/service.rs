@@ -87,6 +87,8 @@ where TBackend: TransactionBackend
         reply_channel::Receiver<TransactionServiceRequest, Result<TransactionServiceResponse, TransactionServiceError>>,
     >,
     event_publisher: Publisher<TransactionEvent>,
+    callback_received_transaction: Option<extern "C" fn(*mut InboundTransaction)>,
+    callback_received_transaction_reply: Option<extern "C" fn(*mut CompletedTransaction)>
 }
 
 impl<TTxStream, TTxReplyStream, TBackend> TransactionService<TTxStream, TTxReplyStream, TBackend>
@@ -116,6 +118,8 @@ where
             transaction_reply_stream: Some(transaction_reply_stream),
             request_stream: Some(request_stream),
             event_publisher,
+            callback_received_transaction: None,
+            callback_received_transaction_reply: None
         }
     }
 
@@ -207,7 +211,23 @@ where
             TransactionServiceRequest::GetCompletedTransactions => Ok(
                 TransactionServiceResponse::CompletedTransactions(self.get_completed_transactions()?),
             ),
+            TransactionServiceRequest::RegisterCallbackReceivedTransaction(call) =>
+                self.register_callback_received_transaction(call).await.map(|_| TransactionServiceResponse::CallbackRegistered),
+            TransactionServiceRequest::RegisterCallbackReceivedTransactionReply(call) =>
+                self.register_callback_received_transaction_reply(call).await.map(|_| TransactionServiceResponse::CallbackRegistered),
         }
+    }
+
+    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
+    {
+        self.callback_received_transaction = Some(call);
+        Ok(())
+    }
+
+    pub async fn register_callback_received_transaction_reply(&mut self, call:extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
+    {
+        self.callback_received_transaction_reply = Some(call);
+        Ok(())
     }
 
     /// Sends a new transaction to a recipient
@@ -294,15 +314,16 @@ where
         self.output_manager_service
             .confirm_sent_transaction(tx_id.clone(), tx.body.inputs().clone(), tx.body.outputs().clone())
             .await?;
+        let completed_transaction = CompletedTransaction {
+            tx_id,
+            destination_public_key: outbound_tx.destination_public_key,
+            amount: outbound_tx.amount,
+            fee: outbound_tx.fee,
+            transaction: tx.clone(),
+            timestamp: Utc::now().naive_utc(),
+        };
         self.db
-            .complete_outbound_transaction(tx_id.clone(), CompletedTransaction {
-                tx_id,
-                destination_public_key: outbound_tx.destination_public_key,
-                amount: outbound_tx.amount,
-                fee: outbound_tx.fee,
-                transaction: tx.clone(),
-                timestamp: Utc::now().naive_utc(),
-            })?;
+            .complete_outbound_transaction(tx_id.clone(), completed_transaction.clone())?;
         info!(
             target: LOG_TARGET,
             "Transaction Recipient Reply for TX_ID = {} received", tx_id,
@@ -311,7 +332,11 @@ where
             .send(TransactionEvent::ReceivedTransactionReply)
             .await
             .map_err(|_| TransactionServiceError::EventStreamError)?;
-
+        match self.callback_received_transaction_reply
+            {
+                Some(call) => call(Box::into_raw(Box::new(completed_transaction))),
+                None => {}
+            }
         Ok(())
     }
 
@@ -368,13 +393,14 @@ where
                 .await?;
 
             // Otherwise add it to our pending transaction list and return reply
-            self.db.add_pending_inbound_transaction(tx_id, InboundTransaction {
+            let inbound_transaction = InboundTransaction {
                 tx_id,
                 source_public_key: source_pubkey.clone(),
                 amount,
                 receiver_protocol: rtp.clone(),
                 timestamp: Utc::now().naive_utc(),
-            })?;
+            };
+            self.db.add_pending_inbound_transaction(tx_id, inbound_transaction.clone())?;
 
             info!(
                 target: LOG_TARGET,
@@ -387,6 +413,12 @@ where
                 .send(TransactionEvent::ReceivedTransaction)
                 .await
                 .map_err(|_| TransactionServiceError::EventStreamError)?;
+
+            match self.callback_received_transaction
+                {
+                    Some(call) => call(Box::into_raw(Box::new(inbound_transaction))),
+                    None => {}
+                }
         }
         Ok(())
     }

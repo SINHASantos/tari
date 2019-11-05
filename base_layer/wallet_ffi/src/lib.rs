@@ -55,6 +55,7 @@ use tari_wallet::{
     test_utils::generate_wallet_test_data,
 };
 use tokio::runtime::Runtime;
+use futures::executor::block_on;
 
 pub type TariWallet = tari_wallet::wallet::Wallet<WalletMemoryDatabase>;
 pub type TariPublicKey = tari_comms::types::CommsPublicKey;
@@ -1064,6 +1065,7 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
 // }
 //
 
+/*
 #[derive(Debug, Clone, Copy)]
 pub struct CallBacks {
     pub call_back_received_transaction: Option<extern "C" fn(c_ulonglong)>,
@@ -1079,36 +1081,39 @@ impl CallBacks {
     }
 }
 
+
 #[no_mangle]
 pub unsafe extern "C" fn call_back_create() -> *const () {
     let callbacks = CallBacks::new();
     Box::into_raw(Box::new(callbacks)) as *const _
 }
-
+*/
 #[no_mangle]
 pub unsafe extern "C" fn call_back_register_received_transaction(
-    callbacks: *mut CallBacks,
-    call: extern "C" fn(c_ulonglong),
+    wallet: *mut TariWallet,
+    call: extern "C" fn(*mut TariPendingInboundTransaction),
 )
 {
-    (*callbacks).call_back_received_transaction = Some(call);
+    block_on((*wallet).register_callback_received_transaction(call));
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn call_back_register_received_transaction_reply(
-    callbacks: *mut CallBacks,
-    call: extern "C" fn(c_ulonglong),
+    wallet: *mut TariWallet,
+    call: extern "C" fn(*mut TariCompletedTransaction),
 )
 {
-    (*callbacks).call_back_received_transaction_reply = Some(call);
+    block_on((*wallet).register_callback_received_transaction_reply(call));
 }
-
+/*
 #[no_mangle]
-pub unsafe extern "C" fn callbacks_desktroy(calls: *mut CallBacks) {
+pub unsafe extern "C" fn callbacks_destroy(calls: *mut CallBacks) {
     if !calls.is_null() {
         Box::from_raw(calls);
     }
 }
+*/
+
 // ------------------------------------------------------------------------------------------------
 // Callback Functions
 // ------------------------------------------------------------------------------------------------

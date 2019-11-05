@@ -19,7 +19,6 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
 use crate::{
     contacts_service::{
         handle::ContactsServiceHandle,
@@ -60,6 +59,7 @@ use tari_p2p::{
 };
 use tari_service_framework::StackBuilder;
 use tokio::runtime::Runtime;
+use crate::transaction_service::storage::database::{InboundTransaction, CompletedTransaction};
 
 #[derive(Clone)]
 pub struct WalletConfig {
@@ -142,6 +142,16 @@ where T: WalletBackend
             db: WalletDatabase::new(backend),
             runtime,
         })
+    }
+
+    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction))
+    {
+        self.transaction_service.register_callback_received_transaction(call).await.unwrap();
+    }
+
+    pub async fn register_callback_received_transaction_reply(&mut self, call: extern "C" fn(*mut CompletedTransaction))
+    {
+        self.transaction_service.register_callback_received_transaction_reply(call).await.unwrap();
     }
 
     /// This method consumes the wallet so that the handles are dropped which will result in the services async loops
