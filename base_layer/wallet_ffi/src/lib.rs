@@ -57,11 +57,10 @@ use tari_wallet::{
 use tokio::runtime::Runtime;
 
 pub type TariWallet = tari_wallet::wallet::Wallet<WalletMemoryDatabase>;
-pub type TariWalletConfig = tari_wallet::wallet::WalletConfig;
-pub type TariDateTime = chrono::NaiveDateTime;
 pub type TariPublicKey = tari_comms::types::CommsPublicKey;
 pub type TariPrivateKey = tari_comms::types::CommsSecretKey;
 pub type TariCommsConfig = tari_p2p::initialization::CommsConfig;
+pub struct TariContacts(Vec<TariContact>);
 pub type TariContact = tari_wallet::contacts_service::storage::database::Contact;
 pub type TariCompletedTransaction = tari_wallet::transaction_service::storage::database::CompletedTransaction;
 pub struct TariCompletedTransactions(Vec<TariCompletedTransaction>);
@@ -69,7 +68,6 @@ pub type TariPendingInboundTransaction = tari_wallet::transaction_service::stora
 pub struct TariPendingInboundTransactions(Vec<TariPendingInboundTransaction>);
 pub type TariPendingOutboundTransaction = tari_wallet::transaction_service::storage::database::OutboundTransaction;
 pub struct TariPendingOutboundTransactions(Vec<TariPendingOutboundTransaction>);
-pub struct TariContacts(Vec<TariContact>);
 pub struct ByteVector(Vec<c_uchar>); // declared like this so that it can be exposed to external header
 
 /// -------------------------------- Strings ------------------------------------------------ ///
@@ -470,7 +468,7 @@ pub unsafe extern "C" fn pending_inbound_transactions_destroy(transactions: *mut
 }
 
 /// -------------------------------------------------------------------------------------------- ///
-///
+
 /// ----------------------------------- CompletedTransaction ------------------------------------- ///
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_get_transaction_id(
@@ -924,7 +922,7 @@ pub unsafe extern "C" fn wallet_get_pending_outbound_transactions(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wallet_get_pending_completed_transaction_by_id(
+pub unsafe extern "C" fn wallet_get_completed_transaction_by_id(
     wallet: *mut TariWallet,
     transaction_id: c_ulonglong
 ) -> *mut TariCompletedTransaction {
@@ -1066,7 +1064,6 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
 // }
 //
 
-#[no_mangle]
 #[derive(Debug, Clone, Copy)]
 pub struct CallBacks {
     pub call_back_received_transaction: Option<extern "C" fn(c_ulonglong)>,
