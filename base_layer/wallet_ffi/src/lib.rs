@@ -939,10 +939,6 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
     }
 }
 
-// TODO Get and destructure a completed transactions from Transaction Service
-// TODO Get and destructure a pending_inbound_transactions from Transaction Service
-// TODO Get and destructure a pending_outbound_transactions from Transaction Service
-
 // TODO (Potentially) Add optional error parameter to methods which can return null
 
 // Callback Definition - Example
