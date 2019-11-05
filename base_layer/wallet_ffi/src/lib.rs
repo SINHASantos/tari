@@ -33,7 +33,7 @@ extern crate libc;
 extern crate tari_wallet;
 
 use chrono::NaiveDateTime;
-use libc::{c_char, c_int, c_uchar, c_ulonglong};
+use libc::{c_char, c_int, c_uchar, c_ulonglong,c_longlong};
 use std::{
     boxed::Box,
     ffi::{CStr, CString},
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn public_key_destroy(pk: *mut TariPublicKey) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn public_key_get_key(pk: *mut TariPublicKey) -> *mut ByteVector {
+pub unsafe extern "C" fn public_key_get_bytes(pk: *mut TariPublicKey) -> *mut ByteVector {
     let mut bytes = ByteVector(Vec::new());
     if !pk.is_null() {
         bytes.0 = (*pk).to_vec();
@@ -221,7 +221,7 @@ pub unsafe extern "C" fn private_key_destroy(pk: *mut TariPrivateKey) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn private_key_get_byte_vector(pk: *mut TariPrivateKey) -> *mut ByteVector {
+pub unsafe extern "C" fn private_key_get_bytes(pk: *mut TariPrivateKey) -> *mut ByteVector {
     let mut bytes = ByteVector(Vec::new());
     if !pk.is_null() {
         bytes.0 = (*pk).to_vec();
@@ -464,7 +464,119 @@ pub unsafe extern "C" fn pending_inbound_transactions_destroy(transactions: *mut
 }
 
 /// -------------------------------------------------------------------------------------------- ///
+///
+/// ----------------------------------- CompletedTransaction ------------------------------------- ///
+#[no_mangle]
+pub unsafe extern "C" fn completed_transaction_get_transaction_id(transaction: *mut TariCompletedTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    (*transaction).tx_id as c_ulonglong
+}
 
+#[no_mangle]
+pub unsafe extern "C" fn completed_transaction_get_destination_public_key(transaction: *mut TariCompletedTransaction) -> *mut TariPublicKey {
+    if !transaction.is_null() {
+        return ptr::null_mut();
+    }
+    let m = (*transaction).destination_public_key.clone();
+    Box::into_raw(Box::new(m))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn completed_transaction_get_amount(transaction: *mut TariCompletedTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    c_ulonglong::from((*transaction).amount)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn completed_transaction_get_fee(transaction: *mut TariCompletedTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    c_ulonglong::from((*transaction).fee)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn completed_transaction_get_transaction_timestamp(transaction: *mut TariCompletedTransaction) -> c_longlong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    (*transaction).timestamp.timestamp() as c_longlong
+}
+/// -------------------------------------------------------------------------------------------- ///
+
+/// ----------------------------------- OutboundTransaction ------------------------------------- ///
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_id(transaction: *mut TariPendingOutboundTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    (*transaction).tx_id as c_ulonglong
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transaction_get_destination_public_key(transaction: *mut TariPendingOutboundTransaction) -> *mut TariPublicKey {
+    if !transaction.is_null() {
+        return ptr::null_mut();
+    }
+    let m = (*transaction).destination_public_key.clone();
+    Box::into_raw(Box::new(m))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transaction_get_amount(transaction: *mut TariPendingOutboundTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    c_ulonglong::from((*transaction).amount)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_timestamp(transaction: *mut TariPendingOutboundTransaction) -> c_longlong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    (*transaction).timestamp.timestamp() as c_longlong
+}
+/// -------------------------------------------------------------------------------------------- ///
+///
+/// ----------------------------------- InboundTransaction ------------------------------------- ///
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_id(transaction: *mut TariPendingInboundTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    (*transaction).tx_id as c_ulonglong
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transaction_get_source_public_key(transaction: *mut TariPendingInboundTransaction) -> *mut TariPublicKey {
+    if !transaction.is_null() {
+        return ptr::null_mut();
+    }
+    let m = (*transaction).source_public_key.clone();
+    Box::into_raw(Box::new(m))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transaction_get_amount(transaction: *mut TariPendingInboundTransaction) -> c_ulonglong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    c_ulonglong::from((*transaction).amount)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_timestamp(transaction: *mut TariPendingInboundTransaction) -> c_longlong {
+    if !transaction.is_null() {
+        return 0;
+    }
+    (*transaction).timestamp.timestamp() as c_longlong
+}
+/// -------------------------------------------------------------------------------------------- ///
 /*
 #[derive(Debug, Clone)]
 pub struct InboundTransaction {
