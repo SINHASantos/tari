@@ -32,8 +32,7 @@
 extern crate libc;
 extern crate tari_wallet;
 
-use chrono::NaiveDateTime;
-use libc::{c_char, c_int, c_uchar, c_ulonglong,c_longlong};
+use libc::{c_char, c_int, c_longlong, c_uchar, c_ulonglong};
 use std::{
     boxed::Box,
     ffi::{CStr, CString},
@@ -43,12 +42,12 @@ use tari_comms::peer_manager::NodeIdentity;
 use tari_crypto::keys::SecretKey;
 use tari_transactions::tari_amount::MicroTari;
 use tari_utilities::ByteArray;
-use tari_wallet::wallet::{Wallet, WalletConfig};
+use tari_wallet::wallet::{WalletConfig};
 
 use core::ptr;
 use std::{sync::Arc, time::Duration};
 use tari_comms::{connection::NetAddress, control_service::ControlServiceConfig, peer_manager::PeerFeatures};
-use tari_crypto::{keys::PublicKey, ristretto::RistrettoPublicKey};
+use tari_crypto::{keys::PublicKey};
 use tari_utilities::hex::Hex;
 use tari_wallet::{
     contacts_service::storage::database::Contact,
@@ -56,7 +55,6 @@ use tari_wallet::{
     test_utils::generate_wallet_test_data,
 };
 use tokio::runtime::Runtime;
-use tari_wallet::transaction_service::storage::database::{CompletedTransaction, OutboundTransaction, InboundTransaction};
 
 pub type TariWallet = tari_wallet::wallet::Wallet<WalletMemoryDatabase>;
 pub type TariWalletConfig = tari_wallet::wallet::WalletConfig;
@@ -111,17 +109,16 @@ pub unsafe extern "C" fn byte_vector_get_at(ptr: *mut ByteVector, position: c_in
     if ptr.is_null() {
         return 0 as c_uchar;
     }
-    let mut i = byte_vector_get_length(ptr)-1; // clamp to length
-    if i < 0
-    {
+    let len = byte_vector_get_length(ptr) - 1; // clamp to length
+    if len < 0 {
         return 0 as c_uchar;
     }
     if position < 0 {
-        i = 0; // clamp
-    } else if position <= i {
-        i = position;
+        return 0 as c_uchar;
+    } else if position > len {
+        return 0 as c_uchar;
     }
-    (*ptr).0.clone()[i as usize]
+    (*ptr).0.clone()[position as usize]
 }
 
 /// Returns the number of items, zero-indexed
@@ -296,7 +293,6 @@ pub unsafe extern "C" fn contact_get_public_key(contact: *mut TariContact) -> *m
     Box::into_raw(Box::new((*contact).public_key.clone()))
 }
 
-
 #[no_mangle]
 pub unsafe extern "C" fn contact_destroy(contact: *mut TariContact) {
     if !contact.is_null() {
@@ -306,7 +302,7 @@ pub unsafe extern "C" fn contact_destroy(contact: *mut TariContact) {
 
 /// ----------------------------------- Contacts -------------------------------------------------///
 
-//no create since cloned from wallet, never passed to wallet
+// no create since cloned from wallet, never passed to wallet
 
 #[no_mangle]
 pub unsafe extern "C" fn contacts_get_length(contact: *mut TariContacts) -> c_int {
@@ -322,18 +318,17 @@ pub unsafe extern "C" fn contacts_get_at(contacts: *mut TariContacts, position: 
     if contacts.is_null() {
         return ptr::null_mut();
     }
-    let mut i = contacts_get_length(contacts)-1;
-    if i < 0
-    {
-        return ptr::null_mut()
+    let len = contacts_get_length(contacts) - 1;
+    if len < 0 {
+        return ptr::null_mut();
     }
     if position < 0 {
-        i = 0
+        return ptr::null_mut();
     }
-    if position <= i-1 {
-        i = position
+    if position > len {
+        return ptr::null_mut();
     }
-    Box::into_raw(Box::new((*contacts).0[i as usize].clone()))
+    Box::into_raw(Box::new((*contacts).0[position as usize].clone()))
 }
 
 // destructor since cloned from wallet
@@ -346,7 +341,6 @@ pub unsafe extern "C" fn contacts_destroy(contacts: *mut TariContacts) {
 
 /// -------------------------------------------------------------------------------------------- ///
 
-
 /// ----------------------------------- CompletedTransactions ----------------------------------- ///
 #[no_mangle]
 pub unsafe extern "C" fn completed_transactions_get_length(transactions: *mut TariCompletedTransactions) -> c_int {
@@ -358,22 +352,25 @@ pub unsafe extern "C" fn completed_transactions_get_length(transactions: *mut Ta
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn ccompleted_transactions_get_at(transactions: *mut TariCompletedTransactions, position: c_int) -> *mut TariCompletedTransaction {
+pub unsafe extern "C" fn ccompleted_transactions_get_at(
+    transactions: *mut TariCompletedTransactions,
+    position: c_int,
+) -> *mut TariCompletedTransaction
+{
     if transactions.is_null() {
         return ptr::null_mut();
     }
-    let mut i = completed_transactions_get_length(transactions)-1;
-    if i < 0
-    {
-        return ptr::null_mut()
+    let len = completed_transactions_get_length(transactions) - 1;
+    if len < 0 {
+        return ptr::null_mut();
     }
     if position < 0 {
-        i = 0
+        return ptr::null_mut();
     }
-    if position <= i-1 {
-        i = position
+    if position > len {
+        return ptr::null_mut();
     }
-    Box::into_raw(Box::new((*transactions).0[i as usize].clone()))
+    Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
 
 // destructor since cloned from wallet
@@ -388,7 +385,9 @@ pub unsafe extern "C" fn completed_transactions_destroy(transactions: *mut TariC
 
 /// ----------------------------------- OutboundTransactions ------------------------------------ ///
 #[no_mangle]
-pub unsafe extern "C" fn pending_outbound_transactions_get_length(transactions: *mut TariPendingOutboundTransactions) -> c_int {
+pub unsafe extern "C" fn pending_outbound_transactions_get_length(
+    transactions: *mut TariPendingOutboundTransactions,
+) -> c_int {
     let mut len = 0;
     if !transactions.is_null() {
         len = (*transactions).0.len();
@@ -397,22 +396,25 @@ pub unsafe extern "C" fn pending_outbound_transactions_get_length(transactions: 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_outbound_transactions_get_at(transactions: *mut TariPendingOutboundTransactions, position: c_int) -> *mut TariPendingOutboundTransaction {
+pub unsafe extern "C" fn pending_outbound_transactions_get_at(
+    transactions: *mut TariPendingOutboundTransactions,
+    position: c_int,
+) -> *mut TariPendingOutboundTransaction
+{
     if transactions.is_null() {
         return ptr::null_mut();
     }
-    let mut i = pending_outbound_transactions_get_length(transactions)-1;
-    if i < 0
-    {
-        return ptr::null_mut()
+    let len = pending_outbound_transactions_get_length(transactions) - 1;
+    if len < 0 {
+        return ptr::null_mut();
     }
     if position < 0 {
-        i = 0
+        return ptr::null_mut();
     }
-    if position <= i-1 {
-        i = position
+    if position > len {
+        return ptr::null_mut()
     }
-    Box::into_raw(Box::new((*transactions).0[i as usize].clone()))
+    Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
 
 // destructor since cloned from wallet
@@ -425,10 +427,11 @@ pub unsafe extern "C" fn pending_outbound_transactions_destroy(transactions: *mu
 
 /// -------------------------------------------------------------------------------------------- ///
 
-
 /// ----------------------------------- InboundTransactions ------------------------------------- ///
 #[no_mangle]
-pub unsafe extern "C" fn pending_inbound_transactions_get_length(transactions: *mut TariPendingInboundTransactions) -> c_int {
+pub unsafe extern "C" fn pending_inbound_transactions_get_length(
+    transactions: *mut TariPendingInboundTransactions,
+) -> c_int {
     let mut len = 0;
     if !transactions.is_null() {
         len = (*transactions).0.len();
@@ -437,22 +440,25 @@ pub unsafe extern "C" fn pending_inbound_transactions_get_length(transactions: *
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_inbound_transactions_get_at(transactions: *mut TariPendingInboundTransactions, position: c_int) -> *mut TariPendingInboundTransaction {
+pub unsafe extern "C" fn pending_inbound_transactions_get_at(
+    transactions: *mut TariPendingInboundTransactions,
+    position: c_int,
+) -> *mut TariPendingInboundTransaction
+{
     if transactions.is_null() {
         return ptr::null_mut();
     }
-    let mut i = pending_inbound_transactions_get_length(transactions)-1;
-    if i < 0
-    {
-        return ptr::null_mut()
+    let len = pending_inbound_transactions_get_length(transactions) - 1;
+    if len < 0 {
+        return ptr::null_mut();
     }
     if position < 0 {
-        i = 0
+        return ptr::null_mut()
     }
-    if position <= i-1 {
-        i = position
+    if position > len {
+        return ptr::null_mut();
     }
-    Box::into_raw(Box::new((*transactions).0[i as usize].clone()))
+    Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
 
 // destructor since cloned from wallet
@@ -467,7 +473,9 @@ pub unsafe extern "C" fn pending_inbound_transactions_destroy(transactions: *mut
 ///
 /// ----------------------------------- CompletedTransaction ------------------------------------- ///
 #[no_mangle]
-pub unsafe extern "C" fn completed_transaction_get_transaction_id(transaction: *mut TariCompletedTransaction) -> c_ulonglong {
+pub unsafe extern "C" fn completed_transaction_get_transaction_id(
+    transaction: *mut TariCompletedTransaction,
+) -> c_ulonglong {
     if !transaction.is_null() {
         return 0;
     }
@@ -475,7 +483,9 @@ pub unsafe extern "C" fn completed_transaction_get_transaction_id(transaction: *
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn completed_transaction_get_destination_public_key(transaction: *mut TariCompletedTransaction) -> *mut TariPublicKey {
+pub unsafe extern "C" fn completed_transaction_get_destination_public_key(
+    transaction: *mut TariCompletedTransaction,
+) -> *mut TariPublicKey {
     if !transaction.is_null() {
         return ptr::null_mut();
     }
@@ -500,7 +510,9 @@ pub unsafe extern "C" fn completed_transaction_get_fee(transaction: *mut TariCom
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn completed_transaction_get_transaction_timestamp(transaction: *mut TariCompletedTransaction) -> c_longlong {
+pub unsafe extern "C" fn completed_transaction_get_transaction_timestamp(
+    transaction: *mut TariCompletedTransaction,
+) -> c_longlong {
     if !transaction.is_null() {
         return 0;
     }
@@ -510,7 +522,9 @@ pub unsafe extern "C" fn completed_transaction_get_transaction_timestamp(transac
 
 /// ----------------------------------- OutboundTransaction ------------------------------------- ///
 #[no_mangle]
-pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_id(transaction: *mut TariPendingOutboundTransaction) -> c_ulonglong {
+pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_id(
+    transaction: *mut TariPendingOutboundTransaction,
+) -> c_ulonglong {
     if !transaction.is_null() {
         return 0;
     }
@@ -518,7 +532,9 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_id(transac
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_outbound_transaction_get_destination_public_key(transaction: *mut TariPendingOutboundTransaction) -> *mut TariPublicKey {
+pub unsafe extern "C" fn pending_outbound_transaction_get_destination_public_key(
+    transaction: *mut TariPendingOutboundTransaction,
+) -> *mut TariPublicKey {
     if !transaction.is_null() {
         return ptr::null_mut();
     }
@@ -527,7 +543,9 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_destination_public_key
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_outbound_transaction_get_amount(transaction: *mut TariPendingOutboundTransaction) -> c_ulonglong {
+pub unsafe extern "C" fn pending_outbound_transaction_get_amount(
+    transaction: *mut TariPendingOutboundTransaction,
+) -> c_ulonglong {
     if !transaction.is_null() {
         return 0;
     }
@@ -535,7 +553,9 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_amount(transaction: *m
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_timestamp(transaction: *mut TariPendingOutboundTransaction) -> c_longlong {
+pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_timestamp(
+    transaction: *mut TariPendingOutboundTransaction,
+) -> c_longlong {
     if !transaction.is_null() {
         return 0;
     }
@@ -545,7 +565,9 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_timestamp(
 ///
 /// ----------------------------------- InboundTransaction ------------------------------------- ///
 #[no_mangle]
-pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_id(transaction: *mut TariPendingInboundTransaction) -> c_ulonglong {
+pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_id(
+    transaction: *mut TariPendingInboundTransaction,
+) -> c_ulonglong {
     if !transaction.is_null() {
         return 0;
     }
@@ -553,7 +575,9 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_id(transact
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_inbound_transaction_get_source_public_key(transaction: *mut TariPendingInboundTransaction) -> *mut TariPublicKey {
+pub unsafe extern "C" fn pending_inbound_transaction_get_source_public_key(
+    transaction: *mut TariPendingInboundTransaction,
+) -> *mut TariPublicKey {
     if !transaction.is_null() {
         return ptr::null_mut();
     }
@@ -562,7 +586,9 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_source_public_key(trans
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_inbound_transaction_get_amount(transaction: *mut TariPendingInboundTransaction) -> c_ulonglong {
+pub unsafe extern "C" fn pending_inbound_transaction_get_amount(
+    transaction: *mut TariPendingInboundTransaction,
+) -> c_ulonglong {
     if !transaction.is_null() {
         return 0;
     }
@@ -570,43 +596,15 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_amount(transaction: *mu
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_timestamp(transaction: *mut TariPendingInboundTransaction) -> c_longlong {
+pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_timestamp(
+    transaction: *mut TariPendingInboundTransaction,
+) -> c_longlong {
     if !transaction.is_null() {
         return 0;
     }
     (*transaction).timestamp.timestamp() as c_longlong
 }
 /// -------------------------------------------------------------------------------------------- ///
-/*
-#[derive(Debug, Clone)]
-pub struct InboundTransaction {
-    pub tx_id: TxId,
-    pub source_public_key: CommsPublicKey,
-    pub amount: MicroTari,
-    pub receiver_protocol: ReceiverTransactionProtocol,
-    pub timestamp: NaiveDateTime,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutboundTransaction {
-    pub tx_id: TxId,
-    pub destination_public_key: CommsPublicKey,
-    pub amount: MicroTari,
-    pub fee: MicroTari,
-    pub sender_protocol: SenderTransactionProtocol,
-    pub timestamp: NaiveDateTime,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompletedTransaction {
-    pub tx_id: TxId,
-    pub destination_public_key: CommsPublicKey,
-    pub amount: MicroTari,
-    pub fee: MicroTari,
-    pub transaction: Transaction,
-    pub timestamp: NaiveDateTime,
-}
-*/
 
 /// ----------------------------------- CommsConfig ---------------------------------------------///
 
@@ -703,7 +701,7 @@ pub unsafe extern "C" fn wallet_create(config: *mut TariCommsConfig) -> *mut Tar
                 Err(_) => ptr::null_mut(),
             }
         },
-        Err(_) => ptr::null_mut()
+        Err(_) => ptr::null_mut(),
     }
 }
 
@@ -746,50 +744,38 @@ pub unsafe extern "C" fn wallet_add_base_node_peer(
     }
 }
 
-pub unsafe extern "C" fn wallet_add_contact(
-    wallet: *mut TariWallet,
-    contact: *mut TariContact,
-) -> bool
-{
-    if wallet.is_null()
-    {
+pub unsafe extern "C" fn wallet_add_contact(wallet: *mut TariWallet, contact: *mut TariContact) -> bool {
+    if wallet.is_null() {
         return false;
     }
-    if contact.is_null()
-    {
+    if contact.is_null() {
         return false;
     }
 
     match (*wallet)
-    .runtime
-    .block_on((*wallet).contacts_service.save_contact((*contact).clone()))
-        {
-            Ok(_) => true,
-            Err(_) => false
-        }
+        .runtime
+        .block_on((*wallet).contacts_service.save_contact((*contact).clone()))
+    {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
-pub unsafe extern "C" fn wallet_remove_contact(
-    wallet: *mut TariWallet,
-    contact: *mut TariContact,
-) -> bool
-{
-    if wallet.is_null()
-    {
+pub unsafe extern "C" fn wallet_remove_contact(wallet: *mut TariWallet, contact: *mut TariContact) -> bool {
+    if wallet.is_null() {
         return false;
     }
-    if contact.is_null()
-    {
+    if contact.is_null() {
         return false;
     }
 
-    match  (*wallet)
+    match (*wallet)
         .runtime
         .block_on((*wallet).contacts_service.remove_contact((*contact).public_key.clone()))
-        {
-            Ok(_) => true,
-            Err(_) => false
-        }
+    {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 #[no_mangle]
@@ -877,11 +863,13 @@ pub unsafe extern "C" fn wallet_get_completed_transactions(wallet: *mut TariWall
         return ptr::null_mut();
     }
 
-    let completed_transactions = (*wallet).runtime.block_on((*wallet).transaction_service.get_completed_transactions());
+    let completed_transactions = (*wallet)
+        .runtime
+        .block_on((*wallet).transaction_service.get_completed_transactions());
     match completed_transactions {
         Ok(completed_transactions) => {
             for (_id, tx) in &completed_transactions {
-                completed.push( tx.clone());
+                completed.push(tx.clone());
             }
             Box::into_raw(Box::new(TariCompletedTransactions(completed)))
         },
@@ -890,17 +878,21 @@ pub unsafe extern "C" fn wallet_get_completed_transactions(wallet: *mut TariWall
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wallet_get_pending_inbound_transactions(wallet: *mut TariWallet) -> *mut TariPendingInboundTransactions {
+pub unsafe extern "C" fn wallet_get_pending_inbound_transactions(
+    wallet: *mut TariWallet,
+) -> *mut TariPendingInboundTransactions {
     let mut pending = Vec::new();
     if wallet.is_null() {
         return ptr::null_mut();
     }
 
-    let pending_transactions = (*wallet).runtime.block_on((*wallet).transaction_service.get_pending_inbound_transactions());
+    let pending_transactions = (*wallet)
+        .runtime
+        .block_on((*wallet).transaction_service.get_pending_inbound_transactions());
     match pending_transactions {
         Ok(pending_transactions) => {
             for (_id, tx) in &pending_transactions {
-                pending.push( tx.clone());
+                pending.push(tx.clone());
             }
             Box::into_raw(Box::new(TariPendingInboundTransactions(pending)))
         },
@@ -909,13 +901,17 @@ pub unsafe extern "C" fn wallet_get_pending_inbound_transactions(wallet: *mut Ta
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn wallet_get_pending_outbound_transactions(wallet: *mut TariWallet) -> *mut TariPendingOutboundTransactions {
+pub unsafe extern "C" fn wallet_get_pending_outbound_transactions(
+    wallet: *mut TariWallet,
+) -> *mut TariPendingOutboundTransactions {
     let mut pending = Vec::new();
     if wallet.is_null() {
         return ptr::null_mut();
     }
 
-    let pending_transactions = (*wallet).runtime.block_on((*wallet).transaction_service.get_pending_outbound_transactions());
+    let pending_transactions = (*wallet)
+        .runtime
+        .block_on((*wallet).transaction_service.get_pending_outbound_transactions());
     match pending_transactions {
         Ok(pending_transactions) => {
             for (_id, tx) in &pending_transactions {
@@ -926,6 +922,91 @@ pub unsafe extern "C" fn wallet_get_pending_outbound_transactions(wallet: *mut T
         Err(_) => ptr::null_mut(),
     }
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn wallet_get_pending_completed_transaction_by_id(
+    wallet: *mut TariWallet,
+    transaction_id: c_ulonglong
+) -> *mut TariCompletedTransaction {
+    if wallet.is_null() {
+        return ptr::null_mut();
+    }
+
+    let pending_transactions = (*wallet)
+        .runtime
+        .block_on((*wallet).transaction_service.get_completed_transactions());
+
+    match pending_transactions {
+        Ok(pending_transactions) => {
+            for (id, tx) in &pending_transactions {
+                if id == &transaction_id
+                {
+                    let pending = tx.clone();
+                    return Box::into_raw(Box::new(pending));
+                }
+            }
+            return ptr::null_mut();
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wallet_get_pending_inbound_transaction_by_id(
+    wallet: *mut TariWallet,
+    transaction_id: c_ulonglong
+) -> *mut TariPendingInboundTransaction {
+    if wallet.is_null() {
+        return ptr::null_mut();
+    }
+
+    let pending_transactions = (*wallet)
+        .runtime
+        .block_on((*wallet).transaction_service.get_pending_inbound_transactions());
+
+    match pending_transactions {
+        Ok(pending_transactions) => {
+            for (id, tx) in &pending_transactions {
+                if id == &transaction_id
+                {
+                    let pending = tx.clone();
+                    return Box::into_raw(Box::new(pending));
+                }
+            }
+            return ptr::null_mut();
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wallet_get_pending_outbound_transaction_by_id(
+    wallet: *mut TariWallet,
+    transaction_id: c_ulonglong
+) -> *mut TariPendingOutboundTransaction {
+    if wallet.is_null() {
+        return ptr::null_mut();
+    }
+
+    let pending_transactions = (*wallet)
+        .runtime
+        .block_on((*wallet).transaction_service.get_pending_outbound_transactions());
+
+    match pending_transactions {
+        Ok(pending_transactions) => {
+            for (id, tx) in &pending_transactions {
+                if id == &transaction_id
+                {
+                    let pending = tx.clone();
+                    return Box::into_raw(Box::new(pending));
+                }
+            }
+            return ptr::null_mut();
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
 
 #[no_mangle]
 pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
@@ -985,6 +1066,52 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
 // }
 //
 
+#[no_mangle]
+#[derive(Debug, Clone, Copy)]
+pub struct CallBacks {
+    pub call_back_received_transaction: Option<extern "C" fn(c_ulonglong)>,
+    pub call_back_received_transaction_reply: Option<extern "C" fn(c_ulonglong)>,
+}
+
+impl CallBacks {
+    pub fn new() -> CallBacks {
+        CallBacks {
+            call_back_received_transaction: None,
+            call_back_received_transaction_reply: None,
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn call_back_create() -> *const () {
+    let callbacks = CallBacks::new();
+    Box::into_raw(Box::new(callbacks)) as *const _
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn call_back_register_received_transaction(
+    callbacks: *mut CallBacks,
+    call: extern "C" fn(c_ulonglong),
+)
+{
+    (*callbacks).call_back_received_transaction = Some(call);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn call_back_register_received_transaction_reply(
+    callbacks: *mut CallBacks,
+    call: extern "C" fn(c_ulonglong),
+)
+{
+    (*callbacks).call_back_received_transaction_reply = Some(call);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn callbacks_desktroy(calls: *mut CallBacks) {
+    if !calls.is_null() {
+        Box::from_raw(calls);
+    }
+}
 // ------------------------------------------------------------------------------------------------
 // Callback Functions
 // ------------------------------------------------------------------------------------------------
@@ -992,11 +1119,9 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
 // LibWallet can directly respond to the client when events occur
 
 // TODO Callbacks to be written and registered to receive the following events
-// Received a transaction
-// Received a transaction reply
-// Transaction hit the mempool (send and receive)
-// Transaction is mined
-// Transaction is confirmed
+// Transaction hit the mempool (send and receive), wallet needs to be extended for this
+// Transaction is mined, wallet needs to be extended for this
+// Transaction is confirmed, wallet needs to be extended for this
 
 #[cfg(test)]
 mod test {
