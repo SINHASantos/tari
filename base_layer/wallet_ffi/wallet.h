@@ -225,6 +225,8 @@ struct TariPendingInboundTransaction *wallet_get_pending_inbound_transaction_by_
 
 void wallet_destroy(struct TariWallet *wallet);
 
-///TODO expose callbacks
+bool call_back_register_received_transaction(struct TariWallet*, void (*ptr)(struct TariPendingInboundTransaction*));
+
+bool call_back_register_received_transaction_reply(struct TariWallet*, void (*ptr)(struct TariCompletedTransaction*));
 
 #endif /* wallet_ffi_h */
