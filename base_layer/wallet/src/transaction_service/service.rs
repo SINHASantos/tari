@@ -211,23 +211,25 @@ where
             TransactionServiceRequest::GetCompletedTransactions => Ok(
                 TransactionServiceResponse::CompletedTransactions(self.get_completed_transactions()?),
             ),
-            TransactionServiceRequest::RegisterCallbackReceivedTransaction(call) =>
-                self.register_callback_received_transaction(call).await.map(|_| TransactionServiceResponse::CallbackRegistered),
-            TransactionServiceRequest::RegisterCallbackReceivedTransactionReply(call) =>
-                self.register_callback_received_transaction_reply(call).await.map(|_| TransactionServiceResponse::CallbackRegistered),
+            TransactionServiceRequest::RegisterCallbackReceivedTransaction(call) => Ok (
+                self.register_callback_received_transaction(call)?
+            ),
+            TransactionServiceRequest::RegisterCallbackReceivedTransactionReply(call) => Ok(
+                self.register_callback_received_transaction_reply(call)?
+            ),
         }
     }
 
-    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
+    pub fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<TransactionServiceResponse, TransactionServiceError>
     {
         self.callback_received_transaction = Some(call);
-        Ok(())
+        Ok(TransactionServiceResponse::CallbackRegistered)
     }
 
-    pub async fn register_callback_received_transaction_reply(&mut self, call:extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
+    pub fn register_callback_received_transaction_reply(&mut self, call:extern "C" fn(*mut CompletedTransaction)) -> Result<TransactionServiceResponse, TransactionServiceError>
     {
         self.callback_received_transaction_reply = Some(call);
-        Ok(())
+        Ok(TransactionServiceResponse::CallbackRegistered)
     }
 
     /// Sends a new transaction to a recipient

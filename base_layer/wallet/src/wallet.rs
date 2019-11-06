@@ -60,6 +60,7 @@ use tari_p2p::{
 use tari_service_framework::StackBuilder;
 use tokio::runtime::Runtime;
 use crate::transaction_service::storage::database::{InboundTransaction, CompletedTransaction};
+use crate::transaction_service::error::TransactionServiceError;
 
 #[derive(Clone)]
 pub struct WalletConfig {
@@ -144,14 +145,16 @@ where T: WalletBackend
         })
     }
 
-    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction))
+    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
     {
-        self.transaction_service.register_callback_received_transaction(call).await.unwrap();
+        self.transaction_service.register_callback_received_transaction(call).await?;
+        Ok(())
     }
 
-    pub async fn register_callback_received_transaction_reply(&mut self, call: extern "C" fn(*mut CompletedTransaction))
+    pub async fn register_callback_received_transaction_reply(&mut self, call: extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
     {
-        self.transaction_service.register_callback_received_transaction_reply(call).await.unwrap();
+        self.transaction_service.register_callback_received_transaction_reply(call).await?;
+        Ok(())
     }
 
     /// This method consumes the wallet so that the handles are dropped which will result in the services async loops

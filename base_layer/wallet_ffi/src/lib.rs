@@ -42,12 +42,12 @@ use tari_comms::peer_manager::NodeIdentity;
 use tari_crypto::keys::SecretKey;
 use tari_transactions::tari_amount::MicroTari;
 use tari_utilities::ByteArray;
-use tari_wallet::wallet::{WalletConfig};
+use tari_wallet::wallet::WalletConfig;
 
 use core::ptr;
 use std::{sync::Arc, time::Duration};
 use tari_comms::{connection::NetAddress, control_service::ControlServiceConfig, peer_manager::PeerFeatures};
-use tari_crypto::{keys::PublicKey};
+use tari_crypto::keys::PublicKey;
 use tari_utilities::hex::Hex;
 use tari_wallet::{
     contacts_service::storage::database::Contact,
@@ -55,7 +55,6 @@ use tari_wallet::{
     test_utils::generate_wallet_test_data,
 };
 use tokio::runtime::Runtime;
-use futures::executor::block_on;
 
 pub type TariWallet = tari_wallet::wallet::Wallet<WalletMemoryDatabase>;
 pub type TariPublicKey = tari_comms::types::CommsPublicKey;
@@ -411,7 +410,7 @@ pub unsafe extern "C" fn pending_outbound_transactions_get_at(
         return ptr::null_mut();
     }
     if position > len {
-        return ptr::null_mut()
+        return ptr::null_mut();
     }
     Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
@@ -452,7 +451,7 @@ pub unsafe extern "C" fn pending_inbound_transactions_get_at(
         return ptr::null_mut();
     }
     if position < 0 {
-        return ptr::null_mut()
+        return ptr::null_mut();
     }
     if position > len {
         return ptr::null_mut();
@@ -925,8 +924,9 @@ pub unsafe extern "C" fn wallet_get_pending_outbound_transactions(
 #[no_mangle]
 pub unsafe extern "C" fn wallet_get_completed_transaction_by_id(
     wallet: *mut TariWallet,
-    transaction_id: c_ulonglong
-) -> *mut TariCompletedTransaction {
+    transaction_id: c_ulonglong,
+) -> *mut TariCompletedTransaction
+{
     if wallet.is_null() {
         return ptr::null_mut();
     }
@@ -938,8 +938,7 @@ pub unsafe extern "C" fn wallet_get_completed_transaction_by_id(
     match pending_transactions {
         Ok(pending_transactions) => {
             for (id, tx) in &pending_transactions {
-                if id == &transaction_id
-                {
+                if id == &transaction_id {
                     let pending = tx.clone();
                     return Box::into_raw(Box::new(pending));
                 }
@@ -953,8 +952,9 @@ pub unsafe extern "C" fn wallet_get_completed_transaction_by_id(
 #[no_mangle]
 pub unsafe extern "C" fn wallet_get_pending_inbound_transaction_by_id(
     wallet: *mut TariWallet,
-    transaction_id: c_ulonglong
-) -> *mut TariPendingInboundTransaction {
+    transaction_id: c_ulonglong,
+) -> *mut TariPendingInboundTransaction
+{
     if wallet.is_null() {
         return ptr::null_mut();
     }
@@ -966,8 +966,7 @@ pub unsafe extern "C" fn wallet_get_pending_inbound_transaction_by_id(
     match pending_transactions {
         Ok(pending_transactions) => {
             for (id, tx) in &pending_transactions {
-                if id == &transaction_id
-                {
+                if id == &transaction_id {
                     let pending = tx.clone();
                     return Box::into_raw(Box::new(pending));
                 }
@@ -981,8 +980,9 @@ pub unsafe extern "C" fn wallet_get_pending_inbound_transaction_by_id(
 #[no_mangle]
 pub unsafe extern "C" fn wallet_get_pending_outbound_transaction_by_id(
     wallet: *mut TariWallet,
-    transaction_id: c_ulonglong
-) -> *mut TariPendingOutboundTransaction {
+    transaction_id: c_ulonglong,
+) -> *mut TariPendingOutboundTransaction
+{
     if wallet.is_null() {
         return ptr::null_mut();
     }
@@ -994,8 +994,7 @@ pub unsafe extern "C" fn wallet_get_pending_outbound_transaction_by_id(
     match pending_transactions {
         Ok(pending_transactions) => {
             for (id, tx) in &pending_transactions {
-                if id == &transaction_id
-                {
+                if id == &transaction_id {
                     let pending = tx.clone();
                     return Box::into_raw(Box::new(pending));
                 }
@@ -1005,7 +1004,6 @@ pub unsafe extern "C" fn wallet_get_pending_outbound_transaction_by_id(
         Err(_) => ptr::null_mut(),
     }
 }
-
 
 #[no_mangle]
 pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
@@ -1065,60 +1063,62 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
 // }
 //
 
-/*
-#[derive(Debug, Clone, Copy)]
-pub struct CallBacks {
-    pub call_back_received_transaction: Option<extern "C" fn(c_ulonglong)>,
-    pub call_back_received_transaction_reply: Option<extern "C" fn(c_ulonglong)>,
-}
+// #[derive(Debug, Clone, Copy)]
+// pub struct CallBacks {
+// pub call_back_received_transaction: Option<extern "C" fn(c_ulonglong)>,
+// pub call_back_received_transaction_reply: Option<extern "C" fn(c_ulonglong)>,
+// }
+//
+// impl CallBacks {
+// pub fn new() -> CallBacks {
+// CallBacks {
+// call_back_received_transaction: None,
+// call_back_received_transaction_reply: None,
+// }
+// }
+// }
+//
+//
+// #[no_mangle]
+// pub unsafe extern "C" fn call_back_create() -> *const () {
+// let callbacks = CallBacks::new();
+// Box::into_raw(Box::new(callbacks)) as *const _
+// }
 
-impl CallBacks {
-    pub fn new() -> CallBacks {
-        CallBacks {
-            call_back_received_transaction: None,
-            call_back_received_transaction_reply: None,
-        }
-    }
-}
+/// ------------------------------------- Callbacks -------------------------------------------- ///
 
+// These functions must be implemented by the FFI client and registered with LibWallet so that
+// LibWallet can directly respond to the client when events occur
 
-#[no_mangle]
-pub unsafe extern "C" fn call_back_create() -> *const () {
-    let callbacks = CallBacks::new();
-    Box::into_raw(Box::new(callbacks)) as *const _
-}
-*/
 #[no_mangle]
 pub unsafe extern "C" fn call_back_register_received_transaction(
     wallet: *mut TariWallet,
     call: extern "C" fn(*mut TariPendingInboundTransaction),
-)
+) -> bool
 {
-    block_on((*wallet).register_callback_received_transaction(call));
+    let result = (*wallet)
+        .runtime
+        .block_on((*wallet).register_callback_received_transaction(call));
+    match result {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn call_back_register_received_transaction_reply(
     wallet: *mut TariWallet,
     call: extern "C" fn(*mut TariCompletedTransaction),
-)
+) -> bool
 {
-    block_on((*wallet).register_callback_received_transaction_reply(call));
-}
-/*
-#[no_mangle]
-pub unsafe extern "C" fn callbacks_destroy(calls: *mut CallBacks) {
-    if !calls.is_null() {
-        Box::from_raw(calls);
+    let result = (*wallet)
+        .runtime
+        .block_on((*wallet).register_callback_received_transaction_reply(call));
+    match result {
+        Ok(_) => true,
+        Err(_) => false,
     }
 }
-*/
-
-// ------------------------------------------------------------------------------------------------
-// Callback Functions
-// ------------------------------------------------------------------------------------------------
-// These functions must be implemented by the FFI client and registered with LibWallet so that
-// LibWallet can directly respond to the client when events occur
 
 // TODO Callbacks to be written and registered to receive the following events
 // Transaction hit the mempool (send and receive), wallet needs to be extended for this
