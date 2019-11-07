@@ -145,13 +145,13 @@ where T: WalletBackend
         })
     }
 
-    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
+    pub async fn register_callback_received_transaction(&mut self, call: unsafe extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
     {
         self.transaction_service.register_callback_received_transaction(call).await?;
         Ok(())
     }
 
-    pub async fn register_callback_received_transaction_reply(&mut self, call: extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
+    pub async fn register_callback_received_transaction_reply(&mut self, call: unsafe extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
     {
         self.transaction_service.register_callback_received_transaction_reply(call).await?;
         Ok(())

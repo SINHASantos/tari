@@ -39,8 +39,8 @@ pub enum TransactionServiceRequest {
     GetPendingOutboundTransactions,
     GetCompletedTransactions,
     SendTransaction((CommsPublicKey, MicroTari, MicroTari)),
-    RegisterCallbackReceivedTransaction((extern "C" fn(*mut InboundTransaction))),
-    RegisterCallbackReceivedTransactionReply((extern "C" fn(*mut CompletedTransaction)))
+    RegisterCallbackReceivedTransaction((unsafe extern "C" fn(*mut InboundTransaction))),
+    RegisterCallbackReceivedTransactionReply((unsafe extern "C" fn(*mut CompletedTransaction)))
 }
 
 /// API Response enum
@@ -140,7 +140,7 @@ impl TransactionServiceHandle {
         }
     }
 
-    pub async fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
+    pub async fn register_callback_received_transaction(&mut self, call: unsafe extern "C" fn(*mut InboundTransaction)) -> Result<(), TransactionServiceError>
     {
        match self
             .handle
@@ -152,7 +152,7 @@ impl TransactionServiceHandle {
         }
     }
 
-    pub async fn register_callback_received_transaction_reply(&mut self, call: extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
+    pub async fn register_callback_received_transaction_reply(&mut self, call: unsafe extern "C" fn(*mut CompletedTransaction)) -> Result<(), TransactionServiceError>
     {
         match self
             .handle

@@ -87,8 +87,8 @@ where TBackend: TransactionBackend
         reply_channel::Receiver<TransactionServiceRequest, Result<TransactionServiceResponse, TransactionServiceError>>,
     >,
     event_publisher: Publisher<TransactionEvent>,
-    callback_received_transaction: Option<extern "C" fn(*mut InboundTransaction)>,
-    callback_received_transaction_reply: Option<extern "C" fn(*mut CompletedTransaction)>
+    callback_received_transaction: Option<unsafe extern "C" fn(*mut InboundTransaction)>,
+    callback_received_transaction_reply: Option<unsafe extern "C" fn(*mut CompletedTransaction)>
 }
 
 impl<TTxStream, TTxReplyStream, TBackend> TransactionService<TTxStream, TTxReplyStream, TBackend>
@@ -220,13 +220,13 @@ where
         }
     }
 
-    pub fn register_callback_received_transaction(&mut self, call: extern "C" fn(*mut InboundTransaction)) -> Result<TransactionServiceResponse, TransactionServiceError>
+    pub fn register_callback_received_transaction(&mut self, call: unsafe extern "C" fn(*mut InboundTransaction)) -> Result<TransactionServiceResponse, TransactionServiceError>
     {
         self.callback_received_transaction = Some(call);
         Ok(TransactionServiceResponse::CallbackRegistered)
     }
 
-    pub fn register_callback_received_transaction_reply(&mut self, call:extern "C" fn(*mut CompletedTransaction)) -> Result<TransactionServiceResponse, TransactionServiceError>
+    pub fn register_callback_received_transaction_reply(&mut self, call: unsafe extern "C" fn(*mut CompletedTransaction)) -> Result<TransactionServiceResponse, TransactionServiceError>
     {
         self.callback_received_transaction_reply = Some(call);
         Ok(TransactionServiceResponse::CallbackRegistered)
@@ -334,9 +334,10 @@ where
             .send(TransactionEvent::ReceivedTransactionReply)
             .await
             .map_err(|_| TransactionServiceError::EventStreamError)?;
+        let boxing = Box::into_raw(Box::new(completed_transaction));
         match self.callback_received_transaction_reply
             {
-                Some(call) => call(Box::into_raw(Box::new(completed_transaction))),
+                Some(call) =>{ unsafe { call(boxing) } },
                 None => {}
             }
         Ok(())
@@ -418,7 +419,7 @@ where
 
             match self.callback_received_transaction
                 {
-                    Some(call) => call(Box::into_raw(Box::new(inbound_transaction))),
+                    Some(call) => { unsafe { call(Box::into_raw(Box::new(inbound_transaction))) } },
                     None => {}
                 }
         }
