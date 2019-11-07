@@ -32,7 +32,7 @@
 extern crate libc;
 extern crate tari_wallet;
 
-use libc::{c_char, c_int, c_longlong, c_uchar, c_ulonglong};
+use libc::{c_char, c_uint, c_int, c_longlong, c_uchar, c_ulonglong};
 use std::{
     boxed::Box,
     ffi::{CStr, CString},
@@ -81,7 +81,7 @@ pub struct ByteVector(Vec<c_uchar>); // declared like this so that it can be exp
 /// `()` - Does not return a value, equivalent to void in C.
 
 #[no_mangle]
-pub unsafe extern "C" fn free_string(ptr: *mut c_char) {
+pub unsafe extern "C" fn string_destroy(ptr: *mut c_char) {
     if !ptr.is_null() {
         let _ = CString::from_raw(ptr);
     }
@@ -101,7 +101,7 @@ pub unsafe extern "C" fn free_string(ptr: *mut c_char) {
 /// if the byte_array pointer was null or if the elements in the byte_vector don't match
 /// element_count when it is created
 #[no_mangle]
-pub unsafe extern "C" fn byte_vector_create(byte_array: *const c_uchar, element_count: c_int) -> *mut ByteVector {
+pub unsafe extern "C" fn byte_vector_create(byte_array: *const c_uchar, element_count: c_uint) -> *mut ByteVector {
     let mut bytes = ByteVector(Vec::new());
     if byte_array.is_null() {
         return ptr::null_mut();
@@ -139,17 +139,15 @@ pub unsafe extern "C" fn byte_vector_destroy(bytes: *mut ByteVector) {
 /// `c_uchar` - Returns a character. Note that the character will be a null terminator (0) if ptr
 /// is null or if the position is invalid
 #[no_mangle]
-pub unsafe extern "C" fn byte_vector_get_at(ptr: *mut ByteVector, position: c_int) -> c_uchar {
+pub unsafe extern "C" fn byte_vector_get_at(ptr: *mut ByteVector, position: c_uint) -> c_uchar {
     if ptr.is_null() {
         return 0 as c_uchar;
     }
-    let len = byte_vector_get_length(ptr) - 1; // clamp to length
+    let len= byte_vector_get_length(ptr) as c_int - 1; // clamp to length
     if len < 0 {
         return 0 as c_uchar;
     }
-    if position < 0 {
-        return 0 as c_uchar;
-    } else if position > len {
+    if position > len as c_uint {
         return 0 as c_uchar;
     }
     (*ptr).0.clone()[position as usize]
@@ -161,14 +159,14 @@ pub unsafe extern "C" fn byte_vector_get_at(ptr: *mut ByteVector, position: c_in
 /// `ptr` - The pointer to a ByteVector
 ///
 /// ## Returns
-/// `c_int` - Returns the integer number of elements in the ByteVector. Note that it will be zero
+/// `c_uint` - Returns the integer number of elements in the ByteVector. Note that it will be zero
 /// if ptr is null
 #[no_mangle]
-pub unsafe extern "C" fn byte_vector_get_length(vec: *const ByteVector) -> c_int {
+pub unsafe extern "C" fn byte_vector_get_length(vec: *const ByteVector) -> c_uint {
     if vec.is_null() {
         return 0;
     }
-    (&*vec).0.len() as c_int
+    (&*vec).0.len() as c_uint
 }
 
 /// -------------------------------------------------------------------------------------------- ///
@@ -332,6 +330,7 @@ pub unsafe extern "C" fn private_key_get_bytes(pk: *mut TariPrivateKey) -> *mut 
 /// Generates a TariPrivateKey
 ///
 /// ## Arguments
+/// `()` - Does  not take any arguments
 ///
 /// ## Returns
 /// `*mut TariPrivateKey` - Returns a pointer to a TariPrivateKey
@@ -406,7 +405,7 @@ pub unsafe extern "C" fn contact_create(alias: *const c_char, public_key: *mut T
 /// `contact` - The pointer to a TariContact
 ///
 /// ## Returns
-/// `*mut c_char` - Returns a pointer to a char array. Note that it returns an empty char array is
+/// `*mut c_char` - Returns a pointer to a char array. Note that it returns an empty char array if
 /// contact is null
 #[no_mangle]
 pub unsafe extern "C" fn contact_get_alias(contact: *mut TariContact) -> *mut c_char {
@@ -417,6 +416,14 @@ pub unsafe extern "C" fn contact_get_alias(contact: *mut TariContact) -> *mut c_
     CString::into_raw(a)
 }
 
+/// Gets the TariPublicKey of the TariContact
+///
+/// ## Arguments
+/// `contact` - The pointer to a TariContact
+///
+/// ## Returns
+/// `*mut TariPublicKey` - Returns a pointer to a TariPublicKey. Note that it returns
+/// ptr::null_mut() if contact is null
 #[no_mangle]
 pub unsafe extern "C" fn contact_get_public_key(contact: *mut TariContact) -> *mut TariPublicKey {
     if contact.is_null() {
@@ -425,6 +432,13 @@ pub unsafe extern "C" fn contact_get_public_key(contact: *mut TariContact) -> *m
     Box::into_raw(Box::new((*contact).public_key.clone()))
 }
 
+/// Destroys the TariContact
+///
+/// ## Arguments
+/// `contact` - The pointer to a TariContact
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn contact_destroy(contact: *mut TariContact) {
     if !contact.is_null() {
@@ -434,36 +448,53 @@ pub unsafe extern "C" fn contact_destroy(contact: *mut TariContact) {
 
 /// ----------------------------------- Contacts -------------------------------------------------///
 
-// no create since cloned from wallet, never passed to wallet
-
+/// Gets the length of TariContacts
+///
+/// ## Arguments
+/// `contacts` - The pointer to a TariContacts
+///
+/// ## Returns
+/// `c_uint` - Returns number of elements in , zero if contacts is null
 #[no_mangle]
-pub unsafe extern "C" fn contacts_get_length(contact: *mut TariContacts) -> c_int {
+pub unsafe extern "C" fn contacts_get_length(contacts: *mut TariContacts) -> c_uint {
     let mut len = 0;
-    if !contact.is_null() {
-        len = (*contact).0.len();
+    if !contacts.is_null() {
+        len = (*contacts).0.len();
     }
-    len as c_int
+    len as c_uint
 }
 
+/// Gets a TariContact from TariContacts at position
+///
+/// ## Arguments
+/// `contacts` - The pointer to a TariContacts
+/// `position` - The integer position
+///
+/// ## Returns
+/// `*mut TariContact` - Returns a TariContact, note that it returns ptr::null_mut() if contacts is
+/// null or position is invalid
 #[no_mangle]
-pub unsafe extern "C" fn contacts_get_at(contacts: *mut TariContacts, position: c_int) -> *mut TariContact {
+pub unsafe extern "C" fn contacts_get_at(contacts: *mut TariContacts, position: c_uint) -> *mut TariContact {
     if contacts.is_null() {
         return ptr::null_mut();
     }
-    let len = contacts_get_length(contacts) - 1;
+    let len = contacts_get_length(contacts) as c_int - 1;
     if len < 0 {
         return ptr::null_mut();
     }
-    if position < 0 {
-        return ptr::null_mut();
-    }
-    if position > len {
+    if position > len as c_uint {
         return ptr::null_mut();
     }
     Box::into_raw(Box::new((*contacts).0[position as usize].clone()))
 }
 
-// destructor since cloned from wallet
+/// Destroys the TariContacts
+///
+/// ## Arguments
+/// `contacts` - The pointer to a TariContacts
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn contacts_destroy(contacts: *mut TariContacts) {
     if !contacts.is_null() {
@@ -474,38 +505,59 @@ pub unsafe extern "C" fn contacts_destroy(contacts: *mut TariContacts) {
 /// -------------------------------------------------------------------------------------------- ///
 
 /// ----------------------------------- CompletedTransactions ----------------------------------- ///
+
+/// Gets the length of a TariCompletedTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariCompletedTransactions
+///
+/// ## Returns
+/// `c_uint` - Returns the number of elements in a TariCompletedTransactions, not that it will be
+/// zero if transactions is null
 #[no_mangle]
-pub unsafe extern "C" fn completed_transactions_get_length(transactions: *mut TariCompletedTransactions) -> c_int {
+pub unsafe extern "C" fn completed_transactions_get_length(transactions: *mut TariCompletedTransactions) -> c_uint {
     let mut len = 0;
     if !transactions.is_null() {
         len = (*transactions).0.len();
     }
-    len as c_int
+    len as c_uint
 }
 
+/// Gets a TariCompletedTransaction from a TariCompletedTransactions at position
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariCompletedTransactions
+/// `position` - The integer position
+///
+/// ## Returns
+/// `*mut TariCompletedTransaction` - Returns a pointer to a TariCompletedTransaction,
+/// note that ptr::null_mut() is returned if transactions is null or position is invalid
 #[no_mangle]
-pub unsafe extern "C" fn ccompleted_transactions_get_at(
+pub unsafe extern "C" fn completed_transactions_get_at(
     transactions: *mut TariCompletedTransactions,
-    position: c_int,
+    position: c_uint,
 ) -> *mut TariCompletedTransaction
 {
     if transactions.is_null() {
         return ptr::null_mut();
     }
-    let len = completed_transactions_get_length(transactions) - 1;
+    let len = completed_transactions_get_length(transactions) as c_int - 1;
     if len < 0 {
         return ptr::null_mut();
     }
-    if position < 0 {
-        return ptr::null_mut();
-    }
-    if position > len {
+    if position > len as c_uint {
         return ptr::null_mut();
     }
     Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
 
-// destructor since cloned from wallet
+/// Destroys a TariCompletedTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn completed_transactions_destroy(transactions: *mut TariCompletedTransactions) {
     if !transactions.is_null() {
@@ -516,40 +568,61 @@ pub unsafe extern "C" fn completed_transactions_destroy(transactions: *mut TariC
 /// -------------------------------------------------------------------------------------------- ///
 
 /// ----------------------------------- OutboundTransactions ------------------------------------ ///
+
+/// Gets the length of a TariPendingOutboundTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariPendingOutboundTransactions
+///
+/// ## Returns
+/// `c_uint` - Returns the number of elements in a TariPendingOutboundTransactions, note that it will be
+/// zero if transactions is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transactions_get_length(
     transactions: *mut TariPendingOutboundTransactions,
-) -> c_int {
+) -> c_uint {
     let mut len = 0;
     if !transactions.is_null() {
         len = (*transactions).0.len();
     }
-    len as c_int
+    len as c_uint
 }
 
+/// Gets a TariPendingOutboundTransaction of a TariPendingOutboundTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariPendingOutboundTransactions
+/// `position` - The integer position
+///
+/// ## Returns
+/// `*mut TariPendingOutboundTransaction` - Returns a pointer to a TariPendingOutboundTransaction,
+/// note that ptr::null_mut() is returned if transactions is null or position is invalid
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transactions_get_at(
     transactions: *mut TariPendingOutboundTransactions,
-    position: c_int,
+    position: c_uint,
 ) -> *mut TariPendingOutboundTransaction
 {
     if transactions.is_null() {
         return ptr::null_mut();
     }
-    let len = pending_outbound_transactions_get_length(transactions) - 1;
+    let len = pending_outbound_transactions_get_length(transactions) as c_int - 1;
     if len < 0 {
         return ptr::null_mut();
     }
-    if position < 0 {
-        return ptr::null_mut();
-    }
-    if position > len {
+    if position > len as c_uint {
         return ptr::null_mut();
     }
     Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
 
-// destructor since cloned from wallet
+/// Destroys a TariCompletedTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariPendingOutboundTransactions
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transactions_destroy(transactions: *mut TariPendingOutboundTransactions) {
     if !transactions.is_null() {
@@ -560,40 +633,61 @@ pub unsafe extern "C" fn pending_outbound_transactions_destroy(transactions: *mu
 /// -------------------------------------------------------------------------------------------- ///
 
 /// ----------------------------------- InboundTransactions ------------------------------------- ///
+
+/// Gets the length of a TariPendingInboundTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariPendingInboundTransactions
+///
+/// ## Returns
+/// `c_uint` - Returns the number of elements in a TariPendingInboundTransactions, note that
+/// it will be zero if transactions is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transactions_get_length(
     transactions: *mut TariPendingInboundTransactions,
-) -> c_int {
+) -> c_uint {
     let mut len = 0;
     if !transactions.is_null() {
         len = (*transactions).0.len();
     }
-    len as c_int
+    len as c_uint
 }
 
+/// Gets a TariPendingInboundTransaction of a TariPendingInboundTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariPendingInboundTransactions
+/// `position` - The integer position
+///
+/// ## Returns
+/// `*mut TariPendingOutboundTransaction` - Returns a pointer to a TariPendingInboundTransaction,
+/// note that ptr::null_mut() is returned if transactions is null or position is invalid
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transactions_get_at(
     transactions: *mut TariPendingInboundTransactions,
-    position: c_int,
+    position: c_uint,
 ) -> *mut TariPendingInboundTransaction
 {
     if transactions.is_null() {
         return ptr::null_mut();
     }
-    let len = pending_inbound_transactions_get_length(transactions) - 1;
+    let len = pending_inbound_transactions_get_length(transactions) as c_int - 1;
     if len < 0 {
         return ptr::null_mut();
     }
-    if position < 0 {
-        return ptr::null_mut();
-    }
-    if position > len {
+    if position > len as c_uint {
         return ptr::null_mut();
     }
     Box::into_raw(Box::new((*transactions).0[position as usize].clone()))
 }
 
-// destructor since cloned from wallet
+/// Destroys a TariCompletedTransactions
+///
+/// ## Arguments
+/// `transactions` - The pointer to a TariPendingInboundTransactions
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transactions_destroy(transactions: *mut TariPendingInboundTransactions) {
     if !transactions.is_null() {
@@ -604,6 +698,14 @@ pub unsafe extern "C" fn pending_inbound_transactions_destroy(transactions: *mut
 /// -------------------------------------------------------------------------------------------- ///
 
 /// ----------------------------------- CompletedTransaction ------------------------------------- ///
+
+/// Gets the TransactionID of a TariCompletedTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the TransactionID, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_get_transaction_id(
     transaction: *mut TariCompletedTransaction,
@@ -614,6 +716,14 @@ pub unsafe extern "C" fn completed_transaction_get_transaction_id(
     (*transaction).tx_id as c_ulonglong
 }
 
+/// Gets the destination TariPublicKey of a TariCompletedTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `*mut TairPublicKey` - Returns the destination TariPublicKey, note that it will be
+/// ptr::null_mut() if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_get_destination_public_key(
     transaction: *mut TariCompletedTransaction,
@@ -625,6 +735,13 @@ pub unsafe extern "C" fn completed_transaction_get_destination_public_key(
     Box::into_raw(Box::new(m))
 }
 
+/// Gets the amount of a TariCompletedTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the amount, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_get_amount(transaction: *mut TariCompletedTransaction) -> c_ulonglong {
     if transaction.is_null() {
@@ -633,6 +750,13 @@ pub unsafe extern "C" fn completed_transaction_get_amount(transaction: *mut Tari
     c_ulonglong::from((*transaction).amount)
 }
 
+/// Gets the fee of a TariCompletedTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the fee, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_get_fee(transaction: *mut TariCompletedTransaction) -> c_ulonglong {
     if transaction.is_null() {
@@ -641,6 +765,13 @@ pub unsafe extern "C" fn completed_transaction_get_fee(transaction: *mut TariCom
     c_ulonglong::from((*transaction).fee)
 }
 
+/// Gets the timestamp of a TariCompletedTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the timestamp, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_get_transaction_timestamp(
     transaction: *mut TariCompletedTransaction,
@@ -651,6 +782,13 @@ pub unsafe extern "C" fn completed_transaction_get_transaction_timestamp(
     (*transaction).timestamp.timestamp() as c_longlong
 }
 
+/// Destroys a TariCompletedTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn completed_transaction_destroy(transaction: *mut TariCompletedTransaction) {
     if !transaction.is_null() {
@@ -661,6 +799,14 @@ pub unsafe extern "C" fn completed_transaction_destroy(transaction: *mut TariCom
 /// -------------------------------------------------------------------------------------------- ///
 
 /// ----------------------------------- OutboundTransaction ------------------------------------- ///
+
+/// Gets the TransactionId of a TariPendingOutboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingOutboundTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the TransactionID, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_id(
     transaction: *mut TariPendingOutboundTransaction,
@@ -671,6 +817,14 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_id(
     (*transaction).tx_id as c_ulonglong
 }
 
+/// Gets the destination TariPublicKey of a TariPendingOutboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingOutboundTransaction
+///
+/// ## Returns
+/// `*mut TariPublicKey` - Returns the destination TariPublicKey, note that it will be
+/// ptr::null_mut() if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transaction_get_destination_public_key(
     transaction: *mut TariPendingOutboundTransaction,
@@ -682,6 +836,13 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_destination_public_key
     Box::into_raw(Box::new(m))
 }
 
+/// Gets the amount of a TariPendingOutboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingOutboundTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the amount, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transaction_get_amount(
     transaction: *mut TariPendingOutboundTransaction,
@@ -692,6 +853,13 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_amount(
     c_ulonglong::from((*transaction).amount)
 }
 
+/// Gets the timestamp of a TariPendingOutboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingOutboundTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the timestamp, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_timestamp(
     transaction: *mut TariPendingOutboundTransaction,
@@ -702,6 +870,13 @@ pub unsafe extern "C" fn pending_outbound_transaction_get_transaction_timestamp(
     (*transaction).timestamp.timestamp() as c_longlong
 }
 
+/// Destroys a TariPendingOutboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariCompletedTransaction
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn pending_outbound_transaction_destroy(transaction: *mut TariPendingOutboundTransaction) {
     if !transaction.is_null() {
@@ -712,6 +887,14 @@ pub unsafe extern "C" fn pending_outbound_transaction_destroy(transaction: *mut 
 /// -------------------------------------------------------------------------------------------- ///
 ///
 /// ----------------------------------- InboundTransaction ------------------------------------- ///
+
+/// Gets the TransactionId of a TariPendingInboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingInboundTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the TransactonId, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_id(
     transaction: *mut TariPendingInboundTransaction,
@@ -722,6 +905,14 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_id(
     (*transaction).tx_id as c_ulonglong
 }
 
+/// Gets the source TariPublicKey of a TariPendingInboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingInboundTransaction
+///
+/// ## Returns
+/// `*mut TariPublicKey` - Returns a pointer to the source TariPublicKey, note that it will be
+/// ptr::null_mut() if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transaction_get_source_public_key(
     transaction: *mut TariPendingInboundTransaction,
@@ -733,6 +924,13 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_source_public_key(
     Box::into_raw(Box::new(m))
 }
 
+/// Gets the amount of a TariPendingInboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingInboundTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the amount, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transaction_get_amount(
     transaction: *mut TariPendingInboundTransaction,
@@ -743,6 +941,13 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_amount(
     c_ulonglong::from((*transaction).amount)
 }
 
+/// Gets the timestamp of a TariPendingInboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingInboundTransaction
+///
+/// ## Returns
+/// `c_ulonglong` - Returns the timestamp, note that it will be zero if transaction is null
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_timestamp(
     transaction: *mut TariPendingInboundTransaction,
@@ -753,6 +958,13 @@ pub unsafe extern "C" fn pending_inbound_transaction_get_transaction_timestamp(
     (*transaction).timestamp.timestamp() as c_longlong
 }
 
+/// Destroys a TariPendingInboundTransaction
+///
+/// ## Arguments
+/// `transaction` - The pointer to a TariPendingInboundTransaction
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
 #[no_mangle]
 pub unsafe extern "C" fn pending_inbound_transaction_destroy(transaction: *mut TariPendingInboundTransaction) {
     if !transaction.is_null() {
@@ -948,24 +1160,6 @@ pub unsafe extern "C" fn wallet_get_balance(wallet: *mut TariWallet) -> c_ulongl
     }
 }
 
-// test code
-// #[no_mangle]
-// pub unsafe extern "C" fn wallet_get_num_completed_tx(wallet: *mut TariWallet) -> c_ulonglong {
-// if wallet.is_null() {
-// return 0;
-// }
-//
-// match (*wallet)
-// .runtime
-// .block_on((*wallet).transaction_service.get_completed_transactions())
-// {
-// Ok(c) => c.len() as u64,
-// Err(_) => 0,
-// }
-// }
-
-// Create and send the first stage of a transaction to the specified wallet for the specified amount and with the
-// specified fee.
 #[no_mangle]
 pub unsafe extern "C" fn wallet_send_transaction(
     wallet: *mut TariWallet,
@@ -1174,78 +1368,8 @@ pub unsafe extern "C" fn wallet_destroy(wallet: *mut TariWallet) {
     }
 }
 
-// TODO (Potentially) Add optional error parameter to methods which can return null
-
-// Callback Definition - Example
-
-// Will probably have to implement as a struct of callbacks in wallet, with wallet only calling the
-// functions if they are callable from the relevant wallet function, where the register callback functions
-// will bind the relevant c equivalent function pointer to the associated function
-// The Rust
-//
-// use std::os::raw::{c_int, c_uchar};
-//
-// #[no_mangle]
-// pub struct MyState {
-// pub call_back: extern "C" fn(*const c_uchar) -> c_int
-// }
-//
-// #[no_mangle]
-// pub extern fn get_state(call: extern "C" fn(*const c_uchar) -> c_int) -> *const () {
-// let state = MyState { call_back: call };
-// Box::into_raw(Box::new(state)) as *const _
-// }
-//
-// #[no_mangle]
-// pub extern fn run(state: *mut MyState) -> c_int {
-// unsafe {
-// ((*state).call_back)(format!("Callback run").as_ptr())
-// }
-// }
-//
-// #[no_mangle]
-// pub extern fn delete_state(state: *mut MyState) {
-// unsafe {
-// Box::from_raw(state);
-// }
-// }
-//
-// The C
-// #include <iostream>
-//
-// extern "C" {
-// void* get_state(int (*callback)(char*));
-// int run(void* state);
-// void delete_state(void* state);
-// }
-//
-
-// #[derive(Debug, Clone, Copy)]
-// pub struct CallBacks {
-// pub call_back_received_transaction: Option<extern "C" fn(c_ulonglong)>,
-// pub call_back_received_transaction_reply: Option<extern "C" fn(c_ulonglong)>,
-// }
-//
-// impl CallBacks {
-// pub fn new() -> CallBacks {
-// CallBacks {
-// call_back_received_transaction: None,
-// call_back_received_transaction_reply: None,
-// }
-// }
-// }
-//
-//
-// #[no_mangle]
-// pub unsafe extern "C" fn call_back_create() -> *const () {
-// let callbacks = CallBacks::new();
-// Box::into_raw(Box::new(callbacks)) as *const _
-// }
 
 /// ------------------------------------- Callbacks -------------------------------------------- ///
-
-// These functions must be implemented by the FFI client and registered with LibWallet so that
-// LibWallet can directly respond to the client when events occur
 
 #[no_mangle]
 pub unsafe extern "C" fn wallet_call_back_register_received_transaction(
@@ -1282,11 +1406,14 @@ pub unsafe extern "C" fn wallet_call_back_register_received_transaction_reply(
 // Transaction is mined, wallet needs to be extended for this
 // Transaction is confirmed, wallet needs to be extended for this
 
+// TODO (Potentially) Add optional error parameter to methods which can return null
+// TODO Write additional tests
+
 #[cfg(test)]
 mod test {
     extern crate libc;
     use crate::*;
-    use libc::{c_char, c_int, c_uchar};
+    use libc::{c_char, c_uint, c_uchar};
     use std::ffi::CString;
 
     unsafe extern "C" fn completed_callback(tx:*mut TariCompletedTransaction)
@@ -1302,13 +1429,13 @@ mod test {
     }
 
     #[test]
-    fn test_free_string() {
+    fn test_string_destroy() {
         unsafe {
             let m = CString::new("Test").unwrap();
             let m_ptr: *mut c_char = CString::into_raw(m) as *mut c_char;
             assert_ne!(m_ptr.is_null(), true);
             assert!(*m_ptr > 0); // dereference will return first character as integer, T as i8 = 84 > 0 = true
-            free_string(m_ptr);
+            string_destroy(m_ptr);
             assert_eq!(*m_ptr, 0); // dereference will return zero, avoids malloc error if attempting to evaluate by
                                    // other means.
         }
@@ -1318,10 +1445,10 @@ mod test {
     fn test_bytevector() {
         unsafe {
             let bytes: [c_uchar; 4] = [2, 114, 34, 255];
-            let bytes_ptr = byte_vector_create(bytes.as_ptr(), bytes.len() as c_int);
+            let bytes_ptr = byte_vector_create(bytes.as_ptr(), bytes.len() as c_uint);
             let length = byte_vector_get_length(bytes_ptr);
             // println!("{:?}",c);
-            assert_eq!(length, bytes.len() as i32);
+            assert_eq!(length, bytes.len() as c_uint);
             let byte = byte_vector_get_at(bytes_ptr, 2);
             assert_eq!(byte, bytes[2]);
             byte_vector_destroy(bytes_ptr);
@@ -1384,12 +1511,12 @@ mod test {
             assert_eq!(contacts_get_length(contacts), 4);
 
             // free string memory
-            free_string(db_name_alice_str as *mut c_char);
-            free_string(db_path_alice_str as *mut c_char);
-            free_string(address_alice_str as *mut c_char);
-            free_string(db_name_bob_str as *mut c_char);
-            free_string(db_path_bob_str as *mut c_char);
-            free_string(address_bob_str as *mut c_char);
+            string_destroy(db_name_alice_str as *mut c_char);
+            string_destroy(db_path_alice_str as *mut c_char);
+            string_destroy(address_alice_str as *mut c_char);
+            string_destroy(db_name_bob_str as *mut c_char);
+            string_destroy(db_path_bob_str as *mut c_char);
+            string_destroy(address_bob_str as *mut c_char);
             // free wallet memory
             wallet_destroy(alice_wallet);
             wallet_destroy(bob_wallet);
