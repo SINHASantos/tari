@@ -322,5 +322,6 @@ fn establish_peer_connection_inbound() {
         .timeout_join(Duration::from_millis(3000))
         .unwrap();
 
+    drop(datastore);
     clean_up_datastore(database_name);
 }

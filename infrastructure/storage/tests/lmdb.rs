@@ -49,7 +49,7 @@ impl User {
         let last = vals[2].to_string();
         let email = vals[3].to_string();
         let male = vals[4] == "Male";
-        let ip = Ipv4Addr::from_str(vals[5]).map_err(|e| e.to_string())?;
+        let ip = Ipv4Addr::from_str(vals[5].trim()).map_err(|e| e.to_string())?;
         Ok(User {
             id,
             first,
@@ -128,6 +128,8 @@ fn single_thread() {
         assert_eq!(check, *user);
     }
     assert_eq!(db.len().unwrap(), 1000);
+    drop(env);
+    drop(db);
     clean_up("single_thread");
 }
 
@@ -157,6 +159,8 @@ fn multi_thread() {
         let check: User = db.get(&user.id).unwrap().unwrap();
         assert_eq!(check, *user);
     }
+    drop(env);
+    drop(db);
     clean_up("multi_thread");
 }
 
@@ -173,6 +177,7 @@ fn transactions() {
         Ok(None)
     });
     assert!(res.unwrap().is_none());
+    drop(db);
     clean_up("transactions");
 }
 
@@ -206,6 +211,8 @@ fn multi_thread_writes() {
         assert_eq!(i, value);
     }
 
+    drop(env);
+    drop(db);
     clean_up("multi-thread-writes");
 }
 
@@ -226,6 +233,7 @@ fn multi_writes() {
         assert!(res.is_ok());
     }
     env.flush().unwrap();
+    drop(env);
     clean_up("multi-writes");
 }
 
@@ -239,6 +247,7 @@ fn pair_iterator() {
         IterationResult::Continue
     });
     assert!(res.is_ok());
+    drop(db);
     clean_up("pair_iterator");
 }
 
@@ -248,5 +257,6 @@ fn exists_and_delete() {
     assert!(db.contains_key(&525u64).unwrap());
     db.remove(&525u64).unwrap();
     assert_eq!(db.contains_key(&525u64).unwrap(), false);
+    drop(db);
     clean_up("delete");
 }

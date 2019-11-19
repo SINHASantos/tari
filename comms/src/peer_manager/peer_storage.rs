@@ -611,6 +611,7 @@ mod test {
 
     #[test]
     fn test_restore() {
+        {
         // Create Peers
         let mut rng = rand::OsRng::new().unwrap();
         let (_sk, pk) = RistrettoPublicKey::random_keypair(&mut rng);
@@ -665,8 +666,8 @@ mod test {
         assert!(peer_storage.find_by_public_key(&peer1.public_key).is_ok());
         assert!(peer_storage.find_by_public_key(&peer2.public_key).is_ok());
         assert!(peer_storage.find_by_public_key(&peer3.public_key).is_ok());
-
-        clean_up_datastore(database_name);
+    }
+        clean_up_datastore("pm_test_restore");
     }
 
     #[test]

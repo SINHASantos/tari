@@ -57,6 +57,7 @@
 //! # use lmdb_zero::db;
 //! # use tari_storage::LMDBWrapper;
 //! # use futures::channel::mpsc::channel;
+//! # use tari_test_utils::paths::create_random_database_path;
 //!
 //! let node_identity = Arc::new(NodeIdentity::random(&mut OsRng::new().unwrap(), "127.0.0.1:9000".parse().unwrap(), PeerFeatures::COMMUNICATION_NODE).unwrap());
 //!
@@ -64,7 +65,7 @@
 //!
 //! let database_name = "cm_peer_database";
 //! let datastore = LMDBBuilder::new()
-//!            .set_path("/tmp/")
+//!            .set_path(create_random_database_path().as_os_str().to_str().unwrap())
 //!            .set_environment_size(10)
 //!            .set_max_number_of_databases(1)
 //!            .add_database(database_name, lmdb_zero::db::CREATE)
