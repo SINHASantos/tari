@@ -102,24 +102,26 @@
 extern crate libc;
 extern crate tari_wallet;
 
+pub mod error;
+
+use crate::error::LibWalletError;
+use core::ptr;
 use libc::{c_char, c_int, c_longlong, c_uchar, c_uint, c_ulonglong};
 use std::{
     boxed::Box,
     ffi::{CStr, CString},
     slice,
+    sync::Arc,
+    time::Duration,
 };
-use tari_comms::peer_manager::NodeIdentity;
-use tari_crypto::keys::SecretKey;
-use tari_transactions::tari_amount::MicroTari;
-use tari_utilities::ByteArray;
-use tari_wallet::wallet::WalletConfig;
-
-use core::ptr;
-use std::{sync::Arc, time::Duration};
-use tari_comms::{connection::NetAddress, control_service::ControlServiceConfig, peer_manager::PeerFeatures};
-use tari_crypto::keys::PublicKey;
-use tari_transactions::types::CryptoFactories;
-use tari_utilities::hex::Hex;
+use tari_comms::{
+    connection::NetAddress,
+    control_service::ControlServiceConfig,
+    peer_manager::{NodeIdentity, PeerFeatures},
+};
+use tari_crypto::keys::{PublicKey, SecretKey};
+use tari_transactions::{tari_amount::MicroTari, types::CryptoFactories};
+use tari_utilities::{hex::Hex, ByteArray};
 use tari_wallet::{
     contacts_service::storage::database::Contact,
     storage::memory_db::WalletMemoryDatabase,
@@ -130,6 +132,7 @@ use tari_wallet::{
         mine_transaction,
         receive_test_transaction,
     },
+    wallet::WalletConfig,
 };
 use tokio::runtime::Runtime;
 
@@ -146,6 +149,7 @@ pub struct TariPendingInboundTransactions(Vec<TariPendingInboundTransaction>);
 pub type TariPendingOutboundTransaction = tari_wallet::transaction_service::storage::database::OutboundTransaction;
 pub struct TariPendingOutboundTransactions(Vec<TariPendingOutboundTransaction>);
 pub struct ByteVector(Vec<c_uchar>); // declared like this so that it can be exposed to external header
+pub type TariLibWalletError = LibWalletError;
 
 /// -------------------------------- Strings ------------------------------------------------ ///
 
@@ -248,6 +252,55 @@ pub unsafe extern "C" fn byte_vector_get_length(vec: *const ByteVector) -> c_uin
 
 /// -------------------------------------------------------------------------------------------- ///
 
+/// -------------------------------- Lib Wallet Error ------------------------------------------ ///
+
+/// Return the code for a TariLibWalletError
+///
+/// ## Arguments
+/// `error` - The pointer to a TariLibWalletError
+///
+/// ## Returns
+/// `i32` - returns the i32 code for the error
+#[no_mangle]
+pub unsafe extern "C" fn lib_wallet_error_code(error: *mut TariLibWalletError) -> c_int {
+    if error.is_null() {
+        return 0;
+    }
+    (*error).code.clone()
+}
+
+/// Return the message for a TariLibWalletError
+///
+/// ## Arguments
+/// `error` - The pointer to a TariLibWalletError
+///
+/// ## Returns
+/// `*mut c_char` - Returns a pointer to a char array containing the error message
+#[no_mangle]
+pub unsafe extern "C" fn lib_wallet_error_message(error: *mut TariLibWalletError) -> *mut c_char {
+    let mut a = CString::new("").unwrap();
+    if !error.is_null() {
+        a = CString::new((*error).message.clone()).unwrap();
+    }
+    CString::into_raw(a)
+}
+
+/// Frees memory for a TariLibWalletError
+///
+/// ## Arguments
+/// `error` - The pointer to a TariLibWalletError
+///
+/// ## Returns
+/// `()` - Does not return a value, equivalent to void in C
+#[no_mangle]
+pub unsafe extern "C" fn lib_wallet_error_destroy(error: *mut TariLibWalletError) {
+    if !error.is_null() {
+        Box::from_raw(error);
+    }
+}
+
+/// -------------------------------------------------------------------------------------------- ///
+
 /// -------------------------------- Public Key ------------------------------------------------ ///
 
 /// Creates a TariPublicKey from a ByteVector
@@ -259,7 +312,11 @@ pub unsafe extern "C" fn byte_vector_get_length(vec: *const ByteVector) -> c_uin
 /// `TariPublicKey` - Returns a public key. Note that it will be ptr::null_mut() if bytes is null or
 /// if there was an error with the contents of bytes
 #[no_mangle]
-pub unsafe extern "C" fn public_key_create(bytes: *mut ByteVector) -> *mut TariPublicKey {
+pub unsafe extern "C" fn public_key_create(
+    bytes: *mut ByteVector,
+    mut error: *mut TariLibWalletError,
+) -> *mut TariPublicKey
+{
     let v;
     if !bytes.is_null() {
         v = (*bytes).0.clone();
@@ -268,8 +325,14 @@ pub unsafe extern "C" fn public_key_create(bytes: *mut ByteVector) -> *mut TariP
     }
     let pk = TariPublicKey::from_bytes(&v);
     match pk {
-        Ok(pk) => Box::into_raw(Box::new(pk)),
-        Err(_) => ptr::null_mut(),
+        Ok(pk) => {
+            error = ptr::null_mut();
+            Box::into_raw(Box::new(pk))
+        },
+        Err(e) => {
+            error = Box::into_raw(Box::new(TariLibWalletError::from(e)));
+            ptr::null_mut()
+        },
     }
 }
 
@@ -330,7 +393,11 @@ pub unsafe extern "C" fn public_key_from_private_key(secret_key: *mut TariPrivat
 /// `*mut TariPublicKey` - Returns a pointer to a TariPublicKey. Note that it returns ptr::null_mut()
 /// if key is null or if there was an error creating the TariPublicKey from key
 #[no_mangle]
-pub unsafe extern "C" fn public_key_from_hex(key: *const c_char) -> *mut TariPublicKey {
+pub unsafe extern "C" fn public_key_from_hex(
+    key: *const c_char,
+    mut error: *mut TariLibWalletError,
+) -> *mut TariPublicKey
+{
     let key_str;
     if !key.is_null() {
         key_str = CStr::from_ptr(key).to_str().unwrap().to_owned();
@@ -338,10 +405,24 @@ pub unsafe extern "C" fn public_key_from_hex(key: *const c_char) -> *mut TariPub
         return ptr::null_mut();
     }
 
+    if !error.is_null() {
+        {
+            Box::from_raw(error);
+        }
+    }
+
     let public_key = TariPublicKey::from_hex(key_str.as_str());
     match public_key {
         Ok(public_key) => Box::into_raw(Box::new(public_key)),
-        Err(_) => ptr::null_mut(),
+        Err(e) => {
+            println!("ERROR");
+            let err = TariLibWalletError::from(e);
+            error = Box::into_raw(Box::new(err.clone()));
+
+            (*error) = err;
+
+            ptr::null_mut()
+        },
     }
 }
 /// -------------------------------------------------------------------------------------------- ///
@@ -1979,14 +2060,21 @@ pub unsafe extern "C" fn wallet_callback_register_mined(
 pub unsafe extern "C" fn wallet_callback_register_transaction_broadcast(
     wallet: *mut TariWallet,
     call: unsafe extern "C" fn(*mut TariCompletedTransaction),
+    // mut error: *mut TariLibWalletError,
 ) -> bool
 {
     let result = (*wallet)
         .runtime
         .block_on((*wallet).register_callback_transaction_broadcast(call));
     match result {
-        Ok(_) => true,
-        Err(_) => false,
+        Ok(_) => {
+            //  error = ptr::null_mut();
+            true
+        },
+        Err(_e) => {
+            // error = Box::into_raw(Box::new(TariLibWalletError::from(e)));
+            false
+        },
     }
 }
 
@@ -1998,7 +2086,11 @@ mod test {
     use crate::*;
     use libc::{c_char, c_uchar, c_uint};
     use std::ffi::CString;
-    use tari_wallet::testnet_utils::random_string;
+    use tari_wallet::{
+        error::WalletError,
+        output_manager_service::error::OutputManagerError,
+        testnet_utils::random_string,
+    };
     use tempdir::TempDir;
 
     unsafe extern "C" fn completed_callback(tx: *mut TariCompletedTransaction) {
@@ -2217,6 +2309,20 @@ mod test {
             let contacts = wallet_get_contacts(alice_wallet);
             assert_eq!(contacts_get_length(contacts), 4);
 
+            let test_error = Box::into_raw(Box::new(LibWalletError::from(WalletError::OutputManagerError(
+                OutputManagerError::NotEnoughFunds,
+            ))));
+
+            assert_eq!(101, lib_wallet_error_code(test_error));
+
+            let test_error_str = "OutputManagerError(NotEnoughFunds)".to_string();
+
+            let returned_message = CStr::from_ptr(lib_wallet_error_message(test_error))
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert_eq!(test_error_str, returned_message);
+
             // free string memory
             string_destroy(address_listener_alice_str as *mut c_char);
             string_destroy(address_listener_bob_str as *mut c_char);
@@ -2226,6 +2332,8 @@ mod test {
             string_destroy(db_name_bob_str as *mut c_char);
             string_destroy(db_path_bob_str as *mut c_char);
             string_destroy(address_bob_str as *mut c_char);
+            // free error memory
+            lib_wallet_error_destroy(test_error);
             // free wallet memory
             wallet_destroy(alice_wallet);
             wallet_destroy(bob_wallet);
@@ -2237,6 +2345,29 @@ mod test {
             // free config memory
             comms_config_destroy(bob_config);
             comms_config_destroy(alice_config);
+        }
+    }
+
+    #[test]
+    fn test_public_private_key_ffi() {
+        unsafe {
+            let public_key_hex =
+                CString::new("daa67142abc315b1149b54b8f086eb16596b15ee0e70e37f0aa15294fdcbd65b").unwrap();
+            let public_key_hex_str: *const c_char = CString::into_raw(public_key_hex.clone()) as *const c_char;
+            let mut error_ptr = ptr::null_mut();
+
+            let public_key = public_key_from_hex(public_key_hex_str, error_ptr);
+            assert!(!public_key.is_null());
+            assert!(error_ptr.is_null());
+            let mut error_ptr = ptr::null_mut();
+
+            let public_key_hex = CString::new("xx").unwrap();
+            let public_key_hex_str: *const c_char = CString::into_raw(public_key_hex.clone()) as *const c_char;
+            let public_key_err1 = public_key_from_hex(public_key_hex_str, error_ptr);
+            //            assert!(!public_key_err1.is_null());
+            assert!(error_ptr.is_null());
+
+            assert!(false, "End");
         }
     }
 }
