@@ -24,26 +24,24 @@ use std::{
     fmt,
     future::Future,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
 
+use futures::{future::BoxFuture, stream::FuturesUnordered};
 use log::*;
 use multiaddr::Multiaddr;
+use tari_shutdown::oneshot_trigger::OneshotTrigger;
 use tokio::{
     sync::{mpsc, oneshot},
     time,
 };
 use tokio_stream::StreamExt;
-use tracing::{self, span, Instrument, Level};
+use tracing::{span, Instrument, Level};
 
-use super::{
-    direction::ConnectionDirection,
-    error::{ConnectionManagerError, PeerConnectionError},
-    manager::ConnectionManagerEvent,
-};
+use super::{direction::ConnectionDirection, error::PeerConnectionError, manager::ConnectionManagerEvent};
 #[cfg(feature = "rpc")]
 use crate::protocol::rpc::{
     pool::RpcClientPool,
@@ -57,14 +55,16 @@ use crate::protocol::rpc::{
 use crate::{
     framing,
     framing::CanonicalFraming,
-    multiplexing::{Control, IncomingSubstreams, Substream, Yamux},
+    multiplexing::{Control, IncomingSubstreams, Substream, Yamux, YamuxControlError},
     peer_manager::{NodeId, PeerFeatures},
     protocol::{ProtocolId, ProtocolNegotiation},
-    runtime,
     utils::atomic_ref_counter::AtomicRefCounter,
+    Minimized,
 };
 
 const LOG_TARGET: &str = "comms::connection_manager::peer_connection";
+
+const PROTOCOL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,9 +75,9 @@ pub fn create(
     peer_features: PeerFeatures,
     direction: ConnectionDirection,
     event_notifier: mpsc::Sender<ConnectionManagerEvent>,
-    our_supported_protocols: Vec<ProtocolId>,
+    our_supported_protocols: Arc<Vec<ProtocolId>>,
     their_supported_protocols: Vec<ProtocolId>,
-) -> Result<PeerConnection, ConnectionManagerError> {
+) -> PeerConnection {
     trace!(
         target: LOG_TARGET,
         "(Peer={}) Socket successfully upgraded to multiplexed socket",
@@ -85,7 +85,7 @@ pub fn create(
     );
     // All requests are request/response, so a channel size of 1 is all that is needed
     let (peer_tx, peer_rx) = mpsc::channel(1);
-    let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed); // Monotonic
+    let id = ID_COUNTER.fetch_add(1, Ordering::SeqCst); // Monotonic
     let substream_counter = connection.substream_counter();
     let peer_conn = PeerConnection::new(
         id,
@@ -106,9 +106,9 @@ pub fn create(
         our_supported_protocols,
         their_supported_protocols,
     );
-    runtime::current().spawn(peer_actor.run());
+    tokio::spawn(peer_actor.run());
 
-    Ok(peer_conn)
+    peer_conn
 }
 
 /// Request types for the PeerConnection actor.
@@ -120,7 +120,7 @@ pub enum PeerConnectionRequest {
         reply_tx: oneshot::Sender<Result<NegotiatedSubstream<Substream>, PeerConnectionError>>,
     },
     /// Disconnect all substreams and close the transport connection
-    Disconnect(bool, oneshot::Sender<Result<(), PeerConnectionError>>),
+    Disconnect(bool, oneshot::Sender<Result<(), PeerConnectionError>>, Minimized),
 }
 
 /// ID type for peer connections
@@ -138,6 +138,9 @@ pub struct PeerConnection {
     started_at: Instant,
     substream_counter: AtomicRefCounter,
     handle_counter: Arc<()>,
+    drop_notifier: OneshotTrigger<NodeId>,
+    number_of_rpc_clients: Arc<AtomicUsize>,
+    force_disconnect_rpc_clients_when_clone_drops: Arc<AtomicBool>,
 }
 
 impl PeerConnection {
@@ -160,6 +163,9 @@ impl PeerConnection {
             started_at: Instant::now(),
             substream_counter,
             handle_counter: Arc::new(()),
+            drop_notifier: OneshotTrigger::<NodeId>::new(),
+            number_of_rpc_clients: Arc::new(AtomicUsize::new(0)),
+            force_disconnect_rpc_clients_when_clone_drops: Arc::new(Default::default()),
         }
     }
 
@@ -173,6 +179,14 @@ impl PeerConnection {
 
     pub fn direction(&self) -> ConnectionDirection {
         self.direction
+    }
+
+    pub fn known_address(&self) -> Option<&Multiaddr> {
+        if self.direction.is_outbound() {
+            Some(self.address())
+        } else {
+            None
+        }
     }
 
     pub fn address(&self) -> &Multiaddr {
@@ -205,7 +219,6 @@ impl PeerConnection {
         Arc::strong_count(&self.handle_counter)
     }
 
-    #[tracing::instrument(level = "trace", "peer_connection::open_substream", skip(self))]
     pub async fn open_substream(
         &mut self,
         protocol_id: &ProtocolId,
@@ -222,7 +235,6 @@ impl PeerConnection {
             .map_err(|_| PeerConnectionError::InternalReplyCancelled)?
     }
 
-    #[tracing::instrument(level = "trace", "peer_connection::open_framed_substream", skip(self))]
     pub async fn open_framed_substream(
         &mut self,
         protocol_id: &ProtocolId,
@@ -233,14 +245,12 @@ impl PeerConnection {
     }
 
     #[cfg(feature = "rpc")]
-    #[tracing::instrument("peer_connection::connect_rpc", level="trace", skip(self), fields(peer_node_id = self.peer_node_id.to_string().as_str()))]
     pub async fn connect_rpc<T>(&mut self) -> Result<T, RpcError>
     where T: From<RpcClient> + NamedProtocolService {
         self.connect_rpc_using_builder(Default::default()).await
     }
 
     #[cfg(feature = "rpc")]
-    #[tracing::instrument("peer_connection::connect_rpc_with_builder", level = "trace", skip(self, builder))]
     pub async fn connect_rpc_using_builder<T>(&mut self, builder: RpcClientBuilder<T>) -> Result<T, RpcError>
     where T: From<RpcClient> + NamedProtocolService {
         let protocol = ProtocolId::from_static(T::PROTOCOL_NAME);
@@ -251,11 +261,16 @@ impl PeerConnection {
             self.peer_node_id
         );
         let framed = self.open_framed_substream(&protocol, RPC_MAX_FRAME_SIZE).await?;
-        builder
+
+        let rpc_client = builder
             .with_protocol_id(protocol)
             .with_node_id(self.peer_node_id.clone())
+            .with_terminate_signal(self.drop_notifier.to_signal())
             .connect(framed)
-            .await
+            .await?;
+        self.number_of_rpc_clients.fetch_add(1, Ordering::Relaxed);
+
+        Ok(rpc_client)
     }
 
     /// Creates a new RpcClientPool that can be shared between tasks. The client pool will lazily establish up to
@@ -274,24 +289,57 @@ impl PeerConnection {
 
     /// Immediately disconnects the peer connection. This can only fail if the peer connection worker
     /// is shut down (and the peer is already disconnected)
-    pub async fn disconnect(&mut self) -> Result<(), PeerConnectionError> {
+    pub async fn disconnect(&mut self, minimized: Minimized) -> Result<(), PeerConnectionError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
-            .send(PeerConnectionRequest::Disconnect(false, reply_tx))
+            .send(PeerConnectionRequest::Disconnect(false, reply_tx, minimized))
             .await?;
         reply_rx
             .await
             .map_err(|_| PeerConnectionError::InternalReplyCancelled)?
     }
 
-    pub(crate) async fn disconnect_silent(&mut self) -> Result<(), PeerConnectionError> {
+    pub(crate) async fn disconnect_silent(&mut self, minimized: Minimized) -> Result<(), PeerConnectionError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.request_tx
-            .send(PeerConnectionRequest::Disconnect(true, reply_tx))
+            .send(PeerConnectionRequest::Disconnect(true, reply_tx, minimized))
             .await?;
         reply_rx
             .await
             .map_err(|_| PeerConnectionError::InternalReplyCancelled)?
+    }
+
+    /// Forcefully disconnect all RPC clients when any clone is dropped - if not set (the default behaviour) all RPC
+    /// clients will be disconnected when the last instance is dropped. i.e. when `self.handle_counter == 1`
+    pub fn set_force_disconnect_rpc_clients_when_clone_drops(&mut self) {
+        self.force_disconnect_rpc_clients_when_clone_drops
+            .store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        if self.handle_count() <= 1 ||
+            self.force_disconnect_rpc_clients_when_clone_drops
+                .load(Ordering::Relaxed)
+        {
+            let number_of_rpc_clients = self.number_of_rpc_clients.load(Ordering::Relaxed);
+            if number_of_rpc_clients > 0 {
+                self.drop_notifier.broadcast(self.peer_node_id.clone());
+                trace!(
+                    target: LOG_TARGET,
+                    "PeerConnection `{}` drop called, open sub-streams: {}, notified {} potential RPC clients to drop \
+                    connection",
+                    self.peer_node_id.clone(), self.substream_count(), number_of_rpc_clients,
+                );
+            } else {
+                trace!(
+                    target: LOG_TARGET,
+                    "PeerConnection `{}` drop called, open sub-streams: {}, RPC clients: {}",
+                    self.peer_node_id, self.substream_count(), number_of_rpc_clients
+                );
+            }
+        }
     }
 }
 
@@ -326,7 +374,9 @@ struct PeerConnectionActor {
     incoming_substreams: IncomingSubstreams,
     control: Control,
     event_notifier: mpsc::Sender<ConnectionManagerEvent>,
-    our_supported_protocols: Vec<ProtocolId>,
+    our_supported_protocols: Arc<Vec<ProtocolId>>,
+    inbound_protocol_negotiations:
+        FuturesUnordered<BoxFuture<'static, Result<(ProtocolId, Substream), PeerConnectionError>>>,
     their_supported_protocols: Vec<ProtocolId>,
 }
 
@@ -338,7 +388,7 @@ impl PeerConnectionActor {
         connection: Yamux,
         request_rx: mpsc::Receiver<PeerConnectionRequest>,
         event_notifier: mpsc::Sender<ConnectionManagerEvent>,
-        our_supported_protocols: Vec<ProtocolId>,
+        our_supported_protocols: Arc<Vec<ProtocolId>>,
         their_supported_protocols: Vec<ProtocolId>,
     ) -> Self {
         Self {
@@ -350,6 +400,7 @@ impl PeerConnectionActor {
             request_rx,
             event_notifier,
             our_supported_protocols,
+            inbound_protocol_negotiations: FuturesUnordered::new(),
             their_supported_protocols,
         }
     }
@@ -369,27 +420,21 @@ impl PeerConnectionActor {
 
                 maybe_substream = self.incoming_substreams.next() => {
                     match maybe_substream {
-                        Some(substream) => {
-                            if let Err(err) = self.handle_incoming_substream(substream).await {
-                                error!(
-                                    target: LOG_TARGET,
-                                    "[{}] Incoming substream for peer '{}' failed to open because '{error}'",
-                                    self,
-                                    self.peer_node_id.short_str(),
-                                    error = err
-                                )
-                            }
-                        },
+                        Some(substream) => self.handle_incoming_substream(substream).await,
                         None => {
                             debug!(target: LOG_TARGET, "[{}] Peer '{}' closed the connection", self, self.peer_node_id.short_str());
                             break;
                         },
                     }
+                },
+
+                Some(result) = self.inbound_protocol_negotiations.next() => {
+                    self.handle_inbound_protocol_negotiation_result(result).await;
                 }
             }
         }
 
-        if let Err(err) = self.disconnect(false).await {
+        if let Err(err) = self.disconnect(false, Minimized::No).await {
             warn!(
                 target: LOG_TARGET,
                 "[{}] Failed to politely close connection to peer '{}' because '{}'",
@@ -414,7 +459,7 @@ impl PeerConnectionActor {
                     "Reply oneshot closed when sending reply",
                 );
             },
-            Disconnect(silent, reply_tx) => {
+            Disconnect(silent, reply_tx, minimized) => {
                 debug!(
                     target: LOG_TARGET,
                     "[{}] Disconnect{}requested for {} connection to peer '{}'",
@@ -423,33 +468,70 @@ impl PeerConnectionActor {
                     self.direction,
                     self.peer_node_id.short_str()
                 );
-                let _result = reply_tx.send(self.disconnect(silent).await);
+                let _result = reply_tx.send(self.disconnect(silent, minimized).await);
             },
         }
     }
 
-    #[tracing::instrument(level="trace", skip(self, stream),fields(comms.direction="inbound"))]
-    async fn handle_incoming_substream(&mut self, mut stream: Substream) -> Result<(), PeerConnectionError> {
-        let selected_protocol = ProtocolNegotiation::new(&mut stream)
-            .negotiate_protocol_inbound(&self.our_supported_protocols)
-            .await?;
+    async fn handle_incoming_substream(&mut self, mut stream: Substream) {
+        let our_supported_protocols = self.our_supported_protocols.clone();
+        self.inbound_protocol_negotiations.push(Box::pin(async move {
+            let mut protocol_negotiation = ProtocolNegotiation::new(&mut stream);
 
-        self.notify_event(ConnectionManagerEvent::NewInboundSubstream(
-            self.peer_node_id.clone(),
-            selected_protocol,
-            stream,
-        ))
-        .await;
-
-        Ok(())
+            let selected_protocol = time::timeout(
+                PROTOCOL_NEGOTIATION_TIMEOUT,
+                protocol_negotiation.negotiate_protocol_inbound(&our_supported_protocols),
+            )
+            .await
+            .map_err(|_| PeerConnectionError::ProtocolNegotiationTimeout)??;
+            Ok((selected_protocol, stream))
+        }));
     }
 
-    #[tracing::instrument(skip(self))]
+    async fn handle_inbound_protocol_negotiation_result(
+        &mut self,
+        result: Result<(ProtocolId, Substream), PeerConnectionError>,
+    ) {
+        match result {
+            Ok((selected_protocol, stream)) => {
+                self.notify_event(ConnectionManagerEvent::NewInboundSubstream(
+                    self.peer_node_id.clone(),
+                    selected_protocol,
+                    stream,
+                ))
+                .await;
+            },
+            Err(PeerConnectionError::ProtocolError(err)) if err.is_ban_offence() => {
+                error!(
+                    target: LOG_TARGET,
+                    "[{}] PEER VIOLATION: Incoming substream for peer '{}' failed to open because '{}'",
+                    self,
+                    self.peer_node_id.short_str(),
+                    err
+                );
+
+                self.notify_event(ConnectionManagerEvent::PeerViolation {
+                    peer_node_id: self.peer_node_id.clone(),
+                    details: err.to_string(),
+                })
+                .await;
+            },
+            Err(err) => {
+                error!(
+                    target: LOG_TARGET,
+                    "[{}] Incoming substream for peer '{}' failed to open because '{error}'",
+                    self,
+                    self.peer_node_id.short_str(),
+                    error = err
+                );
+            },
+        }
+    }
+
     async fn open_negotiated_protocol_stream(
         &mut self,
         protocol: ProtocolId,
     ) -> Result<NegotiatedSubstream<Substream>, PeerConnectionError> {
-        const PROTOCOL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
         debug!(
             target: LOG_TARGET,
             "[{}] Negotiating protocol '{}' on new substream for peer '{}'",
@@ -482,35 +564,33 @@ impl PeerConnectionActor {
     /// # Arguments
     ///
     /// silent - true to suppress the PeerDisconnected event, false to publish the event
-    async fn disconnect(&mut self, silent: bool) -> Result<(), PeerConnectionError> {
+    async fn disconnect(&mut self, silent: bool, minimized: Minimized) -> Result<(), PeerConnectionError> {
         self.request_rx.close();
-        match self.control.close().await {
-            Err(yamux::ConnectionError::Closed) => {
-                debug!(
-                    target: LOG_TARGET,
-                    "(Peer = {}) Connection already closed",
-                    self.peer_node_id.short_str()
-                );
 
-                return Ok(());
-            },
-            // Only emit closed event once
-            _ => {
-                if !silent {
-                    self.notify_event(ConnectionManagerEvent::PeerDisconnected(
-                        self.id,
-                        self.peer_node_id.clone(),
-                    ))
-                    .await;
-                }
-            },
+        // Only emit closed event once
+        if let Err(e) = self.control.close().await {
+            match e {
+                YamuxControlError::ConnectionClosed => {
+                    trace!(
+                        target: LOG_TARGET,
+                        "On disconnect: (Peer = {}) Connection already closed ({})",
+                        self.peer_node_id.short_str(),
+                        e
+                    );
+                },
+                e => trace!(target: LOG_TARGET, "On disconnect: ({})", e),
+            }
         }
 
-        debug!(
-            target: LOG_TARGET,
-            "(Peer = {}) Connection closed",
-            self.peer_node_id.short_str()
-        );
+        if !silent {
+            self.notify_event(ConnectionManagerEvent::PeerDisconnected(
+                self.id,
+                self.peer_node_id.clone(),
+                minimized,
+            ))
+            .await;
+        }
+        trace!(target: LOG_TARGET, "(Peer = {}) Connection closed", self.peer_node_id.short_str());
 
         Ok(())
     }

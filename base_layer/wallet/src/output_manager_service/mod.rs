@@ -33,12 +33,17 @@ pub mod service;
 pub mod storage;
 mod tasks;
 
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 use futures::future;
 use log::*;
-use tari_comms::NodeIdentity;
-use tari_core::{consensus::NetworkConsensus, transactions::CryptoFactories};
+use tari_core::{
+    consensus::NetworkConsensus,
+    transactions::{
+        key_manager::{SecretTransactionKeyManagerInterface, TransactionKeyManagerInterface},
+        CryptoFactories,
+    },
+};
 use tari_service_framework::{
     async_trait,
     reply_channel,
@@ -51,7 +56,6 @@ use tokio::sync::broadcast;
 use crate::{
     base_node_service::handle::BaseNodeServiceHandle,
     connectivity_service::WalletConnectivityHandle,
-    key_manager_service::{storage::database::KeyManagerBackend, KeyManagerHandle},
     output_manager_service::{
         config::OutputManagerServiceConfig,
         handle::OutputManagerHandle,
@@ -60,6 +64,9 @@ use crate::{
     },
 };
 
+/// The maximum number of transaction inputs that can be created in a single transaction, slightly less than the maximum
+/// that a single comms message can hold.
+pub const TRANSACTION_INPUTS_LIMIT: u32 = 4000;
 const LOG_TARGET: &str = "wallet::output_manager_service::initializer";
 
 pub struct OutputManagerServiceInitializer<T, TKeyManagerInterface>
@@ -69,7 +76,6 @@ where T: OutputManagerBackend
     backend: Option<T>,
     factories: CryptoFactories,
     network: NetworkConsensus,
-    node_identity: Arc<NodeIdentity>,
     phantom: PhantomData<TKeyManagerInterface>,
 }
 
@@ -81,14 +87,12 @@ where T: OutputManagerBackend + 'static
         backend: T,
         factories: CryptoFactories,
         network: NetworkConsensus,
-        node_identity: Arc<NodeIdentity>,
     ) -> Self {
         Self {
             config,
             backend: Some(backend),
             factories,
             network,
-            node_identity,
             phantom: PhantomData,
         }
     }
@@ -98,7 +102,7 @@ where T: OutputManagerBackend + 'static
 impl<T, TKeyManagerInterface> ServiceInitializer for OutputManagerServiceInitializer<T, TKeyManagerInterface>
 where
     T: OutputManagerBackend + 'static,
-    TKeyManagerInterface: KeyManagerBackend + 'static,
+    TKeyManagerInterface: TransactionKeyManagerInterface + SecretTransactionKeyManagerInterface,
 {
     async fn initialize(&mut self, context: ServiceInitializerContext) -> Result<(), ServiceInitializationError> {
         let (sender, receiver) = reply_channel::unbounded();
@@ -115,11 +119,11 @@ where
         let factories = self.factories.clone();
         let config = self.config.clone();
         let constants = self.network.create_consensus_constants().pop().unwrap();
-        let node_identity = self.node_identity.clone();
+        let network = self.network.as_network();
         context.spawn_when_ready(move |handles| async move {
             let base_node_service_handle = handles.expect_handle::<BaseNodeServiceHandle>();
             let connectivity = handles.expect_handle::<WalletConnectivityHandle>();
-            let key_manager = handles.expect_handle::<KeyManagerHandle<TKeyManagerInterface>>();
+            let key_manager = handles.expect_handle::<TKeyManagerInterface>();
 
             let service = OutputManagerService::new(
                 config,
@@ -130,8 +134,8 @@ where
                 constants,
                 handles.get_shutdown_signal(),
                 base_node_service_handle,
+                network,
                 connectivity,
-                node_identity,
                 key_manager,
             )
             .await

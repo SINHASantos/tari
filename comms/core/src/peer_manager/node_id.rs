@@ -137,10 +137,10 @@ impl NodeId {
 impl ByteArray for NodeId {
     /// Try and convert the given byte array to a NodeId. Any failures (incorrect array length,
     /// implementation-specific checks, etc) return a [ByteArrayError](enum.ByteArrayError.html).
-    fn from_bytes(bytes: &[u8]) -> Result<Self, ByteArrayError> {
-        bytes
-            .try_into()
-            .map_err(|err| ByteArrayError::ConversionError(format!("{:?}", err)))
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ByteArrayError> {
+        bytes.try_into().map_err(|err| ByteArrayError::ConversionError {
+            reason: format!("{:?}", err),
+        })
     }
 
     /// Return the NodeId as a byte array
@@ -152,8 +152,10 @@ impl ByteArray for NodeId {
 impl ByteArray for Box<NodeId> {
     /// Try and convert the given byte array to a NodeId. Any failures (incorrect array length,
     /// implementation-specific checks, etc) return a [ByteArrayError](enum.ByteArrayError.html).
-    fn from_bytes(bytes: &[u8]) -> Result<Self, ByteArrayError> {
-        let node_id = NodeId::try_from(bytes).map_err(|err| ByteArrayError::ConversionError(format!("{:?}", err)))?;
+    fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, ByteArrayError> {
+        let node_id = NodeId::try_from(bytes).map_err(|err| ByteArrayError::ConversionError {
+            reason: format!("{:?}", err),
+        })?;
         Ok(Box::new(node_id))
     }
 
@@ -171,7 +173,7 @@ impl PartialEq for NodeId {
 
 impl PartialOrd<NodeId> for NodeId {
     fn partial_cmp(&self, other: &NodeId) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
@@ -263,13 +265,10 @@ where D: Deserializer<'de> {
 
 #[cfg(test)]
 mod test {
-    use tari_crypto::{
-        keys::{PublicKey, SecretKey},
-        tari_utilities::byte_array::ByteArray,
-    };
+    use tari_crypto::keys::{PublicKey, SecretKey};
 
     use super::*;
-    use crate::types::{CommsPublicKey, CommsSecretKey};
+    use crate::types::CommsSecretKey;
 
     #[test]
     fn display() {

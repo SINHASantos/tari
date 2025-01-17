@@ -5,25 +5,10 @@
 #                                                                                                                      #
 ########################################################################################################################
 
-[dibbler.wallet]
-# Selected network (Note: Not parsed at the moment, please specify on the command line) (default = "mainnet")
-#network = "dibbler"
-
-[igor.wallet]
-# Selected network (Note: Not parsed at the moment, please specify on the command line) (default = "mainnet")
-#network = "igor"
-
 [wallet]
 # The buffer size constants for the publish/subscribe connector channel, connecting comms messages to the domain layer:
 # (min value = 300, default value = 50000).
 #buffer_size = 50000
-
-# The rate limit constants for the publish/subscribe connector channel, i.e. maximum amount of inbound messages to
-# accept - any rate attempting to exceed this limit will be throttled (min value = 5, default value = 1000).
-#buffer_rate_limit = 1000
-
-# Selected network (Note: Not implemented properly, please specify on the command line) (default = "mainnet")
-#network = "mainnet"
 
 # The relative path to store persistent data (default = "data/wallet")
 #data_dir = "data/wallet"
@@ -38,7 +23,7 @@
 # Console wallet password. Should you wish to start your console wallet without typing in your password, the following
 # options are available:
 # 1. Start the console wallet with the --password=secret argument, or
-# 2. Set the environment variable TARI_WALLET_PASSWORD=secret before starting the console wallet, or
+# 2. Set the environment variable MINOTARI_WALLET_PASSWORD=secret before starting the console wallet, or
 # 3. Set the "password" key in this [wallet] section of the config
 # (default = )
 #password = "secret"
@@ -94,7 +79,7 @@
 #num_required_confirmations = 3
 
 # Spin up and use a built-in Tor instance, only works on macos/linux and must comment out 'tor.control_address' below.
-# This requires that the base node was built with the optional "libtor" feature flag. (default = false)
+# This requires that the base node was built with the optional "libtor" feature flag. (default = true)
 #use_libtor = false
 
 # A path to the file that stores your node identity and secret key (default = "none")
@@ -107,8 +92,13 @@
 # - transaction cancelled
 # - transaction mined but unconfirmed
 # - transaction mined and confirmed
-# An example script is available here: applications/tari_console_wallet/src/notifier/notify_example.sh
+# An example script is available here: applications/minotari_console_wallet/src/notifier/notify_example.sh
 #notify_file = "/path/to/script"
+
+# The cool down period between balance enquiry checks in seconds; requests faster than this will be ignored.
+# For specialized wallets processing many batch transactions this setting could be increased to 60 s to retain
+# responsiveness of the wallet with slightly delayed balance updates (default = 5):
+#balance_enquiry_cooldown_period = 5
 
 [wallet.transactions]
 # This is the timeout period that will be used for base node broadcast monitoring tasks (default = 30)
@@ -148,6 +138,8 @@ transaction_event_channel_size = 25000
 # transaction amount. Set this value to `false` to allow spending of "dust" UTXOs for small valued transactions
 # (default = true).
 prevent_fee_gt_amount = false
+# Ignores dust below this value, value in micro MinoTari, defaults to 100
+# dust_ignore_value: 100,
 # This is the size of the event channel used to communicate output manager events to the wallet. A busy console
 # wallet doing thousands of bulk payments or used for stress testing needs a fairly big size (>3000) (default = 250).
 event_channel_size = 3500
@@ -164,8 +156,8 @@ event_channel_size = 3500
 
 [wallet.base_node]
 # Configuration for the wallet's base node service
-# The refresh interval (default = 3 s)
-#base_node_monitor_refresh_interval = 3
+# The refresh interval
+#base_node_monitor_max_refresh_interval = 30
 # The RPC client pool size  (default = 5)
 #base_node_rpc_pool_size = 5
 # This is the size of the event channel used to communicate base node events to the wallet. (default = 250).
@@ -176,7 +168,7 @@ event_channel_size = 3500
 # peers can find you.
 # _NOTE_: If using the `tor` transport type, public_address will be ignored and an onion address will be
 # automatically configured
-#public_address = "/ip4/172.2.3.4/tcp/18189"
+#public_addresses = ["/ip4/172.2.3.4/tcp/18188",]
 
 # Optionally bind an additional TCP socket for inbound Tari P2P protocol commms.
 # Use cases include:
@@ -206,7 +198,7 @@ event_channel_size = 3500
 # CIDR for addresses allowed to enter into liveness check mode on the listener.
 #listener_liveness_allowlist_cidrs = []
 # Enables periodic socket-level liveness checks. Default: Disabled
-# listener_liveness_check_interval = 15
+# listener_self_liveness_check_interval = 15
 
 # User agent string for this node
 #user_agent = ""
@@ -214,6 +206,13 @@ event_channel_size = 3500
 # The maximum simultaneous comms RPC sessions allowed (default value = 100). Setting this to -1 will allow unlimited
 # sessions.
 #rpc_max_simultaneous_sessions = 100
+# The maximum comms RPC sessions allowed per peer (default value = 10).
+#rpc_max_sessions_per_peer = 10
+#rpc_max_sessions_per_peer = 10
+# If true, and the maximum per peer RPC sessions is reached, the RPC server will close an old session and replace it
+# with a new session. If false, the RPC server will reject the new session and preserve the older session.
+# (default value = true).
+#pub cull_oldest_peer_rpc_connection_on_full = true
 
 [wallet.p2p.transport]
 # -------------- Transport configuration --------------
@@ -245,10 +244,10 @@ event_channel_size = 3500
 # When these peer addresses are encountered when dialing another peer, the tor proxy is bypassed and the connection is
 # made directly over TCP. /ip4, /ip6, /dns, /dns4 and /dns6 are supported. (e.g. ["/dns4/my-foo-base-node/tcp/9998"])
 #tor.proxy_bypass_addresses = []
-# When using the tor transport and set to true, outbound TCP connections bypass the tor proxy. Defaults to false for
-# better privacy
-#tor.proxy_bypass_for_outbound_tcp = false
-# If set, instructs tor to forward traffic the the provided address. (e.g. "/ip4/127.0.0.1/tcp/0") (default = )
+# When using the tor transport and set to true, outbound TCP connections bypass the tor proxy. Defaults to 'true' for
+# better network performance for TCP nodes; set it to 'false' for better privacy.
+#tor.proxy_bypass_for_outbound_tcp = true
+# If set, instructs tor to forward traffic the provided address. (e.g. "/ip4/127.0.0.1/tcp/0") (default = )
 #tor.forward_address =
 
 # Use a SOCKS5 proxy transport. This transport recognises any addresses supported by the proxy.
@@ -268,9 +267,11 @@ database_url = "data/wallet/dht.db"
 # The size of the buffer (channel) which holds pending outbound message requests. Default: 20
 #outbound_buffer_size = 20
 # The maximum number of peer nodes that a message has to be closer to, to be considered a neighbour. Default: 8
-#num_neighbouring_nodes = 8
+num_neighbouring_nodes = 5
 # Number of random peers to include. Default: 4
-#num_random_nodes=  4
+num_random_nodes = 1
+# Connections above the configured number of neighbouring and random nodes will be removed (default: false)
+minimize_connections = true
 # Send to this many peers when using the broadcast strategy. Default: 8
 #broadcast_factor = 8
 # Send to this many peers when using the propagate strategy. Default: 4
@@ -317,7 +318,7 @@ database_url = "data/wallet/dht.db"
 #join_cooldown_interval = 120 # 10 * 60
 
 # The interval to update the neighbouring and random pools, if necessary. Default: 2 minutes
-#connectivity.update_interval = 120 # 2 * 60
+connectivity.update_interval = 300 # 2 * 60
 # The interval to change the random pool peers. Default = 2 hours
 #connectivity.random_pool_refresh_interval = 7_200 # 2 * 60 * 60
 # Length of cooldown when high connection failure rates are encountered. Default: 45s
@@ -325,13 +326,13 @@ database_url = "data/wallet/dht.db"
 # The minimum desired ratio of TCPv4 to Tor connections. TCPv4 addresses have some significant cost to create,
 # making sybil attacks costly. This setting does not guarantee this ratio is maintained.
 # Currently, it only emits a warning if the ratio is below this setting. Default: 0.1 (10%)
-#connectivity.minimum_desired_tcpv4_node_ratio = 0.1
+connectivity.minimum_desired_tcpv4_node_ratio = 0.0
 
 # True to enable network discovery, false to disable it. Default: true
 #network_discovery.enabled = true
 # A threshold for the minimum number of peers this node should ideally be aware of. If below this threshold a
 # more "aggressive" strategy is employed. Default: 50
-#network_discovery.min_desired_peers = 50
+network_discovery.min_desired_peers = 16
 # The period to wait once the number of rounds given by `idle_after_num_rounds` has completed. Default: 30 mins
 #network_discovery.idle_period = 1_800 # 30 * 60
 #  The minimum number of network discovery rounds to perform before idling (going to sleep). If there are less
@@ -342,13 +343,15 @@ database_url = "data/wallet/dht.db"
 # The maximum number of sync peer to select for each round. The selection strategy varies depending on the current state.
 # Default: 5
 #network_discovery.max_sync_peers = 5
+# The maximum number of peers we allow per round of sync. (Default: 500)
+#network_discovery.max_peers_to_sync_per_round = 500
+# Initial refresh sync peers delay period, when a configured connection needs preference. (Default: Disabled)
+network_discovery.initial_peer_sync_delay = 25
 
 # Length of time to ban a peer if the peer misbehaves at the DHT-level. Default: 6 hrs
 #ban_duration = 21_600 # 6 * 60 * 60
 # Length of time to ban a peer for a "short" duration. Default: 60 mins
 #ban_duration_short = 3_600 # 60 * 60
-# This allows the use of test addresses in the network like 127.0.0.1. Default: false
-#allow_test_addresses = false
 # The maximum number of messages over `flood_ban_timespan` to allow before banning the peer (for `ban_duration_short`)
 # Default: 100_000 messages
 #flood_ban_max_msg_count = 100_000
@@ -360,3 +363,9 @@ database_url = "data/wallet/dht.db"
 # In a situation where a node is not well-connected and many nodes are locally marked as offline, we can retry
 # peers that were previously tried. Default: 2 hours
 #offline_peer_cooldown = 7_200 # 2 * 60 * 60
+# Addresses that should never be dialed (default value = []). This can be a specific address or an IPv4/TCP range.
+# Example: When used in conjunction with `allow_test_addresses = true` (but it could be any other range)
+#   `excluded_dial_addresses = ["/ip4/127.*.0:49.*/tcp/*", "/ip4/127.*.101:255.*/tcp/*"]`
+#                or
+#   `excluded_dial_addresses = ["/ip4/127.0:0.1/tcp/122", "/ip4/127.0:0.1/tcp/1000:2000"]`
+excluded_dial_addresses = []

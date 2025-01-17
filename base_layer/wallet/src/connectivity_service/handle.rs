@@ -29,24 +29,28 @@ use tari_core::base_node::{rpc::BaseNodeWalletRpcClient, sync::rpc::BaseNodeSync
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::service::OnlineStatus;
-use crate::{connectivity_service::WalletConnectivityInterface, util::watch::Watch};
+use crate::{
+    connectivity_service::{BaseNodePeerManager, WalletConnectivityInterface},
+    util::watch::Watch,
+};
 
 pub enum WalletConnectivityRequest {
     ObtainBaseNodeWalletRpcClient(oneshot::Sender<RpcClientLease<BaseNodeWalletRpcClient>>),
     ObtainBaseNodeSyncRpcClient(oneshot::Sender<RpcClientLease<BaseNodeSyncRpcClient>>),
+    DisconnectBaseNode(NodeId),
 }
 
 #[derive(Clone)]
 pub struct WalletConnectivityHandle {
     sender: mpsc::Sender<WalletConnectivityRequest>,
-    base_node_watch: Watch<Option<Peer>>,
+    base_node_watch: Watch<Option<BaseNodePeerManager>>,
     online_status_rx: watch::Receiver<OnlineStatus>,
 }
 
 impl WalletConnectivityHandle {
     pub(super) fn new(
         sender: mpsc::Sender<WalletConnectivityRequest>,
-        base_node_watch: Watch<Option<Peer>>,
+        base_node_watch: Watch<Option<BaseNodePeerManager>>,
         online_status_rx: watch::Receiver<OnlineStatus>,
     ) -> Self {
         Self {
@@ -59,17 +63,21 @@ impl WalletConnectivityHandle {
 
 #[async_trait::async_trait]
 impl WalletConnectivityInterface for WalletConnectivityHandle {
-    fn set_base_node(&mut self, base_node_peer: Peer) {
-        if let Some(peer) = self.base_node_watch.borrow().as_ref() {
-            if peer.public_key == base_node_peer.public_key {
+    fn set_base_node(&mut self, base_node_peer_manager: BaseNodePeerManager) {
+        if let Some(selected_peer) = self.base_node_watch.borrow().as_ref() {
+            if selected_peer.get_current_peer().public_key == base_node_peer_manager.get_current_peer().public_key {
                 return;
             }
         }
-        self.base_node_watch.send(Some(base_node_peer));
+        self.base_node_watch.send(Some(base_node_peer_manager));
     }
 
-    fn get_current_base_node_watcher(&self) -> watch::Receiver<Option<Peer>> {
+    fn get_current_base_node_watcher(&self) -> watch::Receiver<Option<BaseNodePeerManager>> {
         self.base_node_watch.get_receiver()
+    }
+
+    fn get_base_node_peer_manager_state(&self) -> Option<(usize, Vec<Peer>)> {
+        self.base_node_watch.borrow().as_ref().map(|p| p.get_state().clone())
     }
 
     /// Obtain a BaseNodeWalletRpcClient.
@@ -111,6 +119,13 @@ impl WalletConnectivityInterface for WalletConnectivityHandle {
         reply_rx.await.ok()
     }
 
+    async fn disconnect_base_node(&mut self, node_id: NodeId) {
+        let _unused = self
+            .sender
+            .send(WalletConnectivityRequest::DisconnectBaseNode(node_id))
+            .await;
+    }
+
     fn get_connectivity_status(&mut self) -> OnlineStatus {
         *self.online_status_rx.borrow()
     }
@@ -120,15 +135,24 @@ impl WalletConnectivityInterface for WalletConnectivityHandle {
     }
 
     fn get_current_base_node_peer(&self) -> Option<Peer> {
-        self.base_node_watch.borrow().clone()
+        self.base_node_watch
+            .borrow()
+            .as_ref()
+            .map(|p| p.get_current_peer().clone())
     }
 
     fn get_current_base_node_peer_public_key(&self) -> Option<CommsPublicKey> {
-        self.base_node_watch.borrow().as_ref().map(|p| p.public_key.clone())
+        self.base_node_watch
+            .borrow()
+            .as_ref()
+            .map(|p| p.get_current_peer().public_key.clone())
     }
 
-    fn get_current_base_node_id(&self) -> Option<NodeId> {
-        self.base_node_watch.borrow().as_ref().map(|p| p.node_id.clone())
+    fn get_current_base_node_peer_node_id(&self) -> Option<NodeId> {
+        self.base_node_watch
+            .borrow()
+            .as_ref()
+            .map(|p| p.get_current_peer().node_id.clone())
     }
 
     fn is_base_node_set(&self) -> bool {

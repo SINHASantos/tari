@@ -24,8 +24,10 @@ use std::{path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use tari_common::configuration::serializers;
+use tari_comms::{net_address::MultiaddrRangeList, peer_validator::PeerValidatorConfig};
 
 use crate::{
+    actor::OffenceSeverity,
     network_discovery::NetworkDiscoveryConfig,
     storage::DbConnectionUrl,
     store_forward::SafConfig,
@@ -48,6 +50,9 @@ pub struct DhtConfig {
     /// Number of random peers to include
     /// Default: 4
     pub num_random_nodes: usize,
+    /// Connections above the configured number of neighbouring and random nodes will be removed
+    /// (default: false)
+    pub minimize_connections: bool,
     /// Send to this many peers when using the broadcast strategy
     /// Default: 8
     pub broadcast_factor: usize,
@@ -82,16 +87,13 @@ pub struct DhtConfig {
     /// Network discovery config
     pub network_discovery: NetworkDiscoveryConfig,
     /// Length of time to ban a peer if the peer misbehaves at the DHT-level.
-    /// Default: 6 hrs
+    /// Default: 2 hrs
     #[serde(with = "serializers::seconds")]
     pub ban_duration: Duration,
     /// Length of time to ban a peer for a "short" duration.
-    /// Default: 30 mins
+    /// Default: 10 mins
     #[serde(with = "serializers::seconds")]
     pub ban_duration_short: Duration,
-    /// This allows the use of test addresses in the network.
-    /// Default: false
-    pub allow_test_addresses: bool,
     /// The maximum number of messages over `flood_ban_timespan` to allow before banning the peer (for
     /// `ban_duration_short`) Default: 100_000 messages
     pub flood_ban_max_msg_count: usize,
@@ -103,9 +105,21 @@ pub struct DhtConfig {
     /// Once a peer has been marked as offline, wait at least this length of time before reconsidering them.
     /// In a situation where a node is not well-connected and many nodes are locally marked as offline, we can retry
     /// peers that were previously tried.
-    /// Default: 2 hours
+    /// Default: 24 hours
     #[serde(with = "serializers::seconds")]
     pub offline_peer_cooldown: Duration,
+    /// The maximum number of peer claims accepted by this node. Only peer sync sends more than one claim.
+    /// Default: 5
+    pub max_permitted_peer_claims: usize,
+    /// Configuration for peer validation
+    /// See [PeerValidatorConfig]
+    pub peer_validator_config: PeerValidatorConfig,
+    /// Addresses that should never be dialed (default value = []). This can be a specific address or an IPv4/TCP
+    /// range. Example: When used in conjunction with `allow_test_addresses = true` (but it could be any other
+    /// range)   `excluded_dial_addresses = ["/ip4/127.*.0:49.*/tcp/*", "/ip4/127.*.101:255.*/tcp/*"]`
+    ///                or
+    ///   `excluded_dial_addresses = ["/ip4/127.0:0.1/tcp/122", "/ip4/127.0:0.1/tcp/1000:2000"]`
+    pub excluded_dial_addresses: MultiaddrRangeList,
 }
 
 impl DhtConfig {
@@ -131,9 +145,14 @@ impl DhtConfig {
             network_discovery: NetworkDiscoveryConfig {
                 // If a test requires the peer probe they should explicitly enable it
                 enabled: false,
+                initial_peer_sync_delay: None,
                 ..Default::default()
             },
-            allow_test_addresses: true,
+            peer_validator_config: PeerValidatorConfig {
+                allow_test_addresses: true,
+                ..Default::default()
+            },
+            excluded_dial_addresses: vec![].into(),
             ..Default::default()
         }
     }
@@ -141,6 +160,14 @@ impl DhtConfig {
     /// Sets relative paths to use a common base path
     pub fn set_base_path<P: AsRef<Path>>(&mut self, base_path: P) {
         self.database_url.set_base_path(base_path);
+    }
+
+    /// Returns a ban duration from the given severity
+    pub fn ban_duration_from_severity(&self, severity: OffenceSeverity) -> Duration {
+        match severity {
+            OffenceSeverity::Low | OffenceSeverity::Medium => self.ban_duration_short,
+            OffenceSeverity::High => self.ban_duration,
+        }
     }
 }
 
@@ -151,7 +178,8 @@ impl Default for DhtConfig {
             protocol_version: DhtProtocolVersion::latest(),
             num_neighbouring_nodes: 8,
             num_random_nodes: 4,
-            propagation_factor: 4,
+            minimize_connections: false,
+            propagation_factor: 20,
             broadcast_factor: 8,
             outbound_buffer_size: 20,
             saf: Default::default(),
@@ -164,12 +192,14 @@ impl Default for DhtConfig {
             auto_join: false,
             join_cooldown_interval: Duration::from_secs(10 * 60),
             network_discovery: Default::default(),
-            ban_duration: Duration::from_secs(6 * 60 * 60),
-            ban_duration_short: Duration::from_secs(60 * 60),
-            allow_test_addresses: false,
+            ban_duration: Duration::from_secs(2 * 60 * 60),
+            ban_duration_short: Duration::from_secs(10 * 60),
             flood_ban_max_msg_count: 100_000,
             flood_ban_timespan: Duration::from_secs(100),
-            offline_peer_cooldown: Duration::from_secs(2 * 60 * 60),
+            max_permitted_peer_claims: 5,
+            offline_peer_cooldown: Duration::from_secs(24 * 60 * 60),
+            peer_validator_config: Default::default(),
+            excluded_dial_addresses: vec![].into(),
         }
     }
 }

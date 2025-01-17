@@ -28,7 +28,6 @@ use log::*;
 use tari_common_types::{
     tari_address::TariAddress,
     transaction::{TransactionDirection, TransactionStatus, TxId},
-    types::HashOutput,
 };
 use tari_comms::types::CommsPublicKey;
 use tari_comms_dht::{
@@ -38,8 +37,9 @@ use tari_comms_dht::{
 use tari_core::{
     covenants::Covenant,
     transactions::{
-        tari_amount::MicroTari,
-        transaction_components::OutputFeatures,
+        key_manager::TransactionKeyManagerInterface,
+        tari_amount::MicroMinotari,
+        transaction_components::{encrypted_data::PaymentId, OutputFeatures},
         transaction_protocol::{
             proto::protocol as proto,
             recipient::RecipientSignedMessage,
@@ -50,7 +50,7 @@ use tari_core::{
     },
 };
 use tari_p2p::tari_message::TariMessageType;
-use tari_script::script;
+use tari_script::TariScript;
 use tokio::{
     sync::{mpsc::Receiver, oneshot},
     time::sleep,
@@ -63,6 +63,7 @@ use crate::{
         config::TransactionRoutingMechanism,
         error::{TransactionServiceError, TransactionServiceProtocolError},
         handle::{TransactionEvent, TransactionSendStatus, TransactionServiceResponse},
+        protocols::check_transaction_size,
         service::{TransactionSendResult, TransactionServiceResources},
         storage::{
             database::TransactionBackend,
@@ -86,44 +87,42 @@ pub enum TransactionSendProtocolStage {
     WaitForReply,
 }
 
-pub struct TransactionSendProtocol<TBackend, TWalletConnectivity> {
+pub struct TransactionSendProtocol<TBackend, TWalletConnectivity, TKeyManagerInterface> {
     id: TxId,
     dest_address: TariAddress,
-    amount: MicroTari,
-    fee_per_gram: MicroTari,
-    message: String,
+    amount: MicroMinotari,
+    fee_per_gram: MicroMinotari,
+    payment_id: PaymentId,
     service_request_reply_channel: Option<oneshot::Sender<Result<TransactionServiceResponse, TransactionServiceError>>>,
     stage: TransactionSendProtocolStage,
-    resources: TransactionServiceResources<TBackend, TWalletConnectivity>,
+    resources: TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
     transaction_reply_receiver: Option<Receiver<(CommsPublicKey, RecipientSignedMessage)>>,
     cancellation_receiver: Option<oneshot::Receiver<()>>,
-    prev_header: Option<HashOutput>,
-    height: Option<u64>,
     tx_meta: TransactionMetadata,
     sender_protocol: Option<SenderTransactionProtocol>,
 }
 
-impl<TBackend, TWalletConnectivity> TransactionSendProtocol<TBackend, TWalletConnectivity>
+impl<TBackend, TWalletConnectivity, TKeyManagerInterface>
+    TransactionSendProtocol<TBackend, TWalletConnectivity, TKeyManagerInterface>
 where
     TBackend: TransactionBackend + 'static,
     TWalletConnectivity: WalletConnectivityInterface,
+    TKeyManagerInterface: TransactionKeyManagerInterface,
 {
     pub fn new(
         id: TxId,
-        resources: TransactionServiceResources<TBackend, TWalletConnectivity>,
+        resources: TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
         transaction_reply_receiver: Receiver<(CommsPublicKey, RecipientSignedMessage)>,
         cancellation_receiver: oneshot::Receiver<()>,
         dest_address: TariAddress,
-        amount: MicroTari,
-        fee_per_gram: MicroTari,
-        message: String,
+        amount: MicroMinotari,
+        fee_per_gram: MicroMinotari,
+        payment_id: PaymentId,
         tx_meta: TransactionMetadata,
         service_request_reply_channel: Option<
             oneshot::Sender<Result<TransactionServiceResponse, TransactionServiceError>>,
         >,
         stage: TransactionSendProtocolStage,
-        prev_header: Option<HashOutput>,
-        height: Option<u64>,
         sender_protocol: Option<SenderTransactionProtocol>,
     ) -> Self {
         Self {
@@ -134,11 +133,9 @@ where
             dest_address,
             amount,
             fee_per_gram,
-            message,
+            payment_id,
             service_request_reply_channel,
             stage,
-            prev_header,
-            height,
             tx_meta,
             sender_protocol,
         }
@@ -227,19 +224,19 @@ where
                 OutputFeatures::default(),
                 self.fee_per_gram,
                 self.tx_meta.clone(),
-                self.message.clone(),
-                script!(Nop),
+                TariScript::default(),
                 Covenant::default(),
-                MicroTari::zero(),
+                MicroMinotari::zero(),
+                self.dest_address.clone(),
+                self.payment_id.clone(),
             )
             .await
         {
             Ok(sp) => {
                 let _result = service_reply_channel
                     .send(Ok(TransactionServiceResponse::TransactionSent(self.id)))
-                    .map_err(|e| {
+                    .inspect_err(|_| {
                         warn!(target: LOG_TARGET, "Failed to send service reply");
-                        e
                     });
                 Ok(sp)
             },
@@ -247,9 +244,8 @@ where
                 let error_string = e.to_string();
                 let _size = service_reply_channel
                     .send(Err(TransactionServiceError::from(e)))
-                    .map_err(|e| {
+                    .inspect_err(|_| {
                         warn!(target: LOG_TARGET, "Failed to send service reply");
-                        e
                     });
                 Err(TransactionServiceProtocolError::new(
                     self.id,
@@ -274,7 +270,8 @@ where
 
         // Build single round message and advance sender state
         let msg = sender_protocol
-            .build_single_round_message()
+            .build_single_round_message(&self.resources.transaction_key_manager_service)
+            .await
             .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
         let tx_id = msg.tx_id;
         if tx_id != self.id {
@@ -284,28 +281,45 @@ where
             ));
         }
 
+        // Calculate the size of the transaction - initial send transaction to the peer (always a small message) should
+        // not be attempted if the final transaction size will be too large to be broadcast
+        let outbound_tx_check = OutboundTransaction::new(
+            tx_id,
+            self.dest_address.clone(),
+            self.amount,
+            MicroMinotari::zero(), // This does not matter for the check
+            sender_protocol.clone(),
+            TransactionStatus::Pending, // This does not matter for the check
+            self.payment_id.clone(),
+            Utc::now(),
+            true, // This does not matter for the check
+        );
+
         // Attempt to send the initial transaction
-        let SendResult {
-            direct_send_result,
-            store_and_forward_send_result,
-            transaction_status,
-        } = match self.send_transaction(msg).await {
-            Ok(val) => val,
-            Err(e) => {
-                warn!(
-                    target: LOG_TARGET,
-                    "Problem sending Outbound Transaction TxId: {:?}: {:?}", self.id, e
-                );
-                SendResult {
-                    direct_send_result: false,
-                    store_and_forward_send_result: false,
-                    transaction_status: TransactionStatus::Queued,
-                }
-            },
+        let mut initial_send = SendResult {
+            direct_send_result: false,
+            store_and_forward_send_result: false,
+            transaction_status: TransactionStatus::Queued,
+        };
+        if let Err(e) = check_transaction_size(&outbound_tx_check, self.id) {
+            info!(
+                target: LOG_TARGET,
+                "Initial Transaction TxId: {:?} will not be sent due to it being oversize ({:?})", self.id, e
+            );
+        } else {
+            match self.send_transaction(msg).await {
+                Ok(val) => initial_send = val,
+                Err(e) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Problem sending Outbound Transaction TxId: {:?}: {:?}", self.id, e
+                    );
+                },
+            }
         };
 
         // Confirm pending transaction (confirm encumbered outputs)
-        if transaction_status == TransactionStatus::Pending {
+        if initial_send.transaction_status == TransactionStatus::Pending {
             self.resources
                 .output_manager_service
                 .confirm_pending_transaction(self.id)
@@ -329,17 +343,21 @@ where
                 self.amount,
                 fee,
                 sender_protocol.clone(),
-                transaction_status.clone(),
-                self.message.clone(),
-                Utc::now().naive_utc(),
-                direct_send_result,
+                initial_send.transaction_status.clone(),
+                self.payment_id.clone(),
+                Utc::now(),
+                initial_send.direct_send_result,
             );
             self.resources
                 .db
-                .add_pending_outbound_transaction(outbound_tx.tx_id, outbound_tx)
+                .add_pending_outbound_transaction(outbound_tx.tx_id, outbound_tx.clone())
                 .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
+            if let Err(e) = check_transaction_size(&outbound_tx, self.id) {
+                self.cancel_oversized_transaction().await?;
+                return Err(e);
+            }
         }
-        if transaction_status == TransactionStatus::Pending {
+        if initial_send.transaction_status == TransactionStatus::Pending {
             self.resources
                 .db
                 .increment_send_count(self.id)
@@ -353,13 +371,13 @@ where
             .send(Arc::new(TransactionEvent::TransactionSendResult(
                 self.id,
                 TransactionSendStatus {
-                    direct_send_result,
-                    store_and_forward_send_result,
-                    queued_for_retry: transaction_status == TransactionStatus::Queued,
+                    direct_send_result: initial_send.direct_send_result,
+                    store_and_forward_send_result: initial_send.store_and_forward_send_result,
+                    queued_for_retry: initial_send.transaction_status == TransactionStatus::Queued,
                 },
             )));
 
-        if transaction_status == TransactionStatus::Pending {
+        if initial_send.transaction_status == TransactionStatus::Pending {
             info!(
                 target: LOG_TARGET,
                 "Pending Outbound Transaction TxId: {:?} added. Waiting for Reply or Cancellation", self.id,
@@ -370,7 +388,7 @@ where
                 "Pending Outbound Transaction TxId: {:?} queued. Waiting for wallet to come online", self.id,
             );
         }
-        Ok(transaction_status)
+        Ok(initial_send.transaction_status)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -393,6 +411,12 @@ where
             .db
             .get_pending_outbound_transaction(tx_id)
             .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
+
+        // Verify that the negotiated transaction is not too large to be broadcast
+        if let Err(e) = check_transaction_size(&outbound_tx, self.id) {
+            self.cancel_oversized_transaction().await?;
+            return Err(e);
+        }
 
         if !outbound_tx.sender_protocol.is_collecting_single_signature() {
             error!(
@@ -439,7 +463,8 @@ where
                 .send_transaction(
                     outbound_tx
                         .sender_protocol
-                        .get_single_round_message()
+                        .get_single_round_message(&self.resources.transaction_key_manager_service)
+                        .await
                         .map_err(|e| TransactionServiceProtocolError::new(self.id, e.into()))?,
                 )
                 .await
@@ -469,7 +494,7 @@ where
                     let rr_tx_id = rr.tx_id;
                     reply = Some(rr);
 
-                    if outbound_tx.destination_address.public_key() != &spk {
+                    if outbound_tx.destination_address.comms_public_key() != &spk {
                         warn!(
                             target: LOG_TARGET,
                             "Transaction Reply did not come from the expected Public Key"
@@ -484,7 +509,7 @@ where
                     if result.is_ok() {
                         info!(target: LOG_TARGET, "Cancelling Transaction Send Protocol (TxId: {})", self.id);
                         let _ = send_transaction_cancelled_message(
-                            self.id,self.dest_address.public_key().clone(),
+                            self.id,self.dest_address.comms_public_key().clone(),
                             self.resources.outbound_message_service.clone(), )
                         .await.map_err(|e| {
                             warn!(
@@ -508,7 +533,7 @@ where
                     match self.send_transaction(
                         outbound_tx
                         .sender_protocol
-                        .get_single_round_message()
+                        .get_single_round_message(&self.resources.transaction_key_manager_service).await
                         .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?
                     ).await
                     {
@@ -546,16 +571,14 @@ where
 
         outbound_tx
             .sender_protocol
-            .add_single_recipient_info(recipient_reply)
+            .add_single_recipient_info(recipient_reply, &self.resources.transaction_key_manager_service)
+            .await
             .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
 
         outbound_tx
             .sender_protocol
-            .finalize(
-                &self.resources.factories,
-                self.prev_header,
-                self.height.unwrap_or(u64::MAX),
-            )
+            .finalize(&self.resources.transaction_key_manager_service)
+            .await
             .map_err(|e| {
                 error!(
                     target: LOG_TARGET,
@@ -571,19 +594,19 @@ where
 
         let completed_transaction = CompletedTransaction::new(
             tx_id,
-            self.resources.wallet_identity.address.clone(),
+            self.resources.interactive_tari_address.clone(),
             outbound_tx.destination_address,
             outbound_tx.amount,
             outbound_tx.fee,
             tx.clone(),
             TransactionStatus::Completed,
-            outbound_tx.message.clone(),
-            Utc::now().naive_utc(),
+            Utc::now(),
             TransactionDirection::Outbound,
             None,
             None,
-            None,
-        );
+            outbound_tx.payment_id.clone(),
+        )
+        .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
 
         self.resources
             .db
@@ -597,7 +620,7 @@ where
         send_finalized_transaction_message(
             tx_id,
             tx.clone(),
-            self.dest_address.public_key().clone(),
+            self.dest_address.comms_public_key().clone(),
             self.resources.outbound_message_service.clone(),
             self.resources.config.direct_send_timeout,
             self.resources.config.transaction_routing_mechanism,
@@ -679,8 +702,8 @@ where
         match self
             .resources
             .outbound_message_service
-            .send_direct(
-                self.dest_address.public_key().clone(),
+            .send_direct_unencrypted(
+                self.dest_address.comms_public_key().clone(),
                 OutboundDomainMessage::new(&TariMessageType::SenderPartialTransaction, proto_message.clone()),
                 "transaction send".to_string(),
             )
@@ -691,7 +714,7 @@ where
                     if wait_on_dial(
                         send_states,
                         self.id,
-                        self.dest_address.public_key().clone(),
+                        self.dest_address.comms_public_key().clone(),
                         "Transaction",
                         self.resources.config.direct_send_timeout,
                     )
@@ -769,7 +792,7 @@ where
                             direct_send_result = wait_on_dial(
                                 send_states,
                                 self.id,
-                                self.dest_address.public_key().clone(),
+                                self.dest_address.comms_public_key().clone(),
                                 "Transaction",
                                 self.resources.config.direct_send_timeout,
                             )
@@ -825,8 +848,8 @@ where
             .resources
             .outbound_message_service
             .closest_broadcast(
-                self.dest_address.public_key().clone(),
-                OutboundEncryption::encrypt_for(self.dest_address.public_key().clone()),
+                self.dest_address.comms_public_key().clone(),
+                OutboundEncryption::encrypt_for(self.dest_address.comms_public_key().clone()),
                 vec![],
                 OutboundDomainMessage::new(&TariMessageType::SenderPartialTransaction, proto_message),
             )
@@ -887,9 +910,36 @@ where
             target: LOG_TARGET,
             "Cancelling Transaction Send Protocol (TxId: {}) due to timeout after no counterparty response", self.id
         );
+
+        self.cancel_transaction(TxCancellationReason::Timeout).await?;
+
+        info!(
+            target: LOG_TARGET,
+            "Pending Transaction (TxId: {}) timed out after no response from counterparty", self.id
+        );
+
+        Err(TransactionServiceProtocolError::new(
+            self.id,
+            TransactionServiceError::Timeout,
+        ))
+    }
+
+    async fn cancel_oversized_transaction(&mut self) -> Result<(), TransactionServiceProtocolError<TxId>> {
+        info!(
+            target: LOG_TARGET,
+            "Cancelling Transaction Send Protocol (TxId: {}) due to transaction being oversized", self.id
+        );
+
+        self.cancel_transaction(TxCancellationReason::Oversized).await
+    }
+
+    async fn cancel_transaction(
+        &mut self,
+        cancel_reason: TxCancellationReason,
+    ) -> Result<(), TransactionServiceProtocolError<TxId>> {
         let _ = send_transaction_cancelled_message(
             self.id,
-            self.dest_address.public_key().clone(),
+            self.dest_address.comms_public_key().clone(),
             self.resources.outbound_message_service.clone(),
         )
         .await
@@ -921,10 +971,7 @@ where
         let _size = self
             .resources
             .event_publisher
-            .send(Arc::new(TransactionEvent::TransactionCancelled(
-                self.id,
-                TxCancellationReason::Timeout,
-            )))
+            .send(Arc::new(TransactionEvent::TransactionCancelled(self.id, cancel_reason)))
             .map_err(|e| {
                 trace!(
                     target: LOG_TARGET,
@@ -937,15 +984,7 @@ where
                 )
             });
 
-        info!(
-            target: LOG_TARGET,
-            "Pending Transaction (TxId: {}) timed out after no response from counterparty", self.id
-        );
-
-        Err(TransactionServiceProtocolError::new(
-            self.id,
-            TransactionServiceError::Timeout,
-        ))
+        Ok(())
     }
 }
 

@@ -43,6 +43,7 @@ pub struct MmrStateRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeCommsRequest {
     GetChainMetadata,
+    GetTargetDifficultyNextBlock(PowAlgorithm),
     FetchHeaders(RangeInclusive<u64>),
     FetchHeadersByHashes(Vec<HashOutput>),
     FetchMatchingUtxos(Vec<HashOutput>),
@@ -74,6 +75,7 @@ impl Display for NodeCommsRequest {
         use NodeCommsRequest::*;
         match self {
             GetChainMetadata => write!(f, "GetChainMetadata"),
+            GetTargetDifficultyNextBlock(algo) => write!(f, "GetTargetDifficultyNextBlock ({:?})", algo),
             FetchHeaders(range) => {
                 write!(f, "FetchHeaders ({:?})", range)
             },
@@ -84,11 +86,11 @@ impl Display for NodeCommsRequest {
             },
             FetchBlocksByKernelExcessSigs(v) => write!(f, "FetchBlocksByKernelExcessSigs (n={})", v.len()),
             FetchBlocksByUtxos(v) => write!(f, "FetchBlocksByUtxos (n={})", v.len()),
-            GetHeaderByHash(v) => write!(f, "GetHeaderByHash({})", v.to_hex()),
-            GetBlockByHash(v) => write!(f, "GetBlockByHash({})", v.to_hex()),
+            GetHeaderByHash(v) => write!(f, "GetHeaderByHash({})", v),
+            GetBlockByHash(v) => write!(f, "GetBlockByHash({})", v),
             GetNewBlockTemplate(v) => write!(f, "GetNewBlockTemplate ({}) with weight {}", v.algo, v.max_weight),
             GetNewBlock(b) => write!(f, "GetNewBlock (Block Height={})", b.header.height),
-            GetBlockFromAllChains(v) => write!(f, "GetBlockFromAllChains({})", v.to_hex()),
+            GetBlockFromAllChains(v) => write!(f, "GetBlockFromAllChains({})", v),
             FetchKernelByExcessSig(s) => write!(
                 f,
                 "FetchKernelByExcessSig (signature=({}, {}))",

@@ -20,11 +20,12 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{convert::TryInto, iter};
+use std::convert::TryInto;
 
 use crate::{
     covenants::{context::CovenantContext, Covenant},
     transactions::{
+        key_manager::MemoryDbKeyManager,
         test_helpers::{TestParams, UtxoTestParams},
         transaction_components::{
             BuildInfo,
@@ -37,20 +38,24 @@ use crate::{
     },
 };
 
-pub fn create_outputs(n: usize, utxo_params: UtxoTestParams) -> Vec<TransactionOutput> {
-    iter::repeat_with(|| {
-        let params = TestParams::new();
-        let output = params.create_unblinded_output(utxo_params.clone());
-        output.as_transaction_output(&Default::default()).unwrap()
-    })
-    .take(n)
-    .collect()
+pub async fn create_outputs(
+    n: usize,
+    utxo_params: UtxoTestParams,
+    key_manager: &MemoryDbKeyManager,
+) -> Vec<TransactionOutput> {
+    let mut outputs = Vec::new();
+    for _i in 0..n {
+        let params = TestParams::new(key_manager).await;
+        let output = params.create_output(utxo_params.clone(), key_manager).await.unwrap();
+        outputs.push(output.to_transaction_output(key_manager).await.unwrap());
+    }
+    outputs
 }
 
-pub fn create_input() -> TransactionInput {
-    let params = TestParams::new();
-    let output = params.create_unblinded_output(Default::default());
-    output.as_transaction_input(&Default::default()).unwrap()
+pub async fn create_input(key_manager: &MemoryDbKeyManager) -> TransactionInput {
+    let params = TestParams::new(key_manager).await;
+    let output = params.create_output(Default::default(), key_manager).await.unwrap();
+    output.to_transaction_input(key_manager).await.unwrap()
 }
 
 pub fn create_context<'a>(covenant: &Covenant, input: &'a TransactionInput, block_height: u64) -> CovenantContext<'a> {
@@ -72,5 +77,5 @@ pub fn make_sample_sidechain_feature() -> SideChainFeature {
         binary_sha: Default::default(),
         binary_url: "https://github.com/tari-project/tari.git".try_into().unwrap(),
     };
-    SideChainFeature::TemplateRegistration(template_reg)
+    SideChainFeature::CodeTemplateRegistration(template_reg)
 }

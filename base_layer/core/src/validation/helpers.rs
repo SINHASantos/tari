@@ -20,25 +20,21 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::collections::HashSet;
+use std::convert::TryFrom;
 
 use log::*;
-use tari_common_types::types::{Commitment, CommitmentFactory, FixedHash, PublicKey};
-use tari_crypto::{
-    commitment::HomomorphicCommitmentFactory,
-    keys::PublicKey as PublicKeyTrait,
-    tari_utilities::{epoch_time::EpochTime, hex::Hex},
-};
+use tari_common_types::types::FixedHash;
+use tari_crypto::tari_utilities::{epoch_time::EpochTime, hex::Hex};
 use tari_script::TariScript;
 
 use crate::{
-    blocks::{Block, BlockHeader, BlockHeaderValidationError, BlockValidationError},
+    blocks::{BlockHeader, BlockHeaderValidationError, BlockValidationError},
     borsh::SerializedSize,
     chain_storage::{BlockchainBackend, MmrRoots, MmrTree},
-    consensus::{emission::Emission, ConsensusConstants, ConsensusManager},
+    consensus::{ConsensusConstants, ConsensusManager},
+    covenants::Covenant,
     proof_of_work::{
-        monero_difficulty,
-        monero_rx::MoneroPowData,
+        randomx_difficulty,
         randomx_factory::RandomXFactory,
         sha3x_difficulty,
         AchievedTargetDifficulty,
@@ -46,50 +42,32 @@ use crate::{
         PowAlgorithm,
         PowError,
     },
-    transactions::{
-        aggregated_body::AggregateBody,
-        tari_amount::MicroTari,
-        transaction_components::{KernelSum, TransactionError, TransactionInput, TransactionKernel, TransactionOutput},
-        CryptoFactories,
+    transactions::transaction_components::{
+        encrypted_data::STATIC_ENCRYPTED_DATA_SIZE_TOTAL,
+        EncryptedData,
+        TransactionInput,
+        TransactionKernel,
+        TransactionOutput,
     },
     validation::ValidationError,
 };
 
 pub const LOG_TARGET: &str = "c::val::helpers";
 
-/// This function tests that the block timestamp is less than the FTL
-pub fn check_timestamp_ftl(
-    block_header: &BlockHeader,
-    consensus_manager: &ConsensusManager,
-) -> Result<(), ValidationError> {
-    if block_header.timestamp > consensus_manager.consensus_constants(block_header.height).ftl() {
-        warn!(
-            target: LOG_TARGET,
-            "Invalid Future Time Limit on block:{}",
-            block_header.hash().to_hex()
-        );
-        return Err(ValidationError::BlockHeaderError(
-            BlockHeaderValidationError::InvalidTimestampFutureTimeLimit,
-        ));
-    }
-    Ok(())
-}
-
 /// Returns the median timestamp for the provided timestamps.
 ///
 /// ## Panics
 /// When an empty slice is given as this is undefined for median average.
 /// https://math.stackexchange.com/a/3451015
-pub fn calc_median_timestamp(timestamps: &[EpochTime]) -> EpochTime {
-    assert!(
-        !timestamps.is_empty(),
-        "calc_median_timestamp: timestamps cannot be empty"
-    );
+pub fn calc_median_timestamp(timestamps: &[EpochTime]) -> Result<EpochTime, ValidationError> {
     trace!(
         target: LOG_TARGET,
         "Calculate the median timestamp from {} timestamps",
         timestamps.len()
     );
+    if timestamps.is_empty() {
+        return Err(ValidationError::IncorrectNumberOfTimestampsProvided { expected: 1, actual: 0 });
+    }
 
     let mid_index = timestamps.len() / 2;
     let median_timestamp = if timestamps.len() % 2 == 0 {
@@ -99,25 +77,33 @@ pub fn calc_median_timestamp(timestamps: &[EpochTime]) -> EpochTime {
             timestamps[mid_index - 1],
             timestamps[mid_index],
         );
-        (timestamps[mid_index - 1] + timestamps[mid_index]) / 2
+        // To compute this mean, we use `u128` to avoid overflow with the internal `u64` typing
+        // Note that the final cast back to `u64` will never truncate since each summand is bounded by `u64`
+        // To make the linter happy, we use `u64::MAX` in the impossible case that the cast fails
+        EpochTime::from(
+            u64::try_from(
+                (u128::from(timestamps[mid_index - 1].as_u64()) + u128::from(timestamps[mid_index].as_u64())) / 2,
+            )
+            .unwrap_or(u64::MAX),
+        )
     } else {
         timestamps[mid_index]
     };
     trace!(target: LOG_TARGET, "Median timestamp:{}", median_timestamp);
-    median_timestamp
+    Ok(median_timestamp)
 }
-
 pub fn check_header_timestamp_greater_than_median(
     block_header: &BlockHeader,
     timestamps: &[EpochTime],
 ) -> Result<(), ValidationError> {
     if timestamps.is_empty() {
+        // unreachable due to sanity_check_timestamp_count
         return Err(ValidationError::BlockHeaderError(
             BlockHeaderValidationError::InvalidTimestamp("The timestamp is empty".to_string()),
         ));
     }
 
-    let median_timestamp = calc_median_timestamp(timestamps);
+    let median_timestamp = calc_median_timestamp(timestamps)?;
     if block_header.timestamp < median_timestamp {
         warn!(
             target: LOG_TARGET,
@@ -136,50 +122,16 @@ pub fn check_header_timestamp_greater_than_median(
 
     Ok(())
 }
-
-/// Check the PoW data in the BlockHeader. This currently only applies to blocks merged mined with Monero.
-pub fn check_pow_data<B: BlockchainBackend>(
-    block_header: &BlockHeader,
-    rules: &ConsensusManager,
-    db: &B,
-) -> Result<(), ValidationError> {
-    use PowAlgorithm::{Monero, Sha3};
-    match block_header.pow.pow_algo {
-        Monero => {
-            let monero_data =
-                MoneroPowData::from_header(block_header).map_err(|e| ValidationError::CustomError(e.to_string()))?;
-            let seed_height = db.fetch_monero_seed_first_seen_height(&monero_data.randomx_key)?;
-            if seed_height != 0 {
-                // Saturating sub: subtraction can underflow in reorgs / rewind-blockchain command
-                let seed_used_height = block_header.height.saturating_sub(seed_height);
-                if seed_used_height > rules.consensus_constants(block_header.height).max_randomx_seed_height() {
-                    return Err(ValidationError::BlockHeaderError(
-                        BlockHeaderValidationError::OldSeedHash,
-                    ));
-                }
-            }
-
-            Ok(())
-        },
-        Sha3 => {
-            if !block_header.pow.pow_data.is_empty() {
-                return Err(ValidationError::CustomError(
-                    "Proof of work data must be empty for Sha3 blocks".to_string(),
-                ));
-            }
-            Ok(())
-        },
-    }
-}
-
 pub fn check_target_difficulty(
     block_header: &BlockHeader,
     target: Difficulty,
     randomx_factory: &RandomXFactory,
+    gen_hash: &FixedHash,
+    consensus: &ConsensusManager,
 ) -> Result<AchievedTargetDifficulty, ValidationError> {
     let achieved = match block_header.pow_algo() {
-        PowAlgorithm::Monero => monero_difficulty(block_header, randomx_factory)?,
-        PowAlgorithm::Sha3 => sha3x_difficulty(block_header),
+        PowAlgorithm::RandomX => randomx_difficulty(block_header, randomx_factory, gen_hash, consensus)?,
+        PowAlgorithm::Sha3x => sha3x_difficulty(block_header)?,
     };
 
     match AchievedTargetDifficulty::try_construct(block_header.pow_algo(), target, achieved) {
@@ -200,112 +152,6 @@ pub fn check_target_difficulty(
     }
 }
 
-pub fn check_block_weight(block: &Block, consensus_constants: &ConsensusConstants) -> Result<(), ValidationError> {
-    // The genesis block has a larger weight than other blocks may have so we have to exclude it here
-    let block_weight = block.body.calculate_weight(consensus_constants.transaction_weight());
-    let max_weight = consensus_constants.get_max_block_transaction_weight();
-    if block_weight <= max_weight || block.header.height == 0 {
-        trace!(
-            target: LOG_TARGET,
-            "SV - Block contents for block #{} : {}; weight {}.",
-            block.header.height,
-            block.body.to_counts_string(),
-            block_weight,
-        );
-
-        Ok(())
-    } else {
-        Err(BlockValidationError::BlockTooLarge {
-            actual_weight: block_weight,
-            max_weight,
-        }
-        .into())
-    }
-}
-
-pub fn check_accounting_balance(
-    block: &Block,
-    rules: &ConsensusManager,
-    bypass_range_proof_verification: bool,
-    factories: &CryptoFactories,
-) -> Result<(), ValidationError> {
-    if block.header.height == 0 {
-        // Gen block does not need to be checked for this.
-        return Ok(());
-    }
-    let offset = &block.header.total_kernel_offset;
-    let script_offset = &block.header.total_script_offset;
-    let total_coinbase = rules.calculate_coinbase_and_fees(block.header.height, block.body.kernels());
-    block
-        .body
-        .validate_internal_consistency(
-            offset,
-            script_offset,
-            bypass_range_proof_verification,
-            total_coinbase,
-            factories,
-            Some(block.header.prev_hash),
-            block.header.height,
-        )
-        .map_err(|err| {
-            warn!(
-                target: LOG_TARGET,
-                "Validation failed on block:{}:{:?}",
-                block.hash().to_hex(),
-                err
-            );
-            ValidationError::TransactionError(err)
-        })
-}
-
-/// THis function checks the total burned sum in the header ensuring that every burned output is counted in the total
-/// sum.
-#[allow(clippy::mutable_key_type)]
-pub fn check_total_burned(body: &AggregateBody) -> Result<(), ValidationError> {
-    let mut burned_outputs = HashSet::new();
-    for output in body.outputs() {
-        if output.is_burned() {
-            // we dont care about duplicate commitments are they should have already been checked
-            burned_outputs.insert(output.commitment.clone());
-        }
-    }
-    for kernel in body.kernels() {
-        if kernel.is_burned() && !burned_outputs.remove(kernel.get_burn_commitment()?) {
-            return Err(ValidationError::InvalidBurnError(
-                "Burned kernel does not match burned output".to_string(),
-            ));
-        }
-    }
-
-    if !burned_outputs.is_empty() {
-        return Err(ValidationError::InvalidBurnError(
-            "Burned output has no matching burned kernel".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-pub fn check_coinbase_output(
-    block: &Block,
-    rules: &ConsensusManager,
-    factories: &CryptoFactories,
-) -> Result<(), ValidationError> {
-    let total_coinbase = rules.calculate_coinbase_and_fees(block.header.height, block.body.kernels());
-    block
-        .check_coinbase_output(
-            total_coinbase,
-            rules.consensus_constants(block.header.height),
-            factories,
-        )
-        .map_err(ValidationError::from)
-}
-
-pub fn check_output_features(block: &Block, rules: &ConsensusManager) -> Result<(), ValidationError> {
-    block
-        .check_output_features(rules.consensus_constants(block.header.height))
-        .map_err(ValidationError::from)
-}
-
 pub fn is_all_unique_and_sorted<'a, I: IntoIterator<Item = &'a T>, T: PartialOrd + 'a>(items: I) -> bool {
     let mut items = items.into_iter();
     let prev_item = items.next();
@@ -323,59 +169,8 @@ pub fn is_all_unique_and_sorted<'a, I: IntoIterator<Item = &'a T>, T: PartialOrd
     true
 }
 
-// This function checks for duplicate inputs and outputs. There should be no duplicate inputs or outputs in a block
-pub fn check_sorting_and_duplicates(body: &AggregateBody) -> Result<(), ValidationError> {
-    if !is_all_unique_and_sorted(body.inputs()) {
-        return Err(ValidationError::UnsortedOrDuplicateInput);
-    }
-
-    if !is_all_unique_and_sorted(body.outputs()) {
-        return Err(ValidationError::UnsortedOrDuplicateOutput);
-    }
-
-    if !is_all_unique_and_sorted(body.kernels()) {
-        return Err(ValidationError::UnsortedOrDuplicateKernel);
-    }
-
-    Ok(())
-}
-
-/// This function checks that all inputs in the blocks are valid UTXO's to be spent
-pub fn check_inputs_are_utxos<B: BlockchainBackend>(db: &B, body: &AggregateBody) -> Result<(), ValidationError> {
-    let mut not_found_inputs = Vec::new();
-    let mut output_hashes = None;
-
-    for input in body.inputs() {
-        // If spending a unique_id, a new output must contain the unique id
-        match check_input_is_utxo(db, input) {
-            Ok(_) => continue,
-            Err(ValidationError::UnknownInput) => {
-                // Lazily allocate and hash outputs as needed
-                if output_hashes.is_none() {
-                    output_hashes = Some(body.outputs().iter().map(|output| output.hash()).collect::<Vec<_>>());
-                }
-
-                let output_hashes = output_hashes.as_ref().unwrap();
-                let output_hash = input.output_hash();
-                if output_hashes.iter().any(|output| output == &output_hash) {
-                    continue;
-                }
-                not_found_inputs.push(output_hash);
-            },
-            Err(err) => {
-                return Err(err);
-            },
-        }
-    }
-
-    if !not_found_inputs.is_empty() {
-        return Err(ValidationError::UnknownInputs(not_found_inputs));
-    }
-
-    Ok(())
-}
-
-/// This function checks that an input is a valid spendable UTXO
+/// This function checks that an input is a valid spendable UTXO in the database. It cannot confirm
+/// zero confermation transactions.
 pub fn check_input_is_utxo<B: BlockchainBackend>(db: &B, input: &TransactionInput) -> Result<(), ValidationError> {
     let output_hash = input.output_hash();
     if let Some(utxo_hash) = db.fetch_unspent_output_hash_by_commitment(input.commitment()?)? {
@@ -415,37 +210,35 @@ pub fn check_input_is_utxo<B: BlockchainBackend>(db: &B, input: &TransactionInpu
 
     warn!(
         target: LOG_TARGET,
-        "Validation failed due to input: {} which does not exist yet", input
+        "Input ({}, {}) does not exist in the database yet", input.commitment()?.to_hex(), output_hash.to_hex()
     );
     Err(ValidationError::UnknownInput)
 }
 
-/// This function checks:
-/// 1. that the output type is permitted
-/// 2. the byte size of TariScript does not exceed the maximum
-/// 3. that the outputs do not already exist in the UTxO set.
-pub fn check_outputs<B: BlockchainBackend>(
-    db: &B,
-    constants: &ConsensusConstants,
-    body: &AggregateBody,
-) -> Result<(), ValidationError> {
-    let max_script_size = constants.get_max_script_byte_size();
-    for output in body.outputs() {
-        check_permitted_output_types(constants, output)?;
-        check_tari_script_byte_size(&output.script, max_script_size)?;
-        check_not_duplicate_txo(db, output)?;
-        check_validator_node_registration_utxo(constants, output)?;
+/// Checks the byte size of TariScript is less than or equal to the given size, otherwise returns an error.
+pub fn check_tari_script_byte_size(script: &TariScript, max_script_size: usize) -> Result<(), ValidationError> {
+    let script_size = script
+        .get_serialized_size()
+        .map_err(|e| ValidationError::SerializationError(format!("Failed to get serialized script size: {}", e)))?;
+    if script_size > max_script_size {
+        return Err(ValidationError::TariScriptExceedsMaxSize {
+            max_script_size,
+            actual_script_size: script_size,
+        });
     }
     Ok(())
 }
 
 /// Checks the byte size of TariScript is less than or equal to the given size, otherwise returns an error.
-pub fn check_tari_script_byte_size(script: &TariScript, max_script_size: usize) -> Result<(), ValidationError> {
-    let script_size = script.get_serialized_size();
-    if script_size > max_script_size {
-        return Err(ValidationError::TariScriptExceedsMaxSize {
-            max_script_size,
-            actual_script_size: script_size,
+pub fn check_tari_encrypted_data_byte_size(
+    encrypted_data: &EncryptedData,
+    max_encrypted_data_size: usize,
+) -> Result<(), ValidationError> {
+    let encrypted_data_size = encrypted_data.as_bytes().len();
+    if encrypted_data_size > max_encrypted_data_size + STATIC_ENCRYPTED_DATA_SIZE_TOTAL {
+        return Err(ValidationError::EncryptedDataExceedsMaxSize {
+            max_encrypted_data_size: max_encrypted_data_size + STATIC_ENCRYPTED_DATA_SIZE_TOTAL,
+            actual_encrypted_data_size: encrypted_data_size,
         });
     }
     Ok(())
@@ -456,13 +249,6 @@ pub fn check_not_duplicate_txo<B: BlockchainBackend>(
     db: &B,
     output: &TransactionOutput,
 ) -> Result<(), ValidationError> {
-    if let Some(index) = db.fetch_mmr_leaf_index(MmrTree::Utxo, &output.hash())? {
-        warn!(
-            target: LOG_TARGET,
-            "Validation failed due to previously spent output: {} (MMR index = {})", output, index
-        );
-        return Err(ValidationError::ContainsTxO);
-    }
     if db
         .fetch_unspent_output_hash_by_commitment(&output.commitment)?
         .is_some()
@@ -477,6 +263,7 @@ pub fn check_not_duplicate_txo<B: BlockchainBackend>(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn check_mmr_roots(header: &BlockHeader, mmr_roots: &MmrRoots) -> Result<(), ValidationError> {
     if header.kernel_mr != mmr_roots.kernel_mr {
         warn!(
@@ -516,33 +303,36 @@ pub fn check_mmr_roots(header: &BlockHeader, mmr_roots: &MmrRoots) -> Result<(),
             mmr_roots.output_mr.to_hex()
         );
         return Err(ValidationError::BlockError(BlockValidationError::MismatchedMmrRoots {
-            kind: "Utxo",
+            kind: "Utxos",
         }));
     };
-    if header.witness_mr != mmr_roots.witness_mr {
-        warn!(
-            target: LOG_TARGET,
-            "Block header witness MMR roots in {} do not match calculated roots",
-            header.hash().to_hex()
-        );
-        return Err(ValidationError::BlockError(BlockValidationError::MismatchedMmrRoots {
-            kind: "Witness",
-        }));
-    };
-    if header.output_mmr_size != mmr_roots.output_mmr_size {
+    if header.output_smt_size != mmr_roots.output_smt_size {
         warn!(
             target: LOG_TARGET,
             "Block header output MMR size in {} does not match. Expected: {}, Actual: {}",
             header.hash().to_hex(),
-            header.output_mmr_size,
-            mmr_roots.output_mmr_size
+            header.output_smt_size,
+            mmr_roots.output_smt_size
         );
         return Err(ValidationError::BlockError(BlockValidationError::MismatchedMmrSize {
-            mmr_tree: MmrTree::Utxo.to_string(),
-            expected: mmr_roots.output_mmr_size,
-            actual: header.output_mmr_size,
+            mmr_tree: "UTXO".to_string(),
+            expected: mmr_roots.output_smt_size,
+            actual: header.output_smt_size,
         }));
-    }
+    };
+    if header.block_output_mr != mmr_roots.block_output_mr {
+        warn!(
+            target: LOG_TARGET,
+            "Block header block output MMR roots in #{} {} do not match calculated roots. Expected: {}, Actual:{}",
+            header.height,
+            header.hash().to_hex(),
+            header.block_output_mr,
+            mmr_roots.block_output_mr,
+        );
+        return Err(ValidationError::BlockError(BlockValidationError::MismatchedMmrRoots {
+            kind: "block outputs",
+        }));
+    };
     if header.input_mr != mmr_roots.input_mr {
         warn!(
             target: LOG_TARGET,
@@ -568,154 +358,23 @@ pub fn check_mmr_roots(header: &BlockHeader, mmr_roots: &MmrRoots) -> Result<(),
             kind: "Validator Node",
         }));
     }
-    Ok(())
-}
 
-pub fn check_not_bad_block<B: BlockchainBackend>(db: &B, hash: FixedHash) -> Result<(), ValidationError> {
-    if db.bad_block_exists(hash)? {
-        return Err(ValidationError::BadBlockFound { hash: hash.to_hex() });
-    }
-    Ok(())
-}
-
-/// This checks to ensure that every kernel included in the block is a unique kernel in the block chain.
-pub fn check_unique_kernels<B: BlockchainBackend>(db: &B, block_body: &AggregateBody) -> Result<(), ValidationError> {
-    for kernel in block_body.kernels() {
-        if let Some((db_kernel, header_hash)) = db.fetch_kernel_by_excess_sig(&kernel.excess_sig)? {
-            let msg = format!(
-                "Block contains kernel excess: {} which matches already existing excess signature in chain database \
-                 block hash: {}. Existing kernel excess: {}, excess sig nonce: {}, excess signature: {}",
-                kernel.excess.to_hex(),
-                header_hash.to_hex(),
-                db_kernel.excess.to_hex(),
-                db_kernel.excess_sig.get_public_nonce().to_hex(),
-                db_kernel.excess_sig.get_signature().to_hex(),
-            );
-            warn!(target: LOG_TARGET, "{}", msg);
-            return Err(ValidationError::ConsensusError(msg));
-        };
-    }
-    Ok(())
-}
-
-pub fn validate_covenants(block: &Block) -> Result<(), ValidationError> {
-    for input in block.body.inputs() {
-        let output_set_size = input
-            .covenant()?
-            .execute(block.header.height, input, block.body.outputs())?;
-        trace!(target: LOG_TARGET, "{} output(s) passed covenant", output_set_size);
-    }
-    Ok(())
-}
-
-pub fn check_coinbase_reward(
-    factory: &CommitmentFactory,
-    rules: &ConsensusManager,
-    height: u64,
-    total_fees: MicroTari,
-    coinbase_kernel: &TransactionKernel,
-    coinbase_output: &TransactionOutput,
-) -> Result<(), ValidationError> {
-    let reward = rules.emission_schedule().block_reward(height) + total_fees;
-    let rhs = &coinbase_kernel.excess + &factory.commit_value(&Default::default(), reward.into());
-    if rhs != coinbase_output.commitment {
+    if header.validator_node_size != mmr_roots.validator_node_size {
         warn!(
             target: LOG_TARGET,
-            "Coinbase {} amount validation failed", coinbase_output
+            "Block header validator size in #{} {} does not match. Expected: {}, Actual:{}",
+            header.height,
+            header.hash().to_hex(),
+            header.validator_node_size,
+            mmr_roots.validator_node_size
         );
-        return Err(ValidationError::TransactionError(TransactionError::InvalidCoinbase));
+        return Err(ValidationError::BlockError(BlockValidationError::MismatchedMmrSize {
+            mmr_tree: "Validator_node".to_string(),
+            expected: mmr_roots.validator_node_size,
+            actual: header.validator_node_size,
+        }));
     }
     Ok(())
-}
-
-pub fn check_coinbase_maturity(
-    rules: &ConsensusManager,
-    height: u64,
-    coinbase_output: &TransactionOutput,
-) -> Result<(), ValidationError> {
-    let constants = rules.consensus_constants(height);
-    if coinbase_output.features.maturity < height + constants.coinbase_lock_height() {
-        warn!(
-            target: LOG_TARGET,
-            "Coinbase {} found with maturity set too low", coinbase_output
-        );
-        return Err(ValidationError::TransactionError(
-            TransactionError::InvalidCoinbaseMaturity,
-        ));
-    }
-    Ok(())
-}
-
-pub fn check_kernel_sum(
-    factory: &CommitmentFactory,
-    kernel_sum: &KernelSum,
-    output_commitment_sum: &Commitment,
-    input_commitment_sum: &Commitment,
-) -> Result<(), ValidationError> {
-    let KernelSum { sum: excess, fees } = kernel_sum;
-    let sum_io = output_commitment_sum - input_commitment_sum;
-    let fees = factory.commit_value(&Default::default(), fees.as_u64());
-    if *excess != &sum_io + &fees {
-        return Err(TransactionError::ValidationError(
-            "Sum of inputs and outputs did not equal sum of kernels with fees".into(),
-        )
-        .into());
-    }
-    Ok(())
-}
-
-pub fn check_script_offset(
-    header: &BlockHeader,
-    aggregate_offset_pubkey: &PublicKey,
-    aggregate_input_key: &PublicKey,
-) -> Result<(), ValidationError> {
-    let script_offset = PublicKey::from_secret_key(&header.total_script_offset);
-    let lhs = aggregate_input_key - aggregate_offset_pubkey;
-    if lhs != script_offset {
-        return Err(TransactionError::ScriptOffset.into());
-    }
-    Ok(())
-}
-
-/// Checks that all transactions (given by their kernels) are spendable at the given height
-pub fn check_kernel_lock_height(height: u64, kernels: &[TransactionKernel]) -> Result<(), BlockValidationError> {
-    if kernels.iter().any(|k| k.lock_height > height) {
-        return Err(BlockValidationError::MaturityError);
-    }
-    Ok(())
-}
-
-/// Checks that all inputs have matured at the given height
-pub fn check_maturity(height: u64, inputs: &[TransactionInput]) -> Result<(), TransactionError> {
-    if let Err(e) = inputs
-        .iter()
-        .map(|input| match input.is_mature_at(height) {
-            Ok(mature) => {
-                if mature {
-                    Ok(0)
-                } else {
-                    warn!(
-                        target: LOG_TARGET,
-                        "Input found that has not yet matured to spending height: {}", input
-                    );
-                    Err(TransactionError::InputMaturity)
-                }
-            },
-            Err(e) => Err(e),
-        })
-        .sum::<Result<usize, TransactionError>>()
-    {
-        return Err(e);
-    }
-    Ok(())
-}
-
-pub fn check_blockchain_version(constants: &ConsensusConstants, version: u16) -> Result<(), ValidationError> {
-    if constants.valid_blockchain_version_range().contains(&version) {
-        Ok(())
-    } else {
-        Err(ValidationError::InvalidBlockchainVersion { version })
-    }
 }
 
 pub fn check_permitted_output_types(
@@ -728,6 +387,40 @@ pub fn check_permitted_output_types(
     {
         return Err(ValidationError::OutputTypeNotPermitted {
             output_type: output.features.output_type,
+        });
+    }
+
+    Ok(())
+}
+
+pub fn check_covenant_length(covenant: &Covenant, max_token_len: u32) -> Result<(), ValidationError> {
+    if covenant.num_tokens() > max_token_len as usize {
+        return Err(ValidationError::CovenantTooLarge {
+            max_size: max_token_len as usize,
+            actual_size: covenant.num_tokens(),
+        });
+    }
+
+    Ok(())
+}
+
+pub fn check_permitted_range_proof_types(
+    constants: &ConsensusConstants,
+    output: &TransactionOutput,
+) -> Result<(), ValidationError> {
+    let binding = constants.permitted_range_proof_types();
+    let permitted_range_proof_types = binding.iter().find(|&&t| t.0 == output.features.output_type).ok_or(
+        ValidationError::OutputTypeNotMatchedToRangeProofType {
+            output_type: output.features.output_type,
+        },
+    )?;
+
+    if !permitted_range_proof_types
+        .1
+        .contains(&output.features.range_proof_type)
+    {
+        return Err(ValidationError::RangeProofTypeNotPermitted {
+            range_proof_type: output.features.range_proof_type,
         });
     }
 
@@ -810,84 +503,12 @@ pub fn validate_kernel_version(
     Ok(())
 }
 
-pub fn validate_versions(
-    body: &AggregateBody,
-    consensus_constants: &ConsensusConstants,
-) -> Result<(), ValidationError> {
-    // validate input version
-    for input in body.inputs() {
-        validate_input_version(consensus_constants, input)?;
-    }
-
-    // validate output version and output features version
-    for output in body.outputs() {
-        validate_output_version(consensus_constants, output)?;
-    }
-
-    // validate kernel version
-    for kernel in body.kernels() {
-        validate_kernel_version(consensus_constants, kernel)?;
-    }
-
-    Ok(())
-}
-
-pub fn check_validator_node_registration_utxo(
-    consensus_constants: &ConsensusConstants,
-    utxo: &TransactionOutput,
-) -> Result<(), ValidationError> {
-    if let Some(reg) = utxo.features.validator_node_registration() {
-        if utxo.minimum_value_promise < consensus_constants.validator_node_registration_min_deposit_amount() {
-            return Err(ValidationError::ValidatorNodeRegistrationMinDepositAmount {
-                min: consensus_constants.validator_node_registration_min_deposit_amount(),
-                actual: utxo.minimum_value_promise,
-            });
-        }
-        if utxo.features.maturity < consensus_constants.validator_node_registration_min_lock_height() {
-            return Err(ValidationError::ValidatorNodeRegistrationMinLockHeight {
-                min: consensus_constants.validator_node_registration_min_lock_height(),
-                actual: utxo.features.maturity,
-            });
-        }
-
-        // TODO(SECURITY): Signing this with a blank msg allows the signature to be replayed. Using the commitment
-        //                 is ideal as uniqueness is enforced. However, because the VN and wallet have different
-        //                 keys this becomes difficult. Fix this once we have decided on a solution.
-        if !reg.is_valid_signature_for(&[]) {
-            return Err(ValidationError::InvalidValidatorNodeSignature);
-        }
-    }
-    Ok(())
-}
-
-pub fn check_output_feature(output: &TransactionOutput, max_coinbase_extra_size: u32) -> Result<(), TransactionError> {
-    // This field is optional for coinbases (mining pools and
-    // other merge mined coins can use it), but must be empty for non-coinbases
-    if !output.is_coinbase() && !output.features.coinbase_extra.is_empty() {
-        return Err(TransactionError::NonCoinbaseHasOutputFeaturesCoinbaseExtra);
-    }
-
-    // For coinbases, the maximum length should be 64 bytes (2x hashes),
-    // so that arbitrary data cannot be included
-    if output.is_coinbase() && output.features.coinbase_extra.len() > max_coinbase_extra_size as usize {
-        return Err(TransactionError::InvalidOutputFeaturesCoinbaseExtraSize {
-            len: output.features.coinbase_extra.len(),
-            max: max_coinbase_extra_size,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod test {
     use tari_test_utils::unpack_enum;
 
     use super::*;
-    use crate::transactions::{
-        test_helpers,
-        test_helpers::TestParams,
-        transaction_components::{OutputFeatures, TransactionInputVersion},
-    };
+    use crate::transactions::{test_helpers, test_helpers::TestParams, CryptoFactories};
 
     mod is_all_unique_and_sorted {
         use super::*;
@@ -927,204 +548,115 @@ mod test {
         use super::*;
 
         #[test]
-        #[should_panic]
-        fn it_panics_if_empty() {
-            calc_median_timestamp(&[]);
+        fn it_errors_on_empty() {
+            assert!(calc_median_timestamp(&[]).is_err());
         }
 
         #[test]
         fn it_calculates_the_correct_median_timestamp() {
-            let median_timestamp = calc_median_timestamp(&[0.into()]);
+            let median_timestamp = calc_median_timestamp(&[0.into()]).unwrap();
             assert_eq!(median_timestamp, 0.into());
 
-            let median_timestamp = calc_median_timestamp(&[123.into()]);
+            let median_timestamp = calc_median_timestamp(&[123.into()]).unwrap();
             assert_eq!(median_timestamp, 123.into());
 
-            let median_timestamp = calc_median_timestamp(&[2.into(), 4.into()]);
+            let median_timestamp = calc_median_timestamp(&[2.into(), 4.into()]).unwrap();
             assert_eq!(median_timestamp, 3.into());
 
-            let median_timestamp = calc_median_timestamp(&[0.into(), 100.into(), 0.into()]);
+            let median_timestamp = calc_median_timestamp(&[0.into(), 100.into(), 0.into()]).unwrap();
             assert_eq!(median_timestamp, 100.into());
 
-            let median_timestamp = calc_median_timestamp(&[1.into(), 2.into(), 3.into(), 4.into()]);
+            let median_timestamp = calc_median_timestamp(&[1.into(), 2.into(), 3.into(), 4.into()]).unwrap();
             assert_eq!(median_timestamp, 2.into());
 
-            let median_timestamp = calc_median_timestamp(&[1.into(), 2.into(), 3.into(), 4.into(), 5.into()]);
+            let median_timestamp = calc_median_timestamp(&[1.into(), 2.into(), 3.into(), 4.into(), 5.into()]).unwrap();
             assert_eq!(median_timestamp, 3.into());
-        }
-    }
-
-    mod check_lock_height {
-        use super::*;
-
-        #[test]
-        fn it_checks_the_kernel_timelock() {
-            let mut kernel = test_helpers::create_test_kernel(0.into(), 0, KernelFeatures::empty());
-            kernel.lock_height = 2;
-            assert!(matches!(
-                check_kernel_lock_height(1, &[kernel.clone()]),
-                Err(BlockValidationError::MaturityError)
-            ));
-
-            check_kernel_lock_height(2, &[kernel.clone()]).unwrap();
-            check_kernel_lock_height(3, &[kernel]).unwrap();
-        }
-    }
-
-    mod check_maturity {
-        use super::*;
-
-        #[test]
-        fn it_checks_the_input_maturity() {
-            let input = TransactionInput::new_with_output_data(
-                TransactionInputVersion::get_current_version(),
-                OutputFeatures {
-                    maturity: 5,
-                    ..Default::default()
-                },
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                MicroTari::zero(),
-            );
-
-            assert!(matches!(
-                check_maturity(1, &[input.clone()]),
-                Err(TransactionError::InputMaturity)
-            ));
-
-            assert!(matches!(
-                check_maturity(4, &[input.clone()]),
-                Err(TransactionError::InputMaturity)
-            ));
-
-            check_maturity(5, &[input.clone()]).unwrap();
-            check_maturity(6, &[input]).unwrap();
         }
     }
 
     mod check_coinbase_maturity {
-        use super::*;
+        use futures::executor::block_on;
 
-        #[test]
-        fn it_succeeds_for_valid_coinbase() {
-            let test_params = TestParams::new();
+        use super::*;
+        use crate::transactions::{
+            aggregated_body::AggregateBody,
+            key_manager::create_memory_db_key_manager,
+            transaction_components::{RangeProofType, TransactionError},
+        };
+
+        #[tokio::test]
+        async fn it_succeeds_for_valid_coinbase() {
+            let height = 1;
+            let key_manager = create_memory_db_key_manager().unwrap();
+            let test_params = TestParams::new(&key_manager).await;
             let rules = test_helpers::create_consensus_manager();
-            let coinbase = test_helpers::create_unblinded_coinbase(&test_params, 1, None);
-            let coinbase_output = coinbase.as_transaction_output(&CryptoFactories::default()).unwrap();
-            check_coinbase_maturity(&rules, 1, &coinbase_output).unwrap();
+            let key_manager = create_memory_db_key_manager().unwrap();
+            let coinbase = block_on(test_helpers::create_coinbase_wallet_output(
+                &test_params,
+                height,
+                None,
+                RangeProofType::RevealedValue,
+            ));
+            let coinbase_output = coinbase.to_transaction_output(&key_manager).await.unwrap();
+            let coinbase_kernel = test_helpers::create_coinbase_kernel(&coinbase.spending_key_id, &key_manager).await;
+
+            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+
+            let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
+            let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
+            body.check_coinbase_output(reward, coinbase_lock_height, &CryptoFactories::default(), height)
+                .unwrap();
         }
 
-        #[test]
-        fn it_returns_error_for_invalid_coinbase_maturity() {
-            let test_params = TestParams::new();
+        #[tokio::test]
+        async fn it_returns_error_for_invalid_coinbase_maturity() {
+            let height = 1;
+            let key_manager = create_memory_db_key_manager().unwrap();
+            let test_params = TestParams::new(&key_manager).await;
             let rules = test_helpers::create_consensus_manager();
-            let mut coinbase = test_helpers::create_unblinded_coinbase(&test_params, 1, None);
+            let mut coinbase =
+                test_helpers::create_coinbase_wallet_output(&test_params, height, None, RangeProofType::RevealedValue)
+                    .await;
             coinbase.features.maturity = 0;
-            let coinbase_output = coinbase.as_transaction_output(&CryptoFactories::default()).unwrap();
-            let err = check_coinbase_maturity(&rules, 1, &coinbase_output).unwrap_err();
-            unpack_enum!(ValidationError::TransactionError(err) = err);
+            let coinbase_output = coinbase.to_transaction_output(&key_manager).await.unwrap();
+            let coinbase_kernel = test_helpers::create_coinbase_kernel(&coinbase.spending_key_id, &key_manager).await;
+
+            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+
+            let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
+            let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
+
+            let err = body
+                .check_coinbase_output(reward, coinbase_lock_height, &CryptoFactories::default(), height)
+                .unwrap_err();
             unpack_enum!(TransactionError::InvalidCoinbaseMaturity = err);
         }
-    }
 
-    mod check_coinbase_reward {
-
-        use super::*;
-
-        #[test]
-        fn it_succeeds_for_valid_coinbase() {
-            let test_params = TestParams::new();
+        #[tokio::test]
+        async fn it_returns_error_for_invalid_coinbase_reward() {
+            let height = 1;
+            let key_manager = create_memory_db_key_manager().unwrap();
+            let test_params = TestParams::new(&key_manager).await;
             let rules = test_helpers::create_consensus_manager();
-            let coinbase = test_helpers::create_unblinded_coinbase(&test_params, 1, None);
-            let coinbase_output = coinbase.as_transaction_output(&CryptoFactories::default()).unwrap();
-            let coinbase_kernel = test_helpers::create_coinbase_kernel(&coinbase.spending_key);
-            check_coinbase_reward(
-                &CommitmentFactory::default(),
-                &rules,
-                1,
-                0.into(),
-                &coinbase_kernel,
-                &coinbase_output,
+            let mut coinbase = test_helpers::create_coinbase_wallet_output(
+                &test_params,
+                height,
+                None,
+                RangeProofType::BulletProofPlus,
             )
-            .unwrap();
-        }
-
-        #[test]
-        fn it_returns_error_for_invalid_coinbase_reward() {
-            let test_params = TestParams::new();
-            let rules = test_helpers::create_consensus_manager();
-            let mut coinbase = test_helpers::create_unblinded_coinbase(&test_params, 1, None);
+            .await;
             coinbase.value = 123.into();
-            let coinbase_output = coinbase.as_transaction_output(&CryptoFactories::default()).unwrap();
-            let coinbase_kernel = test_helpers::create_coinbase_kernel(&coinbase.spending_key);
-            let err = check_coinbase_reward(
-                &CommitmentFactory::default(),
-                &rules,
-                1,
-                0.into(),
-                &coinbase_kernel,
-                &coinbase_output,
-            )
-            .unwrap_err();
-            unpack_enum!(ValidationError::TransactionError(err) = err);
+            let coinbase_output = coinbase.to_transaction_output(&key_manager).await.unwrap();
+            let coinbase_kernel = test_helpers::create_coinbase_kernel(&coinbase.spending_key_id, &key_manager).await;
+
+            let body = AggregateBody::new(vec![], vec![coinbase_output], vec![coinbase_kernel]);
+            let reward = rules.calculate_coinbase_and_fees(height, body.kernels()).unwrap();
+            let coinbase_lock_height = rules.consensus_constants(height).coinbase_min_maturity();
+
+            let err = body
+                .check_coinbase_output(reward, coinbase_lock_height, &CryptoFactories::default(), height)
+                .unwrap_err();
             unpack_enum!(TransactionError::InvalidCoinbase = err);
         }
-    }
-
-    use crate::{covenants::Covenant, transactions::transaction_components::KernelFeatures};
-
-    #[test]
-    fn check_burned_succeeds_for_valid_outputs() {
-        let mut kernel1 = test_helpers::create_test_kernel(0.into(), 0, KernelFeatures::create_burn());
-        let mut kernel2 = test_helpers::create_test_kernel(0.into(), 0, KernelFeatures::create_burn());
-
-        let (output1, _, _) = test_helpers::create_utxo(
-            100.into(),
-            &CryptoFactories::default(),
-            &OutputFeatures::create_burn_output(),
-            &TariScript::default(),
-            &Covenant::default(),
-            0.into(),
-        );
-        let (output2, _, _) = test_helpers::create_utxo(
-            101.into(),
-            &CryptoFactories::default(),
-            &OutputFeatures::create_burn_output(),
-            &TariScript::default(),
-            &Covenant::default(),
-            0.into(),
-        );
-        let (output3, _, _) = test_helpers::create_utxo(
-            102.into(),
-            &CryptoFactories::default(),
-            &OutputFeatures::create_burn_output(),
-            &TariScript::default(),
-            &Covenant::default(),
-            0.into(),
-        );
-
-        kernel1.burn_commitment = Some(output1.commitment.clone());
-        kernel2.burn_commitment = Some(output2.commitment.clone());
-        let kernel3 = kernel1.clone();
-
-        let mut body = AggregateBody::new(Vec::new(), vec![output1.clone(), output2.clone()], vec![
-            kernel1.clone(),
-            kernel2.clone(),
-        ]);
-        assert!(check_total_burned(&body).is_ok());
-        // lets add an extra kernel
-        body.add_kernels(&mut vec![kernel3]);
-        assert!(check_total_burned(&body).is_err());
-        // lets add a kernel commitment mismatch
-        body.add_outputs(&mut vec![output3.clone()]);
-        assert!(check_total_burned(&body).is_err());
-        // Lets try one with a commitment with no kernel
-        let body2 = AggregateBody::new(Vec::new(), vec![output1, output2, output3], vec![kernel1, kernel2]);
-        assert!(check_total_burned(&body2).is_err());
     }
 }

@@ -24,19 +24,24 @@ use std::{convert::TryFrom, fmt, time::Duration};
 
 use bitflags::bitflags;
 use bytes::Bytes;
+use log::warn;
 
 use super::RpcError;
 use crate::{
     proto,
     proto::rpc::rpc_session_reply::SessionResult,
-    protocol::rpc::{
-        body::{Body, IntoBody},
-        context::RequestContext,
-        error::HandshakeRejectReason,
-        RpcStatusCode,
+    protocol::{
+        rpc,
+        rpc::{
+            body::{Body, IntoBody},
+            context::RequestContext,
+            error::HandshakeRejectReason,
+            RpcStatusCode,
+        },
     },
 };
 
+const LOG_TARGET: &str = "comms::rpc::message";
 #[derive(Debug)]
 pub struct Request<T> {
     pub(super) context: Option<RequestContext>,
@@ -128,15 +133,7 @@ impl<T> BaseRequest<T> {
         self.message
     }
 
-    // #[allow(dead_code)]
-    // pub fn map<F, U>(self, mut f: F) -> BaseRequest<U>
-    // where F: FnMut(T) -> U {
-    //     BaseRequest {
-    //         method: self.method,
-    //         message: f(self.message),
-    //     }
-    // }
-
+    #[allow(dead_code)]
     pub fn get_ref(&self) -> &T {
         &self.message
     }
@@ -205,13 +202,12 @@ impl Into<u32> for RpcMethod {
 }
 
 bitflags! {
+    #[derive(Debug, Clone, Copy)]
     pub struct RpcMessageFlags: u8 {
         /// Message stream has completed
         const FIN = 0x01;
         /// Typically sent with empty contents and used to confirm a substream is alive.
         const ACK = 0x02;
-        /// Another chunk to be received
-        const MORE = 0x04;
     }
 }
 impl RpcMessageFlags {
@@ -221,10 +217,6 @@ impl RpcMessageFlags {
 
     pub fn is_ack(self) -> bool {
         self.contains(Self::ACK)
-    }
-
-    pub fn is_more(self) -> bool {
-        self.contains(Self::MORE)
     }
 }
 
@@ -241,8 +233,14 @@ impl proto::rpc::RpcRequest {
         Duration::from_secs(self.deadline)
     }
 
-    pub fn flags(&self) -> RpcMessageFlags {
-        RpcMessageFlags::from_bits_truncate(u8::try_from(self.flags).unwrap())
+    pub fn flags(&self) -> Result<RpcMessageFlags, String> {
+        RpcMessageFlags::from_bits(
+            u8::try_from(self.flags).map_err(|_| format!("invalid message flag: must be less than {}", u8::MAX))?,
+        )
+        .ok_or(format!(
+            "invalid message flag, does not match any flags ({})",
+            self.flags
+        ))
     }
 }
 
@@ -277,6 +275,21 @@ impl RpcResponse {
             payload: self.payload.to_vec(),
         }
     }
+
+    pub fn exceeded_message_size(self) -> RpcResponse {
+        let msg = format!(
+            "The response size exceeded the maximum allowed payload size. Max = {} bytes, Got = {} bytes",
+            rpc::max_response_payload_size() as f32,
+            self.payload.len() as f32,
+        );
+        warn!(target: LOG_TARGET, "{}", msg);
+        RpcResponse {
+            request_id: self.request_id,
+            status: RpcStatusCode::MalformedResponse,
+            flags: RpcMessageFlags::FIN,
+            payload: msg.into_bytes().into(),
+        }
+    }
 }
 
 impl Default for RpcResponse {
@@ -291,8 +304,14 @@ impl Default for RpcResponse {
 }
 
 impl proto::rpc::RpcResponse {
-    pub fn flags(&self) -> RpcMessageFlags {
-        RpcMessageFlags::from_bits_truncate(u8::try_from(self.flags).unwrap())
+    pub fn flags(&self) -> Result<RpcMessageFlags, String> {
+        RpcMessageFlags::from_bits(
+            u8::try_from(self.flags).map_err(|_| format!("invalid message flag: must be less than {}", u8::MAX))?,
+        )
+        .ok_or(format!(
+            "invalid message flag, does not match any flags ({})",
+            self.flags
+        ))
     }
 
     pub fn is_fin(&self) -> bool {

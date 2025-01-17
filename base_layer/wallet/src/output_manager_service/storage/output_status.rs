@@ -19,13 +19,7 @@
 // SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-use core::{
-    convert::TryFrom,
-    result::{
-        Result,
-        Result::{Err, Ok},
-    },
-};
+use core::convert::TryFrom;
 
 use strum_macros::Display;
 
@@ -44,7 +38,6 @@ pub enum OutputStatus {
     ShortTermEncumberedToBeReceived,
     ShortTermEncumberedToBeSpent,
     SpentMinedUnconfirmed,
-    AbandonedCoinbase,
     NotStored,
 }
 
@@ -63,8 +56,7 @@ impl TryFrom<i32> for OutputStatus {
             7 => Ok(OutputStatus::ShortTermEncumberedToBeReceived),
             8 => Ok(OutputStatus::ShortTermEncumberedToBeSpent),
             9 => Ok(OutputStatus::SpentMinedUnconfirmed),
-            10 => Ok(OutputStatus::AbandonedCoinbase),
-            11 => Ok(OutputStatus::NotStored),
+            10 => Ok(OutputStatus::NotStored),
             _ => Err(OutputManagerStorageError::ConversionError {
                 reason: "Was expecting value between 0 and 11 for OutputStatus".to_string(),
             }),

@@ -26,11 +26,12 @@ use log::*;
 use tari_comms::peer_manager::NodeId;
 use tari_utilities::hex::Hex;
 
+#[cfg(feature = "metrics")]
+use crate::mempool::metrics;
 use crate::{
     base_node::comms_interface::{BlockEvent, BlockEvent::AddBlockErrored},
     chain_storage::BlockAddResult,
     mempool::{
-        metrics,
         service::{MempoolRequest, MempoolResponse, MempoolServiceError, OutboundMempoolServiceInterface},
         Mempool,
         TxStorageResponse,
@@ -45,18 +46,21 @@ pub const LOG_TARGET: &str = "c::mp::service::inbound_handlers";
 #[derive(Clone)]
 pub struct MempoolInboundHandlers {
     mempool: Mempool,
-    outbound_nmi: OutboundMempoolServiceInterface,
+    outbound_service: OutboundMempoolServiceInterface,
 }
 
 impl MempoolInboundHandlers {
     /// Construct the MempoolInboundHandlers.
-    pub fn new(mempool: Mempool, outbound_nmi: OutboundMempoolServiceInterface) -> Self {
-        Self { mempool, outbound_nmi }
+    pub fn new(mempool: Mempool, outbound_service: OutboundMempoolServiceInterface) -> Self {
+        Self {
+            mempool,
+            outbound_service,
+        }
     }
 
     /// Handle inbound Mempool service requests from remote nodes and local services.
     pub async fn handle_request(&mut self, request: MempoolRequest) -> Result<MempoolResponse, MempoolServiceError> {
-        debug!(target: LOG_TARGET, "Handling remote request: {}", request);
+        trace!(target: LOG_TARGET, "Handling remote request: {}", request);
         use MempoolRequest::{GetFeePerGramStats, GetState, GetStats, GetTxStateByExcessSig, SubmitTransaction};
         match request {
             GetStats => Ok(MempoolResponse::Stats(self.mempool.stats().await?)),
@@ -65,10 +69,15 @@ impl MempoolInboundHandlers {
                 self.mempool.has_tx_with_excess_sig(excess_sig).await?,
             )),
             SubmitTransaction(tx) => {
+                let first_tx_kernel_excess_sig = tx
+                    .first_kernel_excess_sig()
+                    .ok_or(MempoolServiceError::TransactionNoKernels)?
+                    .get_signature()
+                    .to_hex();
                 debug!(
                     target: LOG_TARGET,
                     "Transaction ({}) submitted using request.",
-                    tx.body.kernels()[0].excess_sig.get_signature().to_hex(),
+                    first_tx_kernel_excess_sig,
                 );
                 Ok(MempoolResponse::TxStorage(self.submit_transaction(tx, None).await?))
             },
@@ -85,10 +94,15 @@ impl MempoolInboundHandlers {
         tx: Transaction,
         source_peer: Option<NodeId>,
     ) -> Result<(), MempoolServiceError> {
+        let first_tx_kernel_excess_sig = tx
+            .first_kernel_excess_sig()
+            .ok_or(MempoolServiceError::TransactionNoKernels)?
+            .get_signature()
+            .to_hex();
         debug!(
             target: LOG_TARGET,
             "Transaction ({}) received from {}.",
-            tx.body.kernels()[0].excess_sig.get_signature().to_hex(),
+            first_tx_kernel_excess_sig,
             source_peer
                 .as_ref()
                 .map(|p| format!("remote peer: {}", p))
@@ -122,6 +136,7 @@ impl MempoolInboundHandlers {
         }
         match self.mempool.insert(tx.clone()).await {
             Ok(tx_storage) => {
+                #[cfg(feature = "metrics")]
                 if tx_storage.is_stored() {
                     metrics::inbound_transactions(source_peer.as_ref()).inc();
                 } else {
@@ -139,7 +154,7 @@ impl MempoolInboundHandlers {
                         target: LOG_TARGET,
                         "Propagate transaction ({}) to network.", kernel_excess_sig,
                     );
-                    self.outbound_nmi
+                    self.outbound_service
                         .propagate_tx(tx, source_peer.into_iter().collect())
                         .await?;
                 }
@@ -151,6 +166,7 @@ impl MempoolInboundHandlers {
 
     #[allow(clippy::cast_possible_wrap)]
     async fn update_pool_size_metrics(&self) {
+        #[cfg(feature = "metrics")]
         if let Ok(stats) = self.mempool.stats().await {
             metrics::unconfirmed_pool_size().set(stats.unconfirmed_txs as i64);
             metrics::reorg_pool_size().set(stats.reorg_txs as i64);

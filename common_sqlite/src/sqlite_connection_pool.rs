@@ -20,14 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use core::{
-    option::Option::{None, Some},
-    result::{
-        Result,
-        Result::{Err, Ok},
-    },
-    time::Duration,
-};
+use core::time::Duration;
 use std::convert::TryFrom;
 
 use diesel::{
@@ -142,4 +135,10 @@ impl SqliteConnectionPool {
             Err(SqliteStorageError::DieselR2d2Error("Pool does not exist".to_string()))
         }
     }
+}
+
+pub trait PooledDbConnection: Send + Sync + Clone {
+    type Error;
+
+    fn get_pooled_connection(&self) -> Result<PooledConnection<ConnectionManager<SqliteConnection>>, Self::Error>;
 }

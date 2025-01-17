@@ -29,8 +29,6 @@ pub use accumulated_data::{
     BlockHeaderAccumulatedData,
     ChainBlock,
     ChainHeader,
-    CompleteDeletedBitmap,
-    DeletedBitmap,
     UpdateBlockAccumulatedData,
 };
 use tari_crypto::hash_domain;
@@ -50,6 +48,9 @@ pub use block_header::{BlockHeader, BlockHeaderValidationError};
 pub mod genesis_block;
 
 #[cfg(feature = "base_node")]
+pub mod pre_mine;
+
+#[cfg(feature = "base_node")]
 mod historical_block;
 #[cfg(feature = "base_node")]
 pub use historical_block::HistoricalBlock;
@@ -61,6 +62,7 @@ pub use new_block_template::NewBlockTemplate;
 
 #[cfg(feature = "base_node")]
 mod new_blockheader_template;
+
 #[cfg(feature = "base_node")]
 pub use new_blockheader_template::NewBlockHeaderTemplate;
 

@@ -23,8 +23,10 @@
 // Portions of this file were originally copyrighted (c) 2018 The Grin Developers, issued under the Apache License,
 // Version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0.
 
+use blake2::Blake2b;
 use chacha20poly1305::Key;
-pub use encrypted_value::{EncryptedValue, EncryptionError};
+use digest::consts::U32;
+pub use encrypted_data::{EncryptedData, EncryptedDataError};
 pub use error::TransactionError;
 pub use kernel_builder::KernelBuilder;
 pub use kernel_features::KernelFeatures;
@@ -32,8 +34,9 @@ pub use kernel_sum::KernelSum;
 pub use output_features::OutputFeatures;
 pub use output_features_version::OutputFeaturesVersion;
 pub use output_type::OutputType;
+pub use range_proof_type::RangeProofType;
 pub use side_chain::*;
-use tari_common_types::types::{Commitment, FixedHash, PublicKey};
+use tari_common_types::types::{ComAndPubSignature, Commitment, FixedHash, PublicKey};
 use tari_script::TariScript;
 use tari_utilities::{hidden_type, safe_array::SafeArray, Hidden};
 pub use transaction::Transaction;
@@ -45,17 +48,20 @@ pub use transaction_kernel_version::TransactionKernelVersion;
 pub use transaction_output::TransactionOutput;
 pub use transaction_output_version::TransactionOutputVersion;
 pub use unblinded_output::UnblindedOutput;
-pub use unblinded_output_builder::UnblindedOutputBuilder;
+pub use wallet_output::WalletOutput;
+pub use wallet_output_builder::WalletOutputBuilder;
 use zeroize::Zeroize;
 
-mod encrypted_value;
+pub mod encrypted_data;
 mod error;
 mod kernel_builder;
 mod kernel_features;
 mod kernel_sum;
 mod output_features;
+pub use output_features::CoinBaseExtra;
 mod output_features_version;
 mod output_type;
+mod range_proof_type;
 mod side_chain;
 
 mod transaction;
@@ -67,7 +73,8 @@ mod transaction_kernel_version;
 pub mod transaction_output;
 mod transaction_output_version;
 mod unblinded_output;
-mod unblinded_output_builder;
+mod wallet_output;
+mod wallet_output_builder;
 
 #[cfg(test)]
 mod test;
@@ -80,13 +87,16 @@ pub(crate) const AEAD_KEY_LEN: usize = std::mem::size_of::<Key>();
 
 // Type for hiding aead key encryption
 hidden_type!(EncryptedValueKey, SafeArray<u8, AEAD_KEY_LEN>);
+hidden_type!(EncryptedDataKey, SafeArray<u8, AEAD_KEY_LEN>);
 
 //----------------------------------------     Crate functions   ----------------------------------------------------//
 
-use super::tari_amount::MicroTari;
-use crate::{consensus::DomainSeparatedConsensusHasher, covenants::Covenant, transactions::TransactionHashDomain};
+use tari_hashing::TransactionHashDomain;
 
-/// Implement the canonical hashing function for TransactionOutput and UnblindedOutput for use in
+use super::tari_amount::MicroMinotari;
+use crate::{consensus::DomainSeparatedConsensusHasher, covenants::Covenant};
+
+/// Implement the canonical hashing function for TransactionOutput and WalletOutput for use in
 /// ordering as well as for the output hash calculation for TransactionInput.
 ///
 /// We can exclude the range proof from this hash. The rationale for this is:
@@ -96,20 +106,24 @@ pub(super) fn hash_output(
     version: TransactionOutputVersion,
     features: &OutputFeatures,
     commitment: &Commitment,
+    rangeproof_hash: &FixedHash,
     script: &TariScript,
-    covenant: &Covenant,
-    encrypted_value: &EncryptedValue,
     sender_offset_public_key: &PublicKey,
-    minimum_value_promise: MicroTari,
+    metadata_signature: &ComAndPubSignature,
+    covenant: &Covenant,
+    encrypted_data: &EncryptedData,
+    minimum_value_promise: MicroMinotari,
 ) -> FixedHash {
-    let common_hash = DomainSeparatedConsensusHasher::<TransactionHashDomain>::new("transaction_output")
+    let common_hash = DomainSeparatedConsensusHasher::<TransactionHashDomain, Blake2b<U32>>::new("transaction_output")
         .chain(&version)
         .chain(features)
         .chain(commitment)
+        .chain(rangeproof_hash)
         .chain(script)
-        .chain(covenant)
-        .chain(encrypted_value)
         .chain(sender_offset_public_key)
+        .chain(metadata_signature)
+        .chain(covenant)
+        .chain(encrypted_data)
         .chain(&minimum_value_promise);
 
     match version {

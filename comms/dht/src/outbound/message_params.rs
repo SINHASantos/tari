@@ -84,7 +84,7 @@ impl Default for FinalSendMessageParams {
             is_discovery_enabled: false,
             dht_header: None,
             debug_info: None,
-            tag: None,
+            tag: Some(MessageTag::new()),
         }
     }
 }
@@ -104,6 +104,7 @@ impl SendMessageParams {
         Default::default()
     }
 
+    /// Not currently used
     pub fn with_debug_info(&mut self, debug_info: String) -> &mut Self {
         self.params_mut().debug_info = Some(debug_info);
         self

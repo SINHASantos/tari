@@ -5,41 +5,55 @@
 #                                                                                                                      #
 ########################################################################################################################
 
-[peer_seeds]
-# DNS seeds hosts - DNS TXT records are queried from these hosts and the resulting peers added to the comms peer list.
-#dns_seeds = []
-# Custom specified peer seed nodes
-#peer_seeds = []
-# DNS name server to use for DNS seeds
-#dns_seeds_name_server = "1.1.1.1:853/cloudflare-dns.com"
-# All DNS seed records must pass DNSSEC validation
+[p2p.seeds]
+# DNS name servers to use for DNS seeds, in order of preference.
+# (default: dns_seed_name_servers = [
+#    "system",
+#    "1.1.1.1:853/cloudflare-dns.com",
+#    "8.8.8.8:853/dns.google",
+#    "9.9.9.9:853/dns.quad9.net"
+#]
+#dns_seed_name_servers = [
+#    "system",
+#    "1.1.1.1:853/cloudflare-dns.com",
+#    "8.8.8.8:853/dns.google",
+#    "9.9.9.9:853/dns.quad9.net"
+#]
+
+# All DNS seed records must pass DNSSEC validation (default: dns_seeds_use_dnssec = false)
 #dns_seeds_use_dnssec = false
+
+[nextnet.p2p.seeds]
+# DNS seeds hosts - DNS TXT records are queried from these hosts and the resulting peers added to the comms peer list.
+# (Default: peer_seeds = [])
+dns_seeds = ["seeds.nextnet.tari.com"]
+# Custom specified peer seed nodes (Default: peer_seeds = [])
+#peer_seeds = ["a062ae2345b0db0df9fb1504b99511e23d98f8513f9b5503efcc6dad8eca7e47::/ip4/54.77.66.39/tcp/18189"]
+
+[stagenet.p2p.seeds]
+# DNS seeds hosts - DNS TXT records are queried from these hosts and the resulting peers added to the comms peer list.
+# (Default: peer_seeds = [])
+dns_seeds = ["seeds.stagenet.tari.com"]
+# Custom specified peer seed nodes (Default: peer_seeds = [])
+#peer_seeds = ["a062ae2345b0db0df9fb1504b99511e23d98f8513f9b5503efcc6dad8eca7e47::/ip4/54.77.66.39/tcp/18189"]
 
 [esmeralda.p2p.seeds]
 # DNS seeds hosts - DNS TXT records are queried from these hosts and the resulting peers added to the comms peer list.
+# (Default: peer_seeds = [])
 dns_seeds = ["seeds.esmeralda.tari.com"]
-# Custom specified peer seed nodes
-peer_seeds = [
-    # 7777773c100a094c4feaa686cf
-    "d2cc8ad88271f075d7c3896179dc867a79115a136c9d9e175fe4ea774dafc75c::/onion3/atlitn6ewryimdviu4kjkjos3ift5v3ykvosgtnfgjocpdmondhykqid:18141",
-    # 222222c9629a9fcf5a71a18838
-    "78b2c0bda70fd12a9987757ffc2851e197080af804353e8e025d28c785b6b447::/onion3/ysj76foyp7qkl7d5x63hyocmp5ydwcgkb25oalo23kj2vvx7zjvofqad:18141",
-    # 3333334aee7f7bfde22e77af02
-    "8648575c606269b032f43cd0d54728628ddb911e636bd65ea36e867a5ffd3643::/onion3/5d2owx6uoqcsoapprattb4fmektm3rcpfyzmmwmf64dsu55mhcqef2yd:18141",
-    # 888888fe452d7db3e87224cafb
-    "083ff333ad7e0e9f3678b67378ec339074474342a6357de64a76bdf15e4c955b::/onion3/ldgdytcrwzfbmbpz3dmyi6yzqzqbeamitpb2saxzxmp52qywlmsg4vyd:18141",
-    # 555555cf2a79f8da9a6b1fecb3
-    "ea420ae2948739bc35907b8ab5a2d41526ccef22ec92f8f8e2bb398500bf435a::/onion3/uybnlnzve4j4w2lj5bdoe2uurwsbjm73ck2cotlnknhu2l7msn26oeyd:18141",
-    # 444444f30fe3a4bf8e5937773e
-    "f688c69f2397dc0d4ad18168cd6ad13f93241a665acf19ab7f358fd661ac3d1c::/onion3/qejny5yprzidxt4rhstjmhsyfmeq4yb4r6tnn3pqowjr7e7roxcpxsqd:18141",
-    # 0000008034cc6453ffae1d0b80
-    "40717ea5146cf6183c07469d188792b12a57b9da2e5af5bc50df270ff789257f::/onion3/qhmrwr2h3fnszwc4udhlgfpealm7mvw64enqghullrarc633fzmd6zqd:18141",
-    # bbbbbb1746d41d5be9936652fd
-    "faf52a5c6364e6bb7dc3a02743273115c7e218e1ef78f27d540c87b35715a005::/onion3/g5txoagsodgpkm2onsfn6r2fuzdzxlggaewre3edghdfzlw6szeo4cqd:18141",
-    # aaaaaac0add43b4b29a983891c
-    "a0e604c9a504558839a5c38faf034024a38c95fe6b04638b89dbfda756adff54::/onion3/vslf4ro52c4dktz2r5qybpwho3v25ikviwgvxf3ujryn2afock3qowad:18141",
-]
+# Custom specified peer seed nodes (Default: peer_seeds = [])
+#peer_seeds = ["a062ae2345b0db0df9fb1504b99511e23d98f8513f9b5503efcc6dad8eca7e47::/ip4/54.77.66.39/tcp/18189"]
 
 [igor.p2p.seeds]
-# Custom specified peer seed nodes
-peer_seeds = ["bc1e742c3af35e4e6998169b9bf8f102a6c0f54e207842a6a2c659e67d938077::/onion3/mmdxq25om5optfjnhd7yry75px6pdom2nqcmbiqmy6xwozjpil3mhkid:18141"]
+# DNS seeds hosts - DNS TXT records are queried from these hosts and the resulting peers added to the comms peer list.
+# (Default: peer_seeds = [])
+dns_seeds = ["seeds.igor.tari.com"]
+# Custom specified peer seed nodes (Default: peer_seeds = [])
+#peer_seeds = ["a062ae2345b0db0df9fb1504b99511e23d98f8513f9b5503efcc6dad8eca7e47::/ip4/54.77.66.39/tcp/18189"]
+
+[mainnet.p2p.seeds]
+# DNS seeds hosts - DNS TXT records are queried from these hosts and the resulting peers added to the comms peer list.
+# (Default: peer_seeds = [])
+dns_seeds = ["seeds.mainnet.tari.com"]
+# Custom specified peer seed nodes (Default: peer_seeds = [])
+peer_seeds = ["a062ae2345b0db0df9fb1504b99511e23d98f8513f9b5503efcc6dad8eca7e47::/ip4/54.77.66.39/tcp/18189"]

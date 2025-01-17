@@ -31,7 +31,6 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec};
 
 use super::{event::TorControlEvent, parsers, response::ResponseLine, LOG_TARGET};
-use crate::runtime::task;
 
 pub fn spawn_monitor<TSocket>(
     mut cmd_rx: mpsc::Receiver<String>,
@@ -43,7 +42,7 @@ where
 {
     let (responses_tx, responses_rx) = mpsc::channel(100);
 
-    task::spawn(async move {
+    tokio::spawn(async move {
         let framed = Framed::new(socket, LinesCodec::new());
         let (mut sink, mut stream) = framed.split();
         loop {
@@ -54,7 +53,7 @@ where
             match either {
                 // Received a command to send to the control server
                 Either::Left(Some(line)) => {
-                    trace!(target: LOG_TARGET, "Writing command of length '{}'", line.len());
+                    trace!(target: LOG_TARGET, "Tor send: {}", line);
                     if let Err(err) = sink.send(line).await {
                         error!(
                             target: LOG_TARGET,
@@ -65,7 +64,7 @@ where
                 },
                 // Command stream ended
                 Either::Left(None) => {
-                    debug!(
+                    warn!(
                         target: LOG_TARGET,
                         "Tor control server command receiver closed. Monitor is exiting."
                     );
@@ -74,7 +73,7 @@ where
 
                 // Received a line from the control server
                 Either::Right(Some(Ok(line))) => {
-                    trace!(target: LOG_TARGET, "Read line of length '{}'", line.len());
+                    trace!(target: LOG_TARGET, "Tor recv: {}", line);
                     match parsers::response_line(&line) {
                         Ok(mut line) => {
                             if line.is_multiline {
@@ -97,6 +96,7 @@ where
                                     "Failed to send response on internal channel: {:?}", err
                                 );
                             } else {
+                                // sent response
                             }
                         },
                         Err(err) => log_server_response_error(err),
@@ -116,7 +116,7 @@ where
                 // The control server disconnected
                 Either::Right(None) => {
                     cmd_rx.close();
-                    debug!(
+                    warn!(
                         target: LOG_TARGET,
                         "Connection to tor control port closed. Monitor is exiting."
                     );

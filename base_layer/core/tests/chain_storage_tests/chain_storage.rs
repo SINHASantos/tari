@@ -46,7 +46,7 @@ use tari_core::{
         TempDatabase,
     },
     transactions::{
-        tari_amount::{uT, MicroTari, T},
+        tari_amount::{uT, MicroMinotari, T},
         test_helpers::spend_utxos,
         CryptoFactories,
     },
@@ -133,9 +133,9 @@ fn test_store_and_retrieve_block() {
     let hash = blocks[0].hash();
     // Check the metadata
     let metadata = db.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 0);
+    assert_eq!(metadata.best_block_height(), 0);
     assert_eq!(metadata.best_block(), hash);
-    assert_eq!(metadata.horizon_block(metadata.height_of_longest_chain()), 0);
+    assert_eq!(metadata.horizon_block(metadata.best_block_height()), 0);
     // Fetch the block back
     let block0 = db.fetch_block(0, true).unwrap();
     assert_eq!(block0.confirmations(), 1);
@@ -151,7 +151,7 @@ fn test_add_multiple_blocks() {
     let consensus_manager = ConsensusManagerBuilder::new(network).build();
     let store = create_store_with_consensus(consensus_manager.clone());
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 0);
+    assert_eq!(metadata.best_block_height(), 0);
     let block0 = store.fetch_block(0, true).unwrap();
     assert_eq!(metadata.best_block(), block0.hash());
     // Add another block
@@ -160,12 +160,12 @@ fn test_add_multiple_blocks() {
         &block0.try_into_chain_block().unwrap(),
         vec![],
         &consensus_manager,
-        1.into(),
+        Difficulty::min(),
     )
     .unwrap();
     let metadata = store.get_chain_metadata().unwrap();
     let hash = block1.hash();
-    assert_eq!(metadata.height_of_longest_chain(), 1);
+    assert_eq!(metadata.best_block_height(), 1);
     assert_eq!(metadata.best_block(), hash);
     // Adding blocks is idempotent
     assert_eq!(
@@ -174,7 +174,7 @@ fn test_add_multiple_blocks() {
     );
     // Check the metadata
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 1);
+    assert_eq!(metadata.best_block_height(), 1);
     assert_eq!(metadata.best_block(), hash);
 }
 
@@ -185,10 +185,10 @@ fn test_checkpoints() {
 
     let txn = txn_schema!(
         from: vec![outputs[0][0].clone()],
-        to: vec![MicroTari(5_000), MicroTari(6_000)]
+        to: vec![MicroMinotari(5_000), MicroMinotari(6_000)]
     );
     let (txn, _) = spend_utxos(txn);
-    let block1 = append_block(&db, &blocks[0], vec![txn], &consensus_manager, 1.into()).unwrap();
+    let block1 = append_block(&db, &blocks[0], vec![txn], &consensus_manager, Difficulty::min()).unwrap();
     // Get the checkpoint
     let block_a = db.fetch_block(0, false).unwrap();
     assert_eq!(block_a.confirmations(), 2);
@@ -265,7 +265,7 @@ fn test_coverage_chain_storage() {
         &block0.clone().try_into_chain_block().unwrap(),
         vec![],
         &rules,
-        1.into(),
+        Difficulty::min(),
     )
     .unwrap();
     assert_eq!(store.fetch_all_reorgs().unwrap(), vec![]);
@@ -303,21 +303,21 @@ fn test_rewind_past_horizon_height() {
     )
     .unwrap();
 
-    let block1 = append_block(&store, &block0, vec![], &consensus_manager, 1.into()).unwrap();
-    let block2 = append_block(&store, &block1, vec![], &consensus_manager, 1.into()).unwrap();
-    let block3 = append_block(&store, &block2, vec![], &consensus_manager, 1.into()).unwrap();
-    let _block4 = append_block(&store, &block3, vec![], &consensus_manager, 1.into()).unwrap();
+    let block1 = append_block(&store, &block0, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let block2 = append_block(&store, &block1, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let block3 = append_block(&store, &block2, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let _block4 = append_block(&store, &block3, vec![], &consensus_manager, Difficulty::min()).unwrap();
 
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 4);
+    assert_eq!(metadata.best_block_height(), 4);
     // we should not be able to rewind to the future
-    assert!(store.rewind_to_height(metadata.height_of_longest_chain() + 1).is_err());
+    assert!(store.rewind_to_height(metadata.best_block_height() + 1).is_err());
     let horizon_height = metadata.pruned_height();
     assert_eq!(horizon_height, 2);
     // rewinding past pruning horizon should set us to height 0 so we can resync from gen block.
     assert!(store.rewind_to_height(horizon_height - 1).is_ok());
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 0);
+    assert_eq!(metadata.best_block_height(), 0);
 }
 
 #[test]
@@ -366,7 +366,7 @@ fn test_handle_tip_reorg_with_zero_conf() {
         &consensus_manager
     )
     .is_ok());
-    assert_eq!(store.get_chain_metadata().unwrap().height_of_longest_chain(), 3);
+    assert_eq!(store.get_chain_metadata().unwrap().best_block_height(), 3);
 
     // Create Forked Chain
 
@@ -406,7 +406,7 @@ fn test_handle_tip_reorg_with_zero_conf() {
     // Check that B2 was removed from the block orphans and A2 has been orphaned.
     assert!(store.fetch_orphan(*orphan_blocks[2].hash()).is_err());
     assert!(store.fetch_orphan(*blocks[2].hash()).is_ok());
-    assert_eq!(store.get_chain_metadata().unwrap().height_of_longest_chain(), 2);
+    assert_eq!(store.get_chain_metadata().unwrap().best_block_height(), 2);
 
     // Block B3
     let txs = vec![
@@ -470,7 +470,7 @@ fn test_handle_tip_reorg_with_zero_conf() {
     } else {
         panic!();
     }
-    assert_eq!(store.get_chain_metadata().unwrap().height_of_longest_chain(), 5);
+    assert_eq!(store.get_chain_metadata().unwrap().best_block_height(), 5);
 }
 #[test]
 #[allow(clippy::too_many_lines)]
@@ -1223,7 +1223,7 @@ fn test_handle_reorg_failure_recovery() {
         let mut block = orphan1_store.prepare_new_block(template).unwrap();
         block.header.nonce = OsRng.next_u64();
         block.header.height += 1;
-        find_header_with_achieved_difficulty(&mut block.header, Difficulty::from(2));
+        find_header_with_achieved_difficulty(&mut block.header, Difficulty::from_u64(2).unwrap());
         block
     };
 
@@ -1268,10 +1268,10 @@ fn test_store_and_retrieve_blocks() {
         &block0.clone().try_into_chain_block().unwrap(),
         vec![],
         &rules,
-        1.into(),
+        Difficulty::min(),
     )
     .unwrap();
-    let block2 = append_block(&store, &block1, vec![], &rules, 1.into()).unwrap();
+    let block2 = append_block(&store, &block1, vec![], &rules, Difficulty::min()).unwrap();
     assert_eq!(
         store.fetch_block(0, true).unwrap().try_into_chain_block().unwrap(),
         block0.clone().try_into_chain_block().unwrap()
@@ -1285,7 +1285,7 @@ fn test_store_and_retrieve_blocks() {
         block2
     );
 
-    let block3 = append_block(&store, &block2, vec![], &rules, 1.into()).unwrap();
+    let block3 = append_block(&store, &block2, vec![], &rules, Difficulty::min()).unwrap();
     assert_eq!(
         store.fetch_block(0, true).unwrap().try_into_chain_block().unwrap(),
         block0.try_into_chain_block().unwrap()
@@ -1370,11 +1370,11 @@ fn test_restore_metadata_and_pruning_horizon_update() {
         )
         .unwrap();
 
-        let block1 = append_block(&db, &block0, vec![], &rules, 1.into()).unwrap();
+        let block1 = append_block(&db, &block0, vec![], &rules, Difficulty::min()).unwrap();
         db.add_block(block1.to_arc_block()).unwrap();
         block_hash = *block1.hash();
         let metadata = db.get_chain_metadata().unwrap();
-        assert_eq!(metadata.height_of_longest_chain(), 1);
+        assert_eq!(metadata.best_block_height(), 1);
         assert_eq!(metadata.best_block(), &block_hash);
         assert_eq!(metadata.pruning_horizon(), 1000);
     }
@@ -1394,7 +1394,7 @@ fn test_restore_metadata_and_pruning_horizon_update() {
         .unwrap();
 
         let metadata = db.get_chain_metadata().unwrap();
-        assert_eq!(metadata.height_of_longest_chain(), 1);
+        assert_eq!(metadata.best_block_height(), 1);
         assert_eq!(metadata.best_block(), &block_hash);
         assert_eq!(metadata.pruning_horizon(), 2000);
     }
@@ -1412,7 +1412,7 @@ fn test_restore_metadata_and_pruning_horizon_update() {
         .unwrap();
 
         let metadata = db.get_chain_metadata().unwrap();
-        assert_eq!(metadata.height_of_longest_chain(), 1);
+        assert_eq!(metadata.best_block_height(), 1);
         assert_eq!(metadata.best_block(), &block_hash);
         assert_eq!(metadata.pruning_horizon(), 900);
     }
@@ -1425,7 +1425,7 @@ fn test_invalid_block() {
     let consensus_constants = ConsensusConstantsBuilder::new(network)
         .with_emission_amounts(100_000_000.into(), &EMISSION, 100.into())
         .build();
-    let (block0, output) = create_genesis_block(&factories, &consensus_constants);
+    let (block0, output) = create_genesis_block( &consensus_constants);
     let consensus_manager = ConsensusManagerBuilder::new(network)
         .add_consensus_constants(consensus_constants)
         .with_block(block0.clone())
@@ -1439,7 +1439,7 @@ fn test_invalid_block() {
     let mut outputs = vec![vec![output]];
     let block0_hash = *blocks[0].hash();
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 0);
+    assert_eq!(metadata.best_block_height(), 0);
     assert_eq!(metadata.best_block(), &block0_hash);
     assert_eq!(store.fetch_block(0, true).unwrap().block().hash(), block0_hash);
     assert!(store.fetch_block(1, true).is_err());
@@ -1464,7 +1464,7 @@ fn test_invalid_block() {
     );
     let block1_hash = *blocks[1].hash();
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 1);
+    assert_eq!(metadata.best_block_height(), 1);
     assert_eq!(metadata.best_block(), &block1_hash);
     assert_eq!(store.fetch_block(0, true).unwrap().hash(), &block0_hash);
     assert_eq!(store.fetch_block(1, true).unwrap().hash(), &block1_hash);
@@ -1487,7 +1487,7 @@ fn test_invalid_block() {
         .unwrap_err()
     );
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 1);
+    assert_eq!(metadata.best_block_height(), 1);
     assert_eq!(metadata.best_block(), &block1_hash);
     assert_eq!(store.fetch_block(0, true).unwrap().hash(), &block0_hash);
     assert_eq!(store.fetch_block(1, true).unwrap().hash(), &block1_hash);
@@ -1511,7 +1511,7 @@ fn test_invalid_block() {
     );
     let block2_hash = blocks[2].hash();
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 2);
+    assert_eq!(metadata.best_block_height(), 2);
     assert_eq!(metadata.best_block(), block2_hash);
     assert_eq!(store.fetch_block(0, true).unwrap().hash(), &block0_hash);
     assert_eq!(store.fetch_block(1, true).unwrap().hash(), &block1_hash);
@@ -1627,10 +1627,10 @@ fn test_horizon_height_orphan_cleanup() {
     assert_eq!(store.add_block(orphan3.into()).unwrap(), BlockAddResult::OrphanBlock);
     assert_eq!(store.db_read_access().unwrap().orphan_count().unwrap(), 3);
 
-    let block1 = append_block(&store, &block0, vec![], &consensus_manager, 1.into()).unwrap();
-    let block2 = append_block(&store, &block1, vec![], &consensus_manager, 1.into()).unwrap();
-    let block3 = append_block(&store, &block2, vec![], &consensus_manager, 1.into()).unwrap();
-    let _block4 = append_block(&store, &block3, vec![], &consensus_manager, 1.into()).unwrap();
+    let block1 = append_block(&store, &block0, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let block2 = append_block(&store, &block1, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let block3 = append_block(&store, &block2, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let _block4 = append_block(&store, &block3, vec![], &consensus_manager, Difficulty::min()).unwrap();
 
     // Adding another orphan block will trigger the orphan cleanup as the storage limit was reached
     assert_eq!(
@@ -1652,7 +1652,7 @@ fn test_orphan_cleanup_on_reorg() {
     let network = Network::LocalNet;
     let factories = CryptoFactories::default();
     let consensus_constants = ConsensusConstantsBuilder::new(network).build();
-    let (block0, output) = create_genesis_block(&factories, &consensus_constants);
+    let (block0, output) = create_genesis_block( &consensus_constants);
     let consensus_manager = ConsensusManagerBuilder::new(network)
         .add_consensus_constants(consensus_constants)
         .with_block(block0.clone())
@@ -1920,7 +1920,7 @@ fn test_fails_validation() {
     let mut blocks = vec![block0];
     let mut outputs = vec![vec![]];
 
-    let schemas = vec![txn_schema!(from: vec![output], to: vec![2 * T, 500_000 * uT])];
+    let schemas = vec![txn_schema!(from: vec![output.clone()], to: vec![2 * T, 500_000 * uT])];
     let err = generate_new_block_with_achieved_difficulty(
         &mut store,
         &mut blocks,
@@ -1934,7 +1934,7 @@ fn test_fails_validation() {
     unpack_enum!(ValidationError::CustomError(_s) = source);
 
     let metadata = store.get_chain_metadata().unwrap();
-    assert_eq!(metadata.height_of_longest_chain(), 0);
+    assert_eq!(metadata.best_block_height(), 0);
 }
 
 #[test]
@@ -1962,19 +1962,19 @@ fn pruned_mode_cleanup_and_fetch_block() {
         DifficultyCalculator::new(consensus_manager.clone(), Default::default()),
     )
     .unwrap();
-    let block1 = append_block(&store, &block0, vec![], &consensus_manager, 1.into()).unwrap();
-    let block2 = append_block(&store, &block1, vec![], &consensus_manager, 1.into()).unwrap();
-    let block3 = append_block(&store, &block2, vec![], &consensus_manager, 1.into()).unwrap();
+    let block1 = append_block(&store, &block0, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let block2 = append_block(&store, &block1, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let block3 = append_block(&store, &block2, vec![], &consensus_manager, Difficulty::min()).unwrap();
 
     let metadata = store.get_chain_metadata().unwrap();
     assert_eq!(metadata.pruned_height(), 0);
 
-    let block4 = append_block(&store, &block3, vec![], &consensus_manager, 1.into()).unwrap();
-    let _block5 = append_block(&store, &block4, vec![], &consensus_manager, 1.into()).unwrap();
+    let block4 = append_block(&store, &block3, vec![], &consensus_manager, Difficulty::min()).unwrap();
+    let _block5 = append_block(&store, &block4, vec![], &consensus_manager, Difficulty::min()).unwrap();
 
     let metadata = store.get_chain_metadata().unwrap();
     assert_eq!(metadata.pruned_height(), 2);
-    assert_eq!(metadata.height_of_longest_chain(), 5);
+    assert_eq!(metadata.best_block_height(), 5);
     assert_eq!(metadata.pruning_horizon(), 3);
 }
 
@@ -2025,7 +2025,7 @@ mod malleability {
                     output.script.clone(),
                     output.sender_offset_public_key.clone(),
                     output.covenant.clone(),
-                    output.encrypted_value.clone(),
+                    output.encrypted_data,
                     output.minimum_value_promise,
                 );
             });
@@ -2084,10 +2084,10 @@ mod malleability {
 
         #[test]
         fn test_proof() {
-            check_witness_malleability(|block: &mut Block| {
+            check_output_malleability(|block: &mut Block| {
                 let output = &mut block.body.outputs_mut()[0];
-                let mod_proof = RangeProof::from_hex(&(output.proof.to_hex() + "00")).unwrap();
-                output.proof = mod_proof;
+                let mod_proof = RangeProof::from_hex(&(output.proof.as_ref().unwrap().to_hex() + "00")).unwrap();
+                output.proof = Some(mod_proof);
             });
         }
 
@@ -2117,7 +2117,7 @@ mod malleability {
 
         #[test]
         fn test_metadata_signature() {
-            check_witness_malleability(|block: &mut Block| {
+            check_output_malleability(|block: &mut Block| {
                 let output = &mut block.body.outputs_mut()[0];
                 output.metadata_signature = ComAndPubSignature::default();
             });
@@ -2127,7 +2127,7 @@ mod malleability {
         fn test_covenant() {
             check_output_malleability(|block: &mut Block| {
                 let output = &mut block.body.outputs_mut()[0];
-                let mod_covenant = covenant!(absolute_height(@uint(42)));
+                let mod_covenant = covenant!(absolute_height(@uint(42))).unwrap();
                 output.covenant = mod_covenant;
             });
         }
@@ -2135,7 +2135,7 @@ mod malleability {
 
     mod kernel {
         use tari_common_types::types::Signature;
-        use tari_core::transactions::tari_amount::MicroTari;
+        use tari_core::transactions::tari_amount::MicroMinotari;
 
         use super::*;
 
@@ -2146,7 +2146,7 @@ mod malleability {
         fn test_fee() {
             check_kernel_malleability(|block: &mut Block| {
                 let kernel = &mut block.body.kernels_mut()[0];
-                kernel.fee += MicroTari::from(1);
+                kernel.fee += MicroMinotari::from(1);
             });
         }
 

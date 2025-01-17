@@ -58,6 +58,22 @@ impl BlockAddResult {
         matches!(self, BlockAddResult::OrphanBlock)
     }
 
+    pub fn added_blocks(&self) -> Vec<Arc<ChainBlock>> {
+        match self {
+            Self::ChainReorg { added, removed: _ } => added.clone(),
+            Self::Ok(added) => vec![added.clone()],
+            _ => vec![],
+        }
+    }
+
+    pub fn removed_blocks(&self) -> Vec<Arc<ChainBlock>> {
+        match self {
+            Self::ChainReorg { added: _, removed } => removed.clone(),
+            _ => vec![],
+        }
+    }
+
+    #[cfg(test)]
     pub fn assert_added(&self) -> ChainBlock {
         match self {
             BlockAddResult::ChainReorg { added, removed } => panic!(
@@ -71,10 +87,12 @@ impl BlockAddResult {
         }
     }
 
+    #[cfg(test)]
     pub fn assert_orphaned(&self) {
         assert!(self.is_orphaned(), "Result was not orphaned");
     }
 
+    #[cfg(test)]
     pub fn assert_reorg(&self, num_added: usize, num_removed: usize) {
         match self {
             BlockAddResult::ChainReorg { added, removed } => {
@@ -90,28 +108,13 @@ impl BlockAddResult {
             BlockAddResult::OrphanBlock => panic!("Expected reorg result, but was OrphanBlock"),
         }
     }
-
-    pub fn added_blocks(&self) -> Vec<Arc<ChainBlock>> {
-        match self {
-            Self::ChainReorg { added, removed: _ } => added.clone(),
-            Self::Ok(added) => vec![added.clone()],
-            _ => vec![],
-        }
-    }
-
-    pub fn removed_blocks(&self) -> Vec<Arc<ChainBlock>> {
-        match self {
-            Self::ChainReorg { added: _, removed } => removed.clone(),
-            _ => vec![],
-        }
-    }
 }
 
 impl fmt::Display for BlockAddResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BlockAddResult::Ok(block) => {
-                write!(f, "Block {} at height {} added", block.hash().to_hex(), block.height())
+                write!(f, "Block {} at height {} added", block.hash(), block.height())
             },
             BlockAddResult::BlockExists => write!(f, "Block already exists"),
             BlockAddResult::OrphanBlock => write!(f, "Block added as orphan"),

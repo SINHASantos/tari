@@ -87,11 +87,11 @@ impl GreetingService {
     }
 
     pub fn call_count(&self) -> usize {
-        self.call_count.load(Ordering::Acquire)
+        self.call_count.load(Ordering::SeqCst)
     }
 
     fn inc_call_count(&self) {
-        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.call_count.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -406,6 +406,7 @@ impl GreetingClient {
             Default::default(),
             framed,
             Self::PROTOCOL_NAME.into(),
+            Default::default(),
         )
         .await?;
         Ok(Self { inner })

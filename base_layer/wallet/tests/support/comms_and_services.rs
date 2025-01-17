@@ -24,7 +24,7 @@ use std::{sync::Arc, time::Duration};
 
 use tari_comms::{
     message::MessageTag,
-    multiaddr::Multiaddr,
+    net_address::MultiaddressesWithStats,
     peer_manager::{NodeId, NodeIdentity, Peer, PeerFeatures, PeerFlags},
     transports::MemoryTransport,
     types::CommsPublicKey,
@@ -37,11 +37,6 @@ use tari_p2p::{
     initialization::initialize_local_test_comms,
 };
 use tari_shutdown::ShutdownSignal;
-
-pub fn get_next_memory_address() -> Multiaddr {
-    let port = MemoryTransport::acquire_next_memsocket_port();
-    format!("/memory/{}", port).parse().unwrap()
-}
 
 pub async fn setup_comms_services(
     node_identity: Arc<NodeIdentity>,
@@ -63,14 +58,23 @@ pub async fn setup_comms_services(
     .await
     .unwrap();
 
+    let mut comms = comms.spawn_with_transport(MemoryTransport).await.unwrap();
+    let address = comms
+        .connection_manager_requester()
+        .wait_until_listening()
+        .await
+        .unwrap();
+    // Set the public address for tests
+    comms.node_identity().add_public_address(address.bind_address().clone());
+
     (comms, dht)
 }
 
-pub fn create_dummy_message<T>(inner: T, public_key: &CommsPublicKey) -> DomainMessage<T> {
+pub fn create_dummy_message<T>(inner: T, public_key: &CommsPublicKey) -> DomainMessage<Result<T, prost::DecodeError>> {
     let peer_source = Peer::new(
         public_key.clone(),
         NodeId::from_key(public_key),
-        Vec::<Multiaddr>::new().into(),
+        MultiaddressesWithStats::empty(),
         PeerFlags::empty(),
         PeerFeatures::COMMUNICATION_NODE,
         Default::default(),
@@ -89,6 +93,6 @@ pub fn create_dummy_message<T>(inner: T, public_key: &CommsPublicKey) -> DomainM
         },
         authenticated_origin: None,
         source_peer: peer_source,
-        inner,
+        inner: Ok(inner),
     }
 }

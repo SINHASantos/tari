@@ -19,7 +19,6 @@
 //  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#![allow(dead_code)]
 
 use std::{
     fs,
@@ -37,21 +36,31 @@ use lmdb_zero::open;
 use log::*;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use tari_common::{
-    configuration::Network,
+    configuration::{DnsNameServerList, Network},
     exit_codes::{ExitCode, ExitError},
+    DnsNameServer,
 };
 use tari_comms::{
     backoff::ConstantBackoff,
+    multiaddr::multiaddr,
     peer_manager::{NodeIdentity, Peer, PeerFeatures, PeerFlags, PeerManagerError},
     pipeline,
     protocol::{
         messaging::{MessagingEventSender, MessagingProtocolExtension},
         rpc::RpcServer,
         NodeNetworkInfo,
+        ProtocolId,
     },
     tor,
-    tor::HiddenServiceControllerError,
-    transports::{predicate::FalsePredicate, MemoryTransport, SocksConfig, SocksTransport, TcpWithTorTransport},
+    tor::{HiddenServiceControllerError, TorIdentity},
+    transports::{
+        predicate::FalsePredicate,
+        HiddenServiceTransport,
+        MemoryTransport,
+        SocksConfig,
+        SocksTransport,
+        TcpWithTorTransport,
+    },
     utils::cidr::parse_cidrs,
     CommsBuilder,
     CommsBuilderError,
@@ -73,13 +82,18 @@ use tower::ServiceBuilder;
 use crate::{
     comms_connector::{InboundDomainConnector, PubsubDomainConnector},
     config::{P2pConfig, PeerSeedsConfig},
+    dns::DnsClientError,
     peer_seeds::{DnsSeedResolver, SeedPeer},
     transport::{TorTransportConfig, TransportType},
     TransportConfig,
     MAJOR_NETWORK_VERSION,
     MINOR_NETWORK_VERSION,
 };
+
 const LOG_TARGET: &str = "p2p::initialization";
+
+/// ProtocolId for minotari messaging protocol
+pub static MESSAGING_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"t/msg/0.1");
 
 #[derive(Debug, Error)]
 pub enum CommsInitializationError {
@@ -131,7 +145,7 @@ pub async fn initialize_local_test_comms<P: AsRef<Path>>(
     discovery_request_timeout: Duration,
     seed_peers: Vec<Peer>,
     shutdown_signal: ShutdownSignal,
-) -> Result<(CommsNode, Dht, MessagingEventSender), CommsInitializationError> {
+) -> Result<(UnspawnedCommsNode, Dht, MessagingEventSender), CommsInitializationError> {
     let peer_database_name = {
         let mut rng = thread_rng();
         iter::repeat(())
@@ -155,7 +169,7 @@ pub async fn initialize_local_test_comms<P: AsRef<Path>>(
 
     let comms = CommsBuilder::new()
         .allow_test_addresses()
-        .with_listener_address(node_identity.public_address())
+        .with_listener_address(node_identity.first_public_address().unwrap())
         .with_listener_liveness_max_sessions(1)
         .with_node_identity(node_identity)
         .with_user_agent(&"/test/1.0")
@@ -197,21 +211,18 @@ pub async fn initialize_local_test_comms<P: AsRef<Path>>(
         )
         .build();
 
-    let comms = comms
-        .add_protocol_extension(MessagingProtocolExtension::new(event_sender.clone(), pipeline))
-        .spawn_with_transport(MemoryTransport)
-        .await?;
-
-    comms
-        .node_identity()
-        .set_public_address(comms.listening_address().clone());
+    let comms = comms.add_protocol_extension(
+        MessagingProtocolExtension::new(MESSAGING_PROTOCOL_ID.clone(), event_sender.clone(), pipeline)
+            .enable_message_received_event(),
+    );
 
     Ok((comms, dht, event_sender))
 }
 
-pub async fn spawn_comms_using_transport(
+pub async fn spawn_comms_using_transport<F: Fn(TorIdentity) + Send + Sync + Unpin + Clone + 'static>(
     comms: UnspawnedCommsNode,
     transport_config: TransportConfig,
+    after_comms: F,
 ) -> Result<CommsNode, CommsInitializationError> {
     let comms = match transport_config.transport_type {
         TransportType::Memory => {
@@ -248,13 +259,17 @@ pub async fn spawn_comms_using_transport(
         TransportType::Tor => {
             let tor_config = transport_config.tor;
             debug!(target: LOG_TARGET, "Building TOR comms stack ({:?})", tor_config);
-            let mut hidden_service_ctl = initialize_hidden_service(tor_config).await?;
+            let listener_address_override = tor_config.listener_address_override.clone();
+            let hidden_service_ctl = initialize_hidden_service(tor_config)?;
             // Set the listener address to be the address (usually local) to which tor will forward all traffic
-            let transport = hidden_service_ctl.initialize_transport().await?;
-            debug!(target: LOG_TARGET, "Comms and DHT configured");
+            let instant = Instant::now();
+            let transport = HiddenServiceTransport::new(hidden_service_ctl, after_comms);
+            debug!(target: LOG_TARGET, "TOR transport initialized in {:.0?}", instant.elapsed());
+
             comms
-                .with_listener_address(hidden_service_ctl.proxied_address())
-                .with_hidden_service_controller(hidden_service_ctl)
+                .with_listener_address(
+                    listener_address_override.unwrap_or_else(|| multiaddr![Ip4([127, 0, 0, 1]), Tcp(0u16)]),
+                )
                 .spawn_with_transport(transport)
                 .await?
         },
@@ -271,7 +286,7 @@ pub async fn spawn_comms_using_transport(
     Ok(comms)
 }
 
-async fn initialize_hidden_service(
+fn initialize_hidden_service(
     mut config: TorTransportConfig,
 ) -> Result<tor::HiddenServiceController, CommsInitializationError> {
     let mut builder = tor::HiddenServiceBuilder::new()
@@ -290,7 +305,7 @@ async fn initialize_hidden_service(
         builder = builder.with_tor_identity(identity);
     }
 
-    let hidden_svc_ctl = builder.build().await?;
+    let hidden_svc_ctl = builder.build()?;
     Ok(hidden_svc_ctl)
 }
 
@@ -319,7 +334,8 @@ async fn configure_comms_and_dht(
         .with_listener_liveness_max_sessions(config.listener_liveness_max_sessions)
         .with_listener_liveness_allowlist_cidrs(listener_liveness_allowlist_cidrs)
         .with_dial_backoff(ConstantBackoff::new(Duration::from_millis(500)))
-        .with_peer_storage(peer_database, Some(file_lock));
+        .with_peer_storage(peer_database, Some(file_lock))
+        .with_excluded_dial_addresses(config.dht.excluded_dial_addresses.clone().into_vec().clone());
 
     let mut comms = match config.auxiliary_tcp_listener_address {
         Some(ref addr) => builder.with_auxiliary_tcp_listener_address(addr.clone()).build()?,
@@ -360,12 +376,15 @@ async fn configure_comms_and_dht(
         )
         .build();
 
-    // TODO: messaging events should be optional
     let (messaging_events_sender, _) = broadcast::channel(1);
-    comms = comms.add_protocol_extension(MessagingProtocolExtension::new(
-        messaging_events_sender,
-        messaging_pipeline,
-    ));
+    comms = comms.add_protocol_extension(
+        MessagingProtocolExtension::new(
+            MESSAGING_PROTOCOL_ID.clone(),
+            messaging_events_sender,
+            messaging_pipeline,
+        )
+        .with_ban_duration(config.dht.ban_duration_short),
+    );
 
     Ok((comms, dht))
 }
@@ -404,7 +423,7 @@ fn acquire_exclusive_file_lock(db_path: &Path) -> Result<File, CommsInitializati
 ///
 /// ## Returns
 /// A Result to determine if the call was successful or not, string will indicate the reason on error
-async fn add_seed_peers(
+pub async fn add_seed_peers(
     peer_manager: &PeerManager,
     node_identity: &NodeIdentity,
     peers: Vec<Peer>,
@@ -430,6 +449,7 @@ async fn add_seed_peers(
 
 pub struct P2pInitializer {
     config: P2pConfig,
+    user_agent: String,
     seed_config: PeerSeedsConfig,
     network: Network,
     node_identity: Arc<NodeIdentity>,
@@ -439,6 +459,7 @@ pub struct P2pInitializer {
 impl P2pInitializer {
     pub fn new(
         config: P2pConfig,
+        user_agent: String,
         seed_config: PeerSeedsConfig,
         network: Network,
         node_identity: Arc<NodeIdentity>,
@@ -446,6 +467,7 @@ impl P2pInitializer {
     ) -> Self {
         Self {
             config,
+            user_agent,
             seed_config,
             network,
             node_identity,
@@ -471,8 +493,9 @@ impl P2pInitializer {
 
         debug!(
             target: LOG_TARGET,
-            "Resolving DNS seeds (NS:{}, addresses: {})...",
-            config.dns_seeds_name_server,
+            "Resolving DNS seeds (DNSSEC is enabled: {}, name servers: {}, addresses: {}) ...",
+            config.dns_seeds_use_dnssec,
+            config.dns_seed_name_servers,
             config
                 .dns_seeds
                 .iter()
@@ -482,19 +505,8 @@ impl P2pInitializer {
         );
         let start = Instant::now();
 
-        let resolver = if config.dns_seeds_use_dnssec {
-            debug!(
-                target: LOG_TARGET,
-                "Using {} to resolve DNS seeds. DNSSEC is enabled", config.dns_seeds_name_server
-            );
-            DnsSeedResolver::connect_secure(config.dns_seeds_name_server.clone()).await?
-        } else {
-            debug!(
-                target: LOG_TARGET,
-                "Using {} to resolve DNS seeds. DNSSEC is disabled", config.dns_seeds_name_server
-            );
-            DnsSeedResolver::connect(config.dns_seeds_name_server.clone()).await?
-        };
+        let resolver =
+            P2pInitializer::get_dns_seed_resolver(config.dns_seeds_use_dnssec, &config.dns_seed_name_servers).await?;
         let resolving = config.dns_seeds.iter().map(|addr| {
             let mut resolver = resolver.clone();
             async move { (resolver.resolve(addr).await, addr) }
@@ -526,6 +538,44 @@ impl P2pInitializer {
 
         Ok(peers)
     }
+
+    async fn get_dns_seed_resolver(
+        dns_seeds_use_dnssec: bool,
+        dns_seed_name_servers: &DnsNameServerList,
+    ) -> Result<DnsSeedResolver, ServiceInitializationError> {
+        if dns_seed_name_servers.is_empty() {
+            return Err(ServiceInitializationError::from(DnsClientError::Connection(
+                "No DNS name servers configured!".to_string(),
+            )));
+        }
+        let mut dns_errors = Vec::new();
+        for dns in dns_seed_name_servers {
+            let res = match (dns_seeds_use_dnssec, dns == &DnsNameServer::System) {
+                (true, false) => DnsSeedResolver::connect_secure(dns.clone()).await,
+                (_, _) => DnsSeedResolver::connect(dns.clone()).await,
+            };
+            match res {
+                Ok(val) => {
+                    trace!(target: LOG_TARGET, "Found DNS client at '{}'", dns);
+                    return Ok(val);
+                },
+                Err(err) => {
+                    warn!(
+                        target: LOG_TARGET,
+                        "DNS entry '{}' did not respond, trying the next one. You can edit 'dns_seed_name_servers' in \
+                        the config file. (Error: {})",
+                        dns,
+                        err.to_string(),
+                    );
+                    dns_errors.push(err.to_string())
+                },
+            }
+        }
+        Err(ServiceInitializationError::from(DnsClientError::Connection(format!(
+            "{:?}",
+            dns_errors
+        ))))
+    }
 }
 
 #[async_trait]
@@ -541,16 +591,21 @@ impl ServiceInitializer for P2pInitializer {
             .with_node_info(NodeNetworkInfo {
                 major_version: MAJOR_NETWORK_VERSION,
                 minor_version: MINOR_NETWORK_VERSION,
-                network_byte: self.network.as_byte(),
-                user_agent: config.user_agent.clone(),
+                network_wire_byte: self.network.as_wire_byte(),
+                user_agent: self.user_agent.clone(),
             })
-            .set_liveness_check(config.listener_liveness_check_interval);
+            .with_minimize_connections(if self.config.dht.minimize_connections {
+                Some(self.config.dht.num_neighbouring_nodes + self.config.dht.num_random_nodes)
+            } else {
+                None
+            })
+            .set_self_liveness_check(config.listener_self_liveness_check_interval);
 
-        if config.allow_test_addresses || config.dht.allow_test_addresses {
+        if config.allow_test_addresses || config.dht.peer_validator_config.allow_test_addresses {
             // The default is false, so ensure that both settings are true in this case
             config.allow_test_addresses = true;
-            config.dht.allow_test_addresses = true;
             builder = builder.allow_test_addresses();
+            config.dht.peer_validator_config = builder.peer_validator_config().clone();
         }
 
         let (comms, dht) = configure_comms_and_dht(builder, &config, connector).await?;
@@ -567,7 +622,6 @@ impl ServiceInitializer for P2pInitializer {
         };
         add_seed_peers(&peer_manager, &node_identity, peers).await?;
 
-        // TODO: Use serde
         let peers = Self::try_parse_seed_peers(&self.seed_config.peer_seeds)?;
 
         add_seed_peers(&peer_manager, &node_identity, peers).await?;
@@ -578,5 +632,16 @@ impl ServiceInitializer for P2pInitializer {
         context.register_handle(dht);
         debug!(target: LOG_TARGET, "P2P Initialized");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use tari_common::configuration::Network;
+    use tari_comms::connection_manager::WireMode;
+    #[test]
+    fn self_liveness_network_wire_byte_is_consistent() {
+        let wire_mode = WireMode::Liveness;
+        assert_eq!(wire_mode.as_byte(), Network::RESERVED_WIRE_BYTE);
     }
 }

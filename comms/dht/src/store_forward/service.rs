@@ -20,13 +20,13 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{convert::TryFrom, sync::Arc, time::Duration};
+use std::{convert::TryInto, sync::Arc, time::Duration};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use log::*;
 use tari_comms::{
     connectivity::{ConnectivityEvent, ConnectivityEventRx, ConnectivityRequester},
-    peer_manager::{NodeId, PeerFeatures},
+    peer_manager::{NodeDistance, NodeId, PeerFeatures},
     types::CommsPublicKey,
     PeerManager,
 };
@@ -67,6 +67,7 @@ pub struct FetchStoredMessageQuery {
     node_id: Box<NodeId>,
     since: Option<DateTime<Utc>>,
     response_type: SafResponseType,
+    limit: Option<u32>,
 }
 
 impl FetchStoredMessageQuery {
@@ -77,7 +78,14 @@ impl FetchStoredMessageQuery {
             node_id,
             since: None,
             response_type: SafResponseType::Anonymous,
+            limit: None,
         }
+    }
+
+    /// Limit the number of messages returned
+    pub fn with_limit(&mut self, limit: u32) -> &mut Self {
+        self.limit = Some(limit);
+        self
     }
 
     /// Modify query to only include messages since the given date.
@@ -195,6 +203,7 @@ pub struct StoreAndForwardService {
     database: StoreAndForwardDatabase,
     peer_manager: Arc<PeerManager>,
     connection_events: ConnectivityEventRx,
+    connectivity: ConnectivityRequester,
     outbound_requester: OutboundMessageRequester,
     request_rx: mpsc::Receiver<StoreAndForwardRequest>,
     shutdown_signal: ShutdownSignal,
@@ -203,6 +212,8 @@ pub struct StoreAndForwardService {
     saf_response_signal_rx: mpsc::Receiver<()>,
     event_publisher: DhtEventSender,
     local_state: SafLocalState,
+    ignore_saf_threshold: Option<usize>,
+    node_id: NodeId,
 }
 
 impl StoreAndForwardService {
@@ -226,6 +237,7 @@ impl StoreAndForwardService {
             dht_requester,
             request_rx,
             connection_events: connectivity.get_event_subscription(),
+            connectivity: connectivity.clone(),
             outbound_requester,
             shutdown_signal,
             num_received_saf_responses: Some(0),
@@ -233,6 +245,8 @@ impl StoreAndForwardService {
             saf_response_signal_rx,
             event_publisher,
             local_state: Default::default(),
+            ignore_saf_threshold: None,
+            node_id: Default::default(),
         }
     }
 
@@ -242,6 +256,28 @@ impl StoreAndForwardService {
     }
 
     async fn run(mut self) {
+        self.ignore_saf_threshold = self
+            .connectivity
+            .get_minimize_connections_threshold()
+            .await
+            .unwrap_or_else(|err| {
+                warn!(target: LOG_TARGET, "Failed to get the minimize connections threshold: {:?}", err);
+                None
+            });
+        // If the comms node is configured to minimize connections, delay the SAF connectivity to prioritize other
+        // higher priority connections
+        if self.ignore_saf_threshold.is_some() {
+            let delay = Duration::from_secs(60);
+            tokio::time::sleep(delay).await;
+            debug!(target: LOG_TARGET, "SAF connectivity starting after delayed for {:.0?}", delay);
+        }
+        self.node_id = self.connectivity.get_node_identity().await.map_or_else(
+            |err| {
+                warn!(target: LOG_TARGET, "Failed to get the node identity: {:?}", err);
+                NodeId::default()
+            },
+            |node_identity| node_identity.node_id().clone(),
+        );
         let mut cleanup_ticker = time::interval(CLEANUP_INTERVAL);
         cleanup_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -362,9 +398,50 @@ impl StoreAndForwardService {
                     return Ok(());
                 }
 
-                // Whenever we connect to a peer, request SAF messages
-                let features = self.peer_manager.get_peer_features(conn.peer_node_id()).await?;
-                if features.contains(PeerFeatures::DHT_STORE_FORWARD) {
+                // Whenever we connect to a peer, request SAF messages based on the peer's features
+                // and the current connectivity state
+                let request_saf = {
+                    let features = self.peer_manager.get_peer_features(conn.peer_node_id()).await?;
+                    if !features.contains(PeerFeatures::DHT_STORE_FORWARD) {
+                        false
+                    } else if let Some(threshold) = self.ignore_saf_threshold {
+                        let active_connections = self.connectivity.get_active_connections().await?;
+                        let mut active_connections_with_distance = active_connections
+                            .into_iter()
+                            .map(|c| {
+                                let distance = self.node_id.distance(&c.peer_node_id().clone());
+                                (c, distance)
+                            })
+                            .collect::<Vec<_>>();
+                        active_connections_with_distance.sort_by(|a, b| a.1.cmp(&b.1));
+                        let saf_ignore_distance = active_connections_with_distance
+                            .get(threshold - 1)
+                            .map(|(_, distance)| distance)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                active_connections_with_distance
+                                    .last()
+                                    .map(|(_, distance)| distance)
+                                    .cloned()
+                                    .unwrap_or(NodeDistance::max_distance())
+                            });
+
+                        let decision = self.node_id.distance(&conn.peer_node_id().clone()) <= saf_ignore_distance;
+                        trace!(
+                            target: LOG_TARGET,
+                            "Ignore SAF decision for peer: '{}', this node id: '{}', is closer: {}, will request SAF: {}, closer peers threshold: {}",
+                            conn.peer_node_id().short_str(),
+                            self.node_id.short_str(),
+                            decision,
+                            decision,
+                            threshold
+                        );
+                        decision
+                    } else {
+                        true
+                    }
+                };
+                if request_saf {
                     info!(
                         target: LOG_TARGET,
                         "Connected peer '{}' is a SAF node. Requesting stored messages.",
@@ -388,7 +465,7 @@ impl StoreAndForwardService {
 
     async fn request_stored_messages_from_peer(&mut self, node_id: &NodeId) -> SafResult<()> {
         let request = self.get_saf_request().await?;
-        info!(
+        trace!(
             target: LOG_TARGET,
             "Sending store and forward request to peer '{}' (Since = {:?})", node_id, request.since
         );
@@ -401,8 +478,7 @@ impl StoreAndForwardService {
                     .finish(),
                 request,
             )
-            .await
-            .map_err(StoreAndForwardError::RequestMessagesFailed)?;
+            .await?;
 
         Ok(())
     }
@@ -428,19 +504,20 @@ impl StoreAndForwardService {
                     .finish(),
                 request,
             )
-            .await
-            .map_err(StoreAndForwardError::RequestMessagesFailed)?;
+            .await?;
 
         Ok(())
     }
 
     async fn get_saf_request(&mut self) -> SafResult<StoredMessagesRequest> {
-        let request = self
+        let mut request = self
             .dht_requester
             .get_metadata(DhtMetadataKey::LastSafMessageReceived)
             .await?
             .map(StoredMessagesRequest::since)
             .unwrap_or_else(StoredMessagesRequest::new);
+
+        request.limit = self.config.max_returned_messages.try_into().unwrap_or(u32::MAX);
 
         Ok(request)
     }
@@ -473,9 +550,11 @@ impl StoreAndForwardService {
 
     fn handle_fetch_message_query(&self, query: &FetchStoredMessageQuery) -> SafResult<Vec<StoredMessage>> {
         use SafResponseType::{Anonymous, Discovery, ForMe, Join};
-        let limit = i64::try_from(self.config.max_returned_messages)
-            .ok()
-            .unwrap_or(std::i64::MAX);
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = query
+            .limit
+            .map(i64::from)
+            .unwrap_or(self.config.max_returned_messages as i64);
         let db = &self.database;
         let messages = match query.response_type {
             ForMe => db.find_messages_for_peer(&query.public_key, &query.node_id, query.since, limit)?,

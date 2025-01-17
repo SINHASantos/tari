@@ -23,12 +23,10 @@
 use std::{
     cmp::{max, min},
     convert::TryInto,
-    iter::IntoIterator,
     marker::PhantomData,
 };
 
 use digest::Digest;
-use tari_common::DomainDigest;
 
 use crate::{
     backend::ArrayLike,
@@ -41,6 +39,7 @@ use crate::{
         leaf_index,
         node_index,
         peak_map_height,
+        LeafIndex,
     },
     error::MerkleMountainRangeError,
     pruned_hashset::PrunedHashSet,
@@ -50,6 +49,10 @@ use crate::{
 /// An implementation of a Merkle Mountain Range (MMR). The MMR is append-only and immutable. Only the hashes are
 /// stored in this data structure. The data itself can be stored anywhere as long as you can maintain a 1:1 mapping
 /// of the hash of that data to the leaf nodes in the MMR.
+///
+/// Because this implementation relies on the caller to hash leaf nodes, it is possible to instantiate an MMR that is
+/// susceptible to second-preimage attacks. The caller _must_ ensure that the hashers used to pre-hash leaf nodes and
+/// instantiate the MMR cannot produce collisions.
 #[derive(Debug)]
 pub struct MerkleMountainRange<D, B> {
     pub(crate) hashes: B,
@@ -58,7 +61,7 @@ pub struct MerkleMountainRange<D, B> {
 
 impl<D, B> MerkleMountainRange<D, B>
 where
-    D: Digest + DomainDigest,
+    D: Digest,
     B: ArrayLike<Value = Hash>,
 {
     /// Create a new Merkle mountain range using the given backend for storage
@@ -111,21 +114,21 @@ where
     }
 
     /// This function returns the hash of the leaf index provided, indexed from 0
-    pub fn get_leaf_hash(&self, leaf_index: usize) -> Result<Option<Hash>, MerkleMountainRangeError> {
+    pub fn get_leaf_hash(&self, leaf_index: LeafIndex) -> Result<Option<Hash>, MerkleMountainRangeError> {
         self.get_node_hash(node_index(leaf_index))
     }
 
     /// Returns a set of leaf hashes from the MMR.
-    pub fn get_leaf_hashes(&self, leaf_index: usize, count: usize) -> Result<Vec<Hash>, MerkleMountainRangeError> {
+    pub fn get_leaf_hashes(&self, leaf_index: LeafIndex, count: usize) -> Result<Vec<Hash>, MerkleMountainRangeError> {
         let leaf_count = self.get_leaf_count()?;
-        if leaf_index >= leaf_count {
+        if leaf_index.0 >= leaf_count {
             return Ok(Vec::new());
         }
         let count = max(1, count);
-        let last_leaf_index = min(leaf_index + count - 1, leaf_count);
-        let mut leaf_hashes = Vec::with_capacity((last_leaf_index - leaf_index + 1) as usize);
-        for leaf_index in leaf_index..=last_leaf_index {
-            if let Some(hash) = self.get_leaf_hash(leaf_index)? {
+        let last_leaf_index = min(leaf_index.0 + count - 1, leaf_count);
+        let mut leaf_hashes = Vec::with_capacity(last_leaf_index - leaf_index.0 + 1);
+        for leaf_index in leaf_index.0..=last_leaf_index {
+            if let Some(hash) = self.get_leaf_hash(LeafIndex(leaf_index))? {
                 leaf_hashes.push(hash);
             }
         }
@@ -148,7 +151,8 @@ where
             self.hashes
                 .len()
                 .map_err(|e| MerkleMountainRangeError::BackendError(e.to_string()))?,
-        );
+        )
+        .ok_or(MerkleMountainRangeError::InvalidMmrSize)?;
         Ok(peaks
             .into_iter()
             .map(|i| {
@@ -157,7 +161,7 @@ where
                     .unwrap()
                     .expect("find_peaks returned invalid indexes")
             })
-            .fold(hasher, |hasher, h| hasher.chain(h)))
+            .fold(hasher, |hasher, h| hasher.chain_update(h)))
     }
 
     /// Push a new element into the MMR. Computes new related peaks at the same time if applicable.
@@ -277,7 +281,7 @@ where
 
 impl<D, B, B2> PartialEq<MerkleMountainRange<D, B2>> for MerkleMountainRange<D, B>
 where
-    D: Digest + DomainDigest,
+    D: Digest,
     B: ArrayLike<Value = Hash>,
     B2: ArrayLike<Value = Hash>,
 {

@@ -20,12 +20,11 @@ fi
 #   common
 #   comms
 #   comms/dht
-#   applications/tari_base_node
-#   applications/tari_app_grpc
-#   applications/tari_app_utilities
-#   applications/tari_console_wallet
-#   applications/tari_merge_mining_proxy
-#   applications/test_faucet
+#   applications/minotari_node
+#   applications/minotari_app_grpc
+#   applications/minotari_app_utilities
+#   applications/minotari_console_wallet
+#   applications/minotari_merge_mining_proxy
 
 function update_versions {
     packages=${@:-'
@@ -34,6 +33,7 @@ function update_versions {
    infrastructure/storage
    infrastructure/test_utils
    base_layer/common_types
+   base_layer/contacts
    base_layer/core
    base_layer/key_manager
    base_layer/mmr
@@ -41,20 +41,20 @@ function update_versions {
    base_layer/service_framework
    base_layer/wallet
    base_layer/wallet_ffi
-   base_layer/tari_mining_helper_ffi
+   base_layer/minotari_mining_helper_ffi
    common
    common_sqlite
+   common/tari_features
    comms/core
    comms/dht
    comms/rpc_macros
-   applications/tari_base_node
-   applications/tari_app_grpc
-   applications/tari_app_utilities
-   applications/tari_console_wallet
-   applications/tari_merge_mining_proxy
-   applications/tari_miner
+   applications/minotari_node
+   applications/minotari_app_grpc
+   applications/minotari_app_utilities
+   applications/minotari_console_wallet
+   applications/minotari_merge_mining_proxy
+   applications/minotari_miner
    applications/tari_validator_node
-   applications/test_faucet
 '}
 
   p_arr=($packages)

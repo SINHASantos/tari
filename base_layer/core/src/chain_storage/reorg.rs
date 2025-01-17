@@ -22,7 +22,7 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::HashOutput;
 
@@ -36,20 +36,20 @@ pub struct Reorg {
     pub prev_hash: HashOutput,
     pub num_blocks_added: u64,
     pub num_blocks_removed: u64,
-    pub local_time: NaiveDateTime,
+    pub local_time: DateTime<Utc>,
 }
 
 impl Reorg {
     pub fn from_reorged_blocks(added: &VecDeque<Arc<ChainBlock>>, removed: &[Arc<ChainBlock>]) -> Self {
         // Expects blocks to be ordered sequentially highest height to lowest (as in rewind_to_height)
         Self {
-            new_height: added.get(0).map(|b| b.header().height).unwrap_or_default(),
-            new_hash: added.get(0).map(|b| *b.hash()).unwrap_or_default(),
+            new_height: added.front().map(|b| b.header().height).unwrap_or_default(),
+            new_hash: added.front().map(|b| *b.hash()).unwrap_or_default(),
             prev_height: removed.first().map(|b| b.header().height).unwrap_or_default(),
             prev_hash: removed.first().map(|b| *b.hash()).unwrap_or_default(),
             num_blocks_added: added.len() as u64,
             num_blocks_removed: removed.len() as u64,
-            local_time: Utc::now().naive_local(),
+            local_time: Utc::now(),
         }
     }
 }

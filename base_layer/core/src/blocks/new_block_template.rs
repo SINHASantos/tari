@@ -22,35 +22,67 @@
 
 use std::fmt::{Display, Formatter};
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     blocks::{new_blockheader_template::NewBlockHeaderTemplate, Block},
     proof_of_work::Difficulty,
-    transactions::{aggregated_body::AggregateBody, tari_amount::MicroTari},
+    transactions::{
+        aggregated_body::AggregateBody,
+        tari_amount::MicroMinotari,
+        transaction_components::TransactionError,
+    },
 };
 
 /// The new block template is used constructing a new partial block, allowing a miner to added the coinbase utxo and as
 /// a final step the Base node to add the MMR roots to the header.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct NewBlockTemplate {
+    /// The NewBlockHeaderTemplate is used for the construction of a new mineable block. It contains all the metadata
+    /// for the block that the Base Node is able to complete on behalf of a Miner.
     pub header: NewBlockHeaderTemplate,
+    /// This flag indicates if the inputs, outputs and kernels have been sorted internally, that is, the sort() method
+    /// has been called. This may be false even if all components are sorted.
     pub body: AggregateBody,
+    /// The difficulty is defined as the maximum target divided by the block hash.
     pub target_difficulty: Difficulty,
-    pub reward: MicroTari,
-    pub total_fees: MicroTari,
+    /// The reward is the sum of the coinbase utxo and the total fees.
+    pub reward: MicroMinotari,
+    /// The total fees is the sum of all the fees in the block.
+    pub total_fees: MicroMinotari,
+    /// Sometimes the mempool has not synced to the latest tip, this flag indicates if the mempool is out of sync.
+    /// In most cases the next call to get_new_block_template will return a block with the mempool in sync.
+    pub is_mempool_in_sync: bool,
 }
 
 impl NewBlockTemplate {
-    pub fn from_block(block: Block, target_difficulty: Difficulty, reward: MicroTari) -> Self {
+    pub fn from_block(
+        block: Block,
+        target_difficulty: Difficulty,
+        reward: MicroMinotari,
+        is_mempool_in_sync: bool,
+    ) -> Result<Self, TransactionError> {
         let Block { header, body } = block;
-        let total_fees = body.get_total_fee();
-        Self {
+        let total_fees = body.get_total_fee()?;
+        Ok(Self {
             header: NewBlockHeaderTemplate::from_header(header),
             body,
             target_difficulty,
             reward,
             total_fees,
+            is_mempool_in_sync,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            header: NewBlockHeaderTemplate::empty(),
+            body: AggregateBody::empty(),
+            target_difficulty: Difficulty::default(),
+            reward: MicroMinotari::default(),
+            total_fees: MicroMinotari::default(),
+            is_mempool_in_sync: false,
         }
     }
 }

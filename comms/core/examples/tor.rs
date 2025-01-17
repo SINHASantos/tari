@@ -10,10 +10,11 @@ use rand::{rngs::OsRng, thread_rng, RngCore};
 use tari_comms::{
     message::{InboundMessage, OutboundMessage},
     multiaddr::Multiaddr,
+    net_address::{MultiaddressesWithStats, PeerAddressSource},
     peer_manager::{NodeId, NodeIdentity, Peer, PeerFeatures},
     pipeline,
     pipeline::SinkService,
-    protocol::messaging::MessagingProtocolExtension,
+    protocol::{messaging::MessagingProtocolExtension, ProtocolId},
     tor,
     CommsBuilder,
     CommsNode,
@@ -32,6 +33,8 @@ use tokio::{
 // Tor example for tari_comms.
 //
 // _Note:_ A running tor proxy with `ControlPort` set is required for this example to work.
+
+static MSG_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"example/tor/msg/1.0");
 
 type Error = anyhow::Error;
 
@@ -84,16 +87,14 @@ async fn run() -> Result<(), Error> {
 
     println!("Comms nodes started!");
     println!(
-        "Node 1 is '{}' with address '{}' (local_listening_addr='{}')",
+        "Node 1 is '{}' with address '{:?}')",
         node_identity1.node_id().short_str(),
-        node_identity1.public_address(),
-        comms_node1.listening_address(),
+        node_identity1.public_addresses(),
     );
     println!(
-        "Node 2 is '{}' with address '{}' (local_listening_addr='{}')",
+        "Node 2 is '{}' with address '{:?}')",
         node_identity2.node_id().short_str(),
-        node_identity2.public_address(),
-        comms_node2.listening_address(),
+        node_identity2.public_addresses(),
     );
 
     // Let's add node 2 as a peer to node 1
@@ -102,7 +103,10 @@ async fn run() -> Result<(), Error> {
         .add_peer(Peer::new(
             node_identity2.public_key().clone(),
             node_identity2.node_id().clone(),
-            vec![node_identity2.public_address()].into(),
+            MultiaddressesWithStats::from_addresses_with_source(
+                node_identity2.public_addresses(),
+                &PeerAddressSource::Config,
+            ),
             Default::default(),
             PeerFeatures::COMMUNICATION_CLIENT,
             Default::default(),
@@ -171,7 +175,7 @@ async fn setup_node_with_tor<P: Into<tor::PortMapping>>(
         hs_builder = hs_builder.with_tor_identity(ident);
     }
 
-    let mut hs_controller = hs_builder.build().await?;
+    let mut hs_controller = hs_builder.build()?;
 
     let node_identity = Arc::new(NodeIdentity::random(
         &mut OsRng,
@@ -191,6 +195,7 @@ async fn setup_node_with_tor<P: Into<tor::PortMapping>>(
     let (event_tx, _) = broadcast::channel(1);
     let comms_node = comms_node
         .add_protocol_extension(MessagingProtocolExtension::new(
+            MSG_PROTOCOL_ID.clone(),
             event_tx,
             pipeline::Builder::new()
             // Outbound messages will be forwarded "as is" to outbound messaging
@@ -204,8 +209,8 @@ async fn setup_node_with_tor<P: Into<tor::PortMapping>>(
         .await?;
 
     println!(
-        "Tor hidden service created with address '{}'",
-        comms_node.node_identity().public_address()
+        "Tor hidden service created with address '{:?}'",
+        comms_node.node_identity().public_addresses()
     );
 
     Ok((comms_node, inbound_rx, outbound_tx))
@@ -248,9 +253,8 @@ async fn start_ping_ponger(
                 id.parse::<u64>()
                     .ok()
                     .and_then(|id_num| inflight_pings.remove(&id_num))
-                    .map(|latency| {
+                    .inspect(|&latency| {
                         println!("Latency: {}ms", latency);
-                        latency
                     });
 
                 println!("-----------------------------------");

@@ -25,22 +25,30 @@
 
 use std::{iter, path::Path, sync::Arc};
 
+use blake2::Blake2b;
 pub use block_spec::{BlockSpec, BlockSpecs};
+use digest::consts::U32;
 use rand::{distributions::Alphanumeric, rngs::OsRng, Rng};
 use tari_common::configuration::Network;
-use tari_common_types::types::PublicKey;
+use tari_common_types::{
+    tari_address::TariAddress,
+    types::{PrivateKey, PublicKey},
+};
 use tari_comms::PeerManager;
-use tari_crypto::keys::PublicKey as PublicKeyT;
+use tari_crypto::keys::{PublicKey as PublicKeyT, SecretKey};
+use tari_key_manager::key_manager_service::KeyManagerInterface;
 use tari_storage::{lmdb_store::LMDBBuilder, LMDBWrapper};
+use tari_utilities::epoch_time::EpochTime;
 
 use crate::{
     blocks::{Block, BlockHeader, BlockHeaderAccumulatedData, ChainHeader},
     consensus::{ConsensusConstants, ConsensusManager},
     proof_of_work::{sha3x_difficulty, AchievedTargetDifficulty, Difficulty},
     transactions::{
-        transaction_components::{Transaction, UnblindedOutput},
-        CoinbaseBuilder,
-        CryptoFactories,
+        generate_coinbase_with_wallet_output,
+        key_manager::{MemoryDbKeyManager, TariKeyId},
+        tari_amount::MicroMinotari,
+        transaction_components::{encrypted_data::PaymentId, CoinBaseExtra, RangeProofType, Transaction, WalletOutput},
     },
 };
 
@@ -49,7 +57,7 @@ mod block_spec;
 pub mod blockchain;
 
 pub fn create_consensus_rules() -> ConsensusManager {
-    ConsensusManager::builder(Network::LocalNet).build()
+    ConsensusManager::builder(Network::LocalNet).build().unwrap()
 }
 
 pub fn create_consensus_constants(height: u64) -> ConsensusConstants {
@@ -64,34 +72,65 @@ pub fn create_orphan_block(block_height: u64, transactions: Vec<Transaction>, co
     header.into_builder().with_transactions(transactions).build()
 }
 
-pub fn create_block(rules: &ConsensusManager, prev_block: &Block, spec: BlockSpec) -> (Block, UnblindedOutput) {
+pub async fn default_coinbase_entities(key_manager: &MemoryDbKeyManager) -> (TariKeyId, TariAddress) {
+    let wallet_private_spend_key = PrivateKey::random(&mut OsRng);
+    let wallet_private_view_key = PrivateKey::random(&mut OsRng);
+    let _key = key_manager.import_key(wallet_private_view_key.clone()).await.unwrap();
+    let script_key_id = key_manager.import_key(wallet_private_spend_key.clone()).await.unwrap();
+    let wallet_payment_address = TariAddress::new_dual_address_with_default_features(
+        PublicKey::from_secret_key(&wallet_private_view_key),
+        PublicKey::from_secret_key(&wallet_private_spend_key),
+        Network::LocalNet,
+    );
+    (script_key_id, wallet_payment_address)
+}
+
+pub async fn create_block(
+    rules: &ConsensusManager,
+    prev_block: &Block,
+    spec: BlockSpec,
+    km: &MemoryDbKeyManager,
+    script_key_id: &TariKeyId,
+    wallet_payment_address: &TariAddress,
+    range_proof_type: Option<RangeProofType>,
+) -> (Block, WalletOutput) {
     let mut header = BlockHeader::from_previous(&prev_block.header);
+    header.version = rules.consensus_constants(header.height).blockchain_version();
     let block_height = spec.height_override.unwrap_or(prev_block.header.height + 1);
     header.height = block_height;
-    // header.prev_hash = prev_block.hash();
     let reward = spec.reward_override.unwrap_or_else(|| {
-        rules.calculate_coinbase_and_fees(
-            header.height,
-            &spec
-                .transactions
-                .iter()
-                .flat_map(|tx| tx.body.kernels().clone())
-                .collect::<Vec<_>>(),
-        )
+        rules
+            .calculate_coinbase_and_fees(
+                header.height,
+                &spec
+                    .transactions
+                    .iter()
+                    .flat_map(|tx| tx.body.kernels().clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
     });
 
-    let (coinbase, coinbase_output) = CoinbaseBuilder::new(CryptoFactories::default())
-        .with_block_height(header.height)
-        .with_fees(0.into())
-        .with_nonce(0.into())
-        .with_spend_key(block_height.into())
-        .build_with_reward(rules.consensus_constants(block_height), reward)
-        .unwrap();
+    let (coinbase_transaction, _, _, coinbase_wallet_output) = generate_coinbase_with_wallet_output(
+        MicroMinotari::from(0),
+        reward,
+        header.height,
+        &CoinBaseExtra::default(),
+        km,
+        script_key_id,
+        wallet_payment_address,
+        false,
+        rules.consensus_constants(header.height),
+        range_proof_type.unwrap_or(RangeProofType::BulletProofPlus),
+        PaymentId::Empty,
+    )
+    .await
+    .unwrap();
 
     let mut block = header
         .into_builder()
         .with_transactions(
-            Some(coinbase)
+            Some(coinbase_transaction)
                 .filter(|_| !spec.skip_coinbase)
                 .into_iter()
                 .chain(spec.transactions)
@@ -100,10 +139,15 @@ pub fn create_block(rules: &ConsensusManager, prev_block: &Block, spec: BlockSpe
         .build();
 
     // Keep times constant in case we need a particular target difficulty
-    block.header.timestamp = prev_block.header.timestamp.increase(spec.block_time);
-    block.header.output_mmr_size = prev_block.header.output_mmr_size + block.body.outputs().len() as u64;
+    block.header.timestamp = prev_block
+        .header
+        .timestamp
+        .checked_add(EpochTime::from(spec.block_time))
+        .unwrap();
+    block.header.output_smt_size = prev_block.header.output_smt_size + block.body.outputs().len() as u64;
     block.header.kernel_mmr_size = prev_block.header.kernel_mmr_size + block.body.kernels().len() as u64;
-    (block, coinbase_output)
+
+    (block, coinbase_wallet_output)
 }
 
 pub fn mine_to_difficulty(mut block: Block, difficulty: Difficulty) -> Result<Block, String> {
@@ -111,7 +155,7 @@ pub fn mine_to_difficulty(mut block: Block, difficulty: Difficulty) -> Result<Bl
     // hash changing. This introduces the required entropy
     block.header.nonce = rand::thread_rng().gen();
     for _i in 0..20000 {
-        if sha3x_difficulty(&block.header) == difficulty {
+        if sha3x_difficulty(&block.header).map_err(|e| e.to_string())? == difficulty {
             return Ok(block);
         }
         block.header.nonce += 1;
@@ -140,7 +184,12 @@ pub fn create_peer_manager<P: AsRef<Path>>(data_path: P) -> Arc<PeerManager> {
 }
 
 pub fn create_chain_header(header: BlockHeader, prev_accum: &BlockHeaderAccumulatedData) -> ChainHeader {
-    let achieved_target_diff = AchievedTargetDifficulty::try_construct(header.pow_algo(), 1.into(), 1.into()).unwrap();
+    let achieved_target_diff = AchievedTargetDifficulty::try_construct(
+        header.pow_algo(),
+        Difficulty::from_u64(Difficulty::min().as_u64() + 1).unwrap(),
+        Difficulty::from_u64(Difficulty::min().as_u64() + 1).unwrap(),
+    )
+    .unwrap();
     let accumulated_data = BlockHeaderAccumulatedData::builder(prev_accum)
         .with_hash(header.hash())
         .with_achieved_target_difficulty(achieved_target_diff)
@@ -156,6 +205,8 @@ pub fn new_public_key() -> PublicKey {
 
 pub fn make_hash<T: AsRef<[u8]>>(preimage: T) -> [u8; 32] {
     use digest::Digest;
-    use tari_crypto::hash::blake2::Blake256;
-    Blake256::new().chain(preimage.as_ref()).finalize().into()
+    Blake2b::<U32>::default()
+        .chain_update(preimage.as_ref())
+        .finalize()
+        .into()
 }

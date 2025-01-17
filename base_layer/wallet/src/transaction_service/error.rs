@@ -23,6 +23,7 @@
 use diesel::result::Error as DieselError;
 use futures::channel::oneshot::Canceled;
 use serde_json::Error as SerdeJsonError;
+use tari_common_sqlite::error::SqliteStorageError;
 use tari_common_types::{
     tari_address::TariAddressError,
     transaction::{TransactionConversionError, TransactionDirectionError, TxId},
@@ -31,10 +32,13 @@ use tari_common_types::{
 use tari_comms::{connectivity::ConnectivityError, peer_manager::node_id::NodeIdError, protocol::rpc::RpcError};
 use tari_comms_dht::outbound::DhtOutboundError;
 use tari_core::transactions::{
-    transaction_components::{EncryptionError, TransactionError},
+    transaction_components::{EncryptedDataError, TransactionError},
     transaction_protocol::TransactionProtocolError,
 };
+use tari_crypto::{errors::RangeProofError, signatures::CommitmentSignatureError};
+use tari_key_manager::key_manager_service::KeyManagerServiceError;
 use tari_p2p::services::liveness::error::LivenessError;
+use tari_script::ScriptError;
 use tari_service_framework::reply_channel::TransportChannelError;
 use tari_utilities::ByteArrayError;
 use thiserror::Error;
@@ -93,8 +97,6 @@ pub enum TransactionServiceError {
     DiscoveryProcessFailed(TxId),
     #[error("Invalid Completed Transaction provided")]
     InvalidCompletedTransaction,
-    #[error("Attempted to broadcast a coinbase transaction. TxId `{0}`")]
-    AttemptedToBroadcastCoinbaseTransaction(TxId),
     #[error("No Base Node public keys are provided for Base chain broadcast and monitoring")]
     NoBaseNodeKeysProvided,
     #[error("Base node changed during {task_name}")]
@@ -109,8 +111,6 @@ pub enum TransactionServiceError {
     UnexpectedBaseNodeResponse,
     #[error("The current transaction has been cancelled")]
     TransactionCancelled,
-    #[error("Chain tip has moved beyond this coinbase before it was mined so it must be cancelled")]
-    ChainTipHigherThanCoinbaseHeight,
     #[error("DHT outbound error: `{0}`")]
     DhtOutboundError(#[from] DhtOutboundError),
     #[error("Output manager error: `{0}`")]
@@ -160,7 +160,7 @@ pub enum TransactionServiceError {
     #[error("Maximum Attempts Exceeded")]
     MaximumAttemptsExceeded,
     #[error("Byte array error")]
-    ByteArrayError(#[from] tari_utilities::ByteArrayError),
+    ByteArrayError(String),
     #[error("Transaction Service Error: `{0}`")]
     ServiceError(String),
     #[error("Wallet Recovery in progress so Transaction Service Messaging Requests ignored")]
@@ -175,9 +175,47 @@ pub enum TransactionServiceError {
     #[error("Base Node is not synced")]
     BaseNodeNotSynced,
     #[error("Value encryption error: `{0}`")]
-    EncryptionError(#[from] EncryptionError),
+    EncryptionError(#[from] EncryptedDataError),
     #[error("FixedHash size error: `{0}`")]
     FixedHashSizeError(#[from] FixedHashSizeError),
+    #[error("Commitment signature error: {0}")]
+    CommitmentSignatureError(String),
+    #[error("Invalid data: `{0}`")]
+    RangeProofError(String),
+    #[error("Key manager error: `{0}`")]
+    InvalidKeyId(String),
+    #[error("Invalid key manager data: `{0}`")]
+    KeyManagerServiceError(#[from] KeyManagerServiceError),
+    #[error("Serialization error: `{0}`")]
+    SerializationError(String),
+    #[error("Transaction exceed maximum byte size. Expected < {expected} but got {got}.")]
+    TransactionTooLarge { got: usize, expected: usize },
+    #[error("Pending Transaction was oversized")]
+    Oversized,
+    #[error("Transaction has invalid address: `{0}`")]
+    InvalidAddress(String),
+    #[error("Transaction is not supported: `{0}`")]
+    NotSupported(String),
+    #[error("Tari script error: {0}")]
+    ScriptError(#[from] ScriptError),
+}
+
+impl From<RangeProofError> for TransactionServiceError {
+    fn from(e: RangeProofError) -> Self {
+        TransactionServiceError::RangeProofError(e.to_string())
+    }
+}
+
+impl From<CommitmentSignatureError> for TransactionServiceError {
+    fn from(e: CommitmentSignatureError) -> Self {
+        TransactionServiceError::CommitmentSignatureError(e.to_string())
+    }
+}
+
+impl From<ByteArrayError> for TransactionServiceError {
+    fn from(err: ByteArrayError) -> Self {
+        TransactionServiceError::ByteArrayError(err.to_string())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -200,6 +238,10 @@ pub enum TransactionStorageError {
     ValueNotFound(DbKey),
     #[error("Unexpected result: `{0}`")]
     UnexpectedResult(String),
+    #[error("Bincode error: `{0}`")]
+    BincodeSerialize(String),
+    #[error("Bincode error: `{0}`")]
+    BincodeDeserialize(String),
     #[error("This write operation is not supported for provided DbKey")]
     OperationNotSupported,
     #[error("Could not find all values specified for batch operation")]
@@ -235,11 +277,19 @@ pub enum TransactionStorageError {
     #[error("Transaction (TxId: '{0}') is not mined")]
     TransactionNotMined(TxId),
     #[error("Conversion error: `{0}`")]
-    ByteArrayError(#[from] ByteArrayError),
+    ByteArrayError(String),
     #[error("Tari address error: `{0}`")]
     TariAddressError(#[from] TariAddressError),
-    #[error("Not a coinbase transaction so cannot be abandoned")]
-    NotCoinbase,
+    #[error("Db error: `{0}`")]
+    SqliteStorageError(#[from] SqliteStorageError),
+    #[error("Coinbase transactions are not supported in the wallet")]
+    CoinbaseNotSupported,
+}
+
+impl From<ByteArrayError> for TransactionStorageError {
+    fn from(e: ByteArrayError) -> Self {
+        TransactionStorageError::ByteArrayError(e.to_string())
+    }
 }
 
 /// This error type is used to return TransactionServiceErrors from inside a Transaction Service protocol but also

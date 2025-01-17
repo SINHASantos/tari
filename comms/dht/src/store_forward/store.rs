@@ -34,13 +34,7 @@ use tower::{layer::Layer, Service, ServiceExt};
 use super::StoreAndForwardRequester;
 use crate::{
     inbound::DecryptedDhtMessage,
-    store_forward::{
-        database::NewStoredMessage,
-        error::StoreAndForwardError,
-        message::StoredMessagePriority,
-        SafConfig,
-        SafResult,
-    },
+    store_forward::{database::NewStoredMessage, message::StoredMessagePriority, SafConfig, SafResult},
 };
 
 const LOG_TARGET: &str = "comms::dht::storeforward::store";
@@ -189,9 +183,9 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
     /// 1. Messages MUST have a message origin set and be encrypted (Join messages are the exception)
     /// 1. Unencrypted Join messages - this increases the knowledge the network has of peers (Low priority)
     /// 1. Encrypted Discovery messages - so that nodes are aware of other nodes that are looking for them (High
-    /// priority) 1. Encrypted messages addressed to the neighbourhood - some node in the neighbourhood may be
-    /// interested in this message (High priority) 1. Encrypted messages addressed to a particular public key or
-    /// node id that this node knows about
+    ///    priority) 1. Encrypted messages addressed to the neighbourhood - some node in the neighbourhood may be
+    ///    interested in this message (High priority) 1. Encrypted messages addressed to a particular public key or node
+    ///    id that this node knows about
     async fn handle(mut self, mut message: DecryptedDhtMessage) -> Result<(), PipelineError> {
         if !self.node_identity.features().contains(PeerFeatures::DHT_STORE_FORWARD) {
             trace!(
@@ -205,10 +199,12 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
         }
 
         message.set_saf_stored(false);
-        if let Some(priority) = self.get_storage_priority(&message).await? {
-            message.set_saf_stored(true);
-            let existing = self.store(priority, message.clone()).await?;
-            message.set_already_forwarded(existing);
+        if self.is_valid_for_storage(&message) {
+            if let Some(priority) = self.get_storage_priority(&message).await? {
+                message.set_saf_stored(true);
+                let existing = self.store(priority, message.clone()).await?;
+                message.set_already_forwarded(existing);
+            }
         }
 
         trace!(
@@ -219,7 +215,36 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
         );
 
         let service = self.next_service.ready_oneshot().await?;
-        return service.oneshot(message).await;
+        service.oneshot(message).await
+    }
+
+    fn is_valid_for_storage(&self, message: &DecryptedDhtMessage) -> bool {
+        if message.body_len() == 0 {
+            debug!(
+                target: LOG_TARGET,
+                "Message {} from peer '{}' not eligible for SAF storage because it has no body (Trace: {})",
+                message.tag,
+                message.source_peer.node_id.short_str(),
+                message.dht_header.message_tag
+            );
+            return false;
+        }
+
+        if let Some(expires) = message.dht_header.expires {
+            let now = EpochTime::now();
+            if expires < now {
+                debug!(
+                    target: LOG_TARGET,
+                    "Message {} from peer '{}' not eligible for SAF storage because it has expired (Trace: {})",
+                    message.tag,
+                    message.source_peer.node_id.short_str(),
+                    message.dht_header.message_tag
+                );
+                return false;
+            }
+        }
+
+        true
     }
 
     async fn get_storage_priority(&self, message: &DecryptedDhtMessage) -> SafResult<Option<StoredMessagePriority>> {
@@ -248,13 +273,8 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
             return Ok(None);
         }
 
-        if message.dht_header.message_type.is_dht_join() {
-            log_not_eligible("it is a join message");
-            return Ok(None);
-        }
-
-        if message.dht_header.message_type.is_dht_discovery() {
-            log_not_eligible("it is a discovery message");
+        if message.dht_header.message_type.is_dht_message() {
+            log_not_eligible(&format!("it is a DHT {} message", message.dht_header.message_type));
             return Ok(None);
         }
 
@@ -282,17 +302,6 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
                     return Ok(None);
                 }
 
-                // If this is a join message, we may want to store it if it's for our neighbourhood
-                // if message.dht_header.message_type.is_dht_join() {
-                // return match self.get_priority_for_dht_join(message).await? {
-                //     Some(priority) => Ok(Some(priority)),
-                //     None => {
-                //         log_not_eligible("the join message was not considered in this node's neighbourhood");
-                //         Ok(None)
-                //     },
-                // };
-                // }
-
                 log_not_eligible("it is not an eligible DhtMessageType");
                 // Otherwise, don't store
                 Ok(None)
@@ -300,7 +309,7 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
             // This node could not decrypt the message
             None => {
                 if !message.has_message_signature() {
-                    // TODO: #banheuristic - the source peer should not have propagated this message
+                    // #banheuristic - the source peer should not have propagated this message
                     debug!(
                         target: LOG_TARGET,
                         "Store task received an encrypted message with no message signature. This message {} is \
@@ -318,41 +327,6 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
             },
         }
     }
-
-    // async fn get_priority_for_dht_join(
-    //     &self,
-    //     message: &DecryptedDhtMessage,
-    // ) -> SafResult<Option<StoredMessagePriority>>
-    // {
-    //     debug_assert!(message.dht_header.message_type.is_dht_join() && !message.is_encrypted());
-    //
-    //     let body = message
-    //         .decryption_result
-    //         .as_ref()
-    //         .expect("already checked that this message is not encrypted");
-    //     let join_msg = body
-    //         .decode_part::<JoinMessage>(0)?
-    //         .ok_or_else(|| StoreAndForwardError::InvalidEnvelopeBody)?;
-    //     let node_id = NodeId::from_bytes(&join_msg.node_id).map_err(StoreAndForwardError::MalformedNodeId)?;
-    //
-    //     // If this join request is for a peer that we'd consider to be a neighbour, store it for other neighbours
-    //     if self
-    //         .peer_manager
-    //         .in_network_region(
-    //             &node_id,
-    //             self.node_identity.node_id(),
-    //             self.config.num_neighbouring_nodes,
-    //         )
-    //         .await?
-    //     {
-    //         if self.saf_requester.query_messages(
-    //             DhtMessageType::Join,
-    //         )
-    //         return Ok(Some(StoredMessagePriority::Low));
-    //     }
-    //
-    //     Ok(None)
-    // }
 
     async fn get_priority_by_destination(
         &self,
@@ -377,7 +351,6 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
             return Ok(None);
         }
 
-        // TODO: Remove this once we have a layer that filters out all messages to/from banned peers
         if let Some(origin_pk) = message.authenticated_origin() {
             if let Ok(Some(peer)) = self.peer_manager.find_by_public_key(origin_pk).await {
                 if peer.is_banned() {
@@ -436,13 +409,6 @@ where S: Service<DecryptedDhtMessage, Response = (), Error = PipelineError> + Se
             message.dht_header.message_tag,
         );
 
-        if let Some(expires) = message.dht_header.expires {
-            let now = EpochTime::now();
-            if expires < now {
-                return Err(StoreAndForwardError::NotStoringExpiredMessage { expired: expires, now });
-            }
-        }
-
         let stored_message = NewStoredMessage::new(message, priority);
         self.saf_requester.insert_message(stored_message).await
     }
@@ -453,7 +419,7 @@ mod test {
     use std::time::Duration;
 
     use chrono::Utc;
-    use tari_comms::{runtime, wrap_in_envelope_body};
+    use tari_comms::wrap_in_envelope_body;
     use tari_test_utils::async_assert_eventually;
     use tari_utilities::hex::Hex;
 
@@ -470,7 +436,7 @@ mod test {
         },
     };
 
-    #[runtime::test]
+    #[tokio::test]
     async fn cleartext_message_no_origin() {
         let (requester, mock_state) = create_store_and_forward_mock();
 
@@ -496,7 +462,7 @@ mod test {
         assert_eq!(messages.len(), 0);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn decryption_succeeded_no_store() {
         let (requester, mock_state) = create_store_and_forward_mock();
 
@@ -526,7 +492,7 @@ mod test {
         assert_eq!(mock_state.call_count(), 0);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn decryption_failed_should_store() {
         let (requester, mock_state) = create_store_and_forward_mock();
         let spy = service_spy();
@@ -567,7 +533,7 @@ mod test {
         assert!(duration.num_seconds() <= 5);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn decryption_failed_banned_peer() {
         let (requester, mock_state) = create_store_and_forward_mock();
         let spy = service_spy();

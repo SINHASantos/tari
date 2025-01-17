@@ -36,11 +36,22 @@ pub enum InterfaceError {
     AllocationError,
     #[error("An error because the supplied position was out of range")]
     PositionInvalidError,
+    #[error("An error has occurred when trying to create the tokio runtime: `{0}`")]
+    TokioError(String),
+    #[error("An error has occurred when trying to create the a coinbase: `{0}`")]
+    CoinbaseBuildError(String),
+    #[error("An invalid address was passed in: `{0}`")]
+    InvalidAddress(String),
+    #[error("An invalid network was passed in: `{0}`")]
+    InvalidNetwork(String),
+    #[error("KeyManager encountered an error: `{0}`")]
+    KeyManager(String),
 }
 
 /// This struct is meant to hold an error for use by Miningcore. The error has an integer code and string
 /// message
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MiningHelperError {
     pub code: i32,
     pub message: String,
@@ -73,6 +84,26 @@ impl From<InterfaceError> for MiningHelperError {
                 code: 6,
                 message: format!("{:?}", v),
             },
+            InterfaceError::TokioError(_) => Self {
+                code: 7,
+                message: format!("{:?}", v),
+            },
+            InterfaceError::CoinbaseBuildError(_) => Self {
+                code: 8,
+                message: format!("{:?}", v),
+            },
+            InterfaceError::InvalidAddress(_) => Self {
+                code: 9,
+                message: format!("{:?}", v),
+            },
+            InterfaceError::InvalidNetwork(_) => Self {
+                code: 10,
+                message: format!("{:?}", v),
+            },
+            InterfaceError::KeyManager(_) => Self {
+                code: 11,
+                message: format!("{:?}", v),
+            },
         }
     }
 }
@@ -82,15 +113,15 @@ impl From<InterfaceError> for MiningHelperError {
 impl From<HexError> for MiningHelperError {
     fn from(h: HexError) -> Self {
         match h {
-            HexError::HexConversionError => Self {
+            HexError::HexConversionError {} => Self {
                 code: 404,
                 message: format!("{:?}", h),
             },
-            HexError::LengthError => Self {
+            HexError::LengthError {} => Self {
                 code: 501,
                 message: format!("{:?}", h),
             },
-            HexError::InvalidCharacter(_) => Self {
+            HexError::InvalidCharacter {} => Self {
                 code: 503,
                 message: format!("{:?}", h),
             },

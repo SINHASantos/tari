@@ -16,7 +16,7 @@ package tari.types;
 message TransactionKernel {
     // Options for a kernel's structure or use
     uint32 features = 1;
-    /// Fee originally included in the transaction this proof is for (in MicroTari)
+    /// Fee originally included in the transaction this proof is for (in MicroMinotari)
     uint64 fee = 2;
     // This kernel is not valid earlier than lock_height blocks
     // The max lock_height of all *inputs* to this transaction
@@ -57,9 +57,13 @@ message TransactionInput {
     // Version
     uint32 version = 10;
     // The encrypted value
-    bytes encrypted_value = 11;
-    // The minimum value of the commitment that is proven by the range proof (in MicroTari)
+    bytes encrypted_data = 11;
+    // The minimum value of the commitment that is proven by the range proof (in MicroMinotari)
     uint64 minimum_value_promise = 12;
+    // The metadata signature for output this input is spending
+    ComAndPubSignature metadata_signature = 13;
+    // The rangeproof hash for output this input is spending
+    bytes rangeproof_hash = 14;
 }
 
 // Output for a transaction, defining the new ownership of coins that are being transferred. The commitment is a
@@ -71,7 +75,7 @@ message TransactionOutput {
     // The homomorphic commitment representing the output amount
     Commitment commitment = 2;
     // A proof that the commitment is in the right range
-    bytes range_proof = 3;
+    RangeProof range_proof = 3;
     // Tari script serialised script
     bytes script = 4;
     // Tari script offset pubkey, K_O
@@ -82,9 +86,9 @@ message TransactionOutput {
     bytes covenant = 7;
     // Version
     uint32 version = 8;
-    // The encrypted value
-    bytes encrypted_value = 9;
-    // The minimum value of the commitment that is proven by the range proof (in MicroTari)
+    // Encrypted Pedersen commitment openings (value and mask) for the output
+    bytes encrypted_data = 9;
+    // The minimum value of the commitment that is proven by the range proof (in MicroMinotari)
     uint64 minimum_value_promise = 10;
 }
 
@@ -99,8 +103,10 @@ message OutputFeatures {
     uint64 maturity = 3;
     // Additional arbitrary info in coinbase transactions supplied by miners
     bytes coinbase_extra = 4;
+    // Features that are specific to a side chain
     SideChainFeature sidechain_feature = 5;
-    // Additional
+    // The type of range proof used in the output
+    uint32 range_proof_type = 6;
 }
 
 // The components of the block or transaction. The same struct can be used for either, since in Mimblewimble,
@@ -118,7 +124,7 @@ message AggregateBody {
 // A transaction which consists of a kernel offset and an aggregate body made up of inputs, outputs and kernels.
 // This struct is used to describe single transactions only.
 message Transaction {
-    BlindingFactor offset = 1;
+    PrivateKey offset = 1;
     AggregateBody body = 2;
-    BlindingFactor script_offset = 3;
+    PrivateKey script_offset = 3;
 }

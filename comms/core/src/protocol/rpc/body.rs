@@ -165,7 +165,7 @@ impl BodyBytes {
     }
 
     pub fn into_bytes_mut(self) -> BytesMut {
-        self.0.map(|v| v.into_iter().collect()).unwrap_or_else(BytesMut::new)
+        self.0.map(|v| v.into_iter().collect()).unwrap_or_default()
     }
 
     pub fn len(&self) -> usize {
@@ -177,7 +177,7 @@ impl BodyBytes {
     }
 
     pub fn into_vec(self) -> Vec<u8> {
-        self.0.map(|bytes| bytes.into()).unwrap_or_else(Vec::new)
+        self.0.map(|bytes| bytes.into()).unwrap_or_default()
     }
 
     pub fn into_bytes(self) -> Option<Bytes> {
@@ -188,7 +188,7 @@ impl BodyBytes {
 #[allow(clippy::from_over_into)]
 impl Into<Bytes> for BodyBytes {
     fn into(self) -> Bytes {
-        self.0.map(Bytes::from).unwrap_or_else(Bytes::new)
+        self.0.map(Bytes::from).unwrap_or_default()
     }
 }
 
@@ -302,9 +302,9 @@ mod test {
     use futures::{stream, StreamExt};
     use prost::Message;
 
-    use crate::{message::MessageExt, protocol::rpc::body::Body, runtime};
+    use crate::{message::MessageExt, protocol::rpc::body::Body};
 
-    #[runtime::test]
+    #[tokio::test]
     async fn single_body() {
         let mut body = Body::single(123u32.to_encoded_bytes());
         let bytes = body.next().await.unwrap().unwrap();
@@ -312,7 +312,7 @@ mod test {
         assert_eq!(u32::decode(bytes).unwrap(), 123u32);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn streaming_body() {
         let body = Body::streaming(stream::repeat(Bytes::new()).map(Ok).take(10));
         let body = body.collect::<Vec<_>>().await;

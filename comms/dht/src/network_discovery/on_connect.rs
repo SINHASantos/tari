@@ -37,11 +37,11 @@ use crate::{
     peer_validator::PeerValidator,
     proto::rpc::GetPeersRequest,
     rpc,
+    rpc::UnvalidatedPeerInfo,
     DhtConfig,
 };
-
 const LOG_TARGET: &str = "comms::dht::network_discovery:onconnect";
-const NUM_FETCH_PEERS: u32 = 1000;
+const NUM_FETCH_PEERS: u32 = 100;
 
 #[derive(Debug)]
 pub(super) struct OnConnect {
@@ -81,7 +81,7 @@ impl OnConnect {
                         conn.peer_node_id()
                     );
 
-                    match self.sync_peers(conn.clone()).await {
+                    match self.sync_peers(*conn.clone()).await {
                         Ok(_) => continue,
                         Err(err @ NetworkDiscoveryError::PeerValidationError(_)) => {
                             warn!(target: LOG_TARGET, "{}. Banning peer.", err);
@@ -121,12 +121,25 @@ impl OnConnect {
         StateEvent::Shutdown
     }
 
-    async fn sync_peers(&self, mut conn: PeerConnection) -> Result<(), NetworkDiscoveryError> {
+    async fn sync_peers(&mut self, mut conn: PeerConnection) -> Result<(), NetworkDiscoveryError> {
         let mut client = conn.connect_rpc::<rpc::DhtClient>().await?;
         let peer_stream = client
             .get_peers(GetPeersRequest {
                 n: NUM_FETCH_PEERS,
                 include_clients: false,
+                max_claims: self.config().max_permitted_peer_claims.try_into().unwrap_or_else(|_| {
+                    error!(target: LOG_TARGET, "Node configured to accept more than u32::MAX claims per peer");
+                    u32::MAX
+                }),
+                max_addresses_per_claim: self
+                    .config()
+                    .peer_validator_config
+                    .max_permitted_peer_addresses_per_claim
+                    .try_into()
+                    .unwrap_or_else(|_| {
+                        error!(target: LOG_TARGET, "Node configured to accept more than u32::MAX addresses per claim");
+                        u32::MAX
+                    }),
             })
             .await?;
 
@@ -135,12 +148,11 @@ impl OnConnect {
 
         let sync_peer = conn.peer_node_id();
         let mut num_added = 0;
-        let peer_validator = PeerValidator::new(&self.context.peer_manager, self.config());
         while let Some(resp) = peer_stream.next().await {
             match resp {
                 Ok(resp) => match resp.peer.and_then(|peer| peer.try_into().ok()) {
                     Some(peer) => {
-                        if peer_validator.validate_and_add_peer(peer).await? {
+                        if self.validate_and_add_peer(peer).await? {
                             num_added += 1;
                         }
                     },
@@ -161,8 +173,6 @@ impl OnConnect {
         if num_added > 0 {
             self.context
                 .publish_event(DhtEvent::NetworkDiscoveryPeersAdded(DhtNetworkDiscoveryRoundInfo {
-                    // TODO: num_new_neighbours could be incorrect here
-                    num_new_neighbours: 0,
                     num_new_peers: num_added,
                     num_duplicate_peers: 0,
                     num_succeeded: num_added,
@@ -171,6 +181,16 @@ impl OnConnect {
         }
 
         Ok(())
+    }
+
+    /// Returns true if the peer is a new peer
+    async fn validate_and_add_peer(&self, peer: UnvalidatedPeerInfo) -> Result<bool, NetworkDiscoveryError> {
+        let peer_validator = PeerValidator::new(self.config());
+        let maybe_existing_peer = self.context.peer_manager.find_by_public_key(&peer.public_key).await?;
+        let is_new_peer = maybe_existing_peer.is_none();
+        let valid_peer = peer_validator.validate_peer(peer, maybe_existing_peer)?;
+        self.context.peer_manager.add_peer(valid_peer).await?;
+        Ok(is_new_peer)
     }
 
     #[inline]

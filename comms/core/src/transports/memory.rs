@@ -134,11 +134,10 @@ mod test {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::runtime;
 
-    #[runtime::test]
+    #[tokio::test]
     async fn simple_listen_and_dial() -> Result<(), ::std::io::Error> {
-        let t = MemoryTransport::default();
+        let t = MemoryTransport;
 
         let (listener, addr) = t.listen(&"/memory/0".parse().unwrap()).await?;
 
@@ -162,9 +161,9 @@ mod test {
         Ok(())
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn unsupported_multiaddrs() {
-        let t = MemoryTransport::default();
+        let t = MemoryTransport;
 
         let err = t.listen(&"/ip4/127.0.0.1/tcp/0".parse().unwrap()).await.unwrap_err();
         assert!(matches!(err.kind(), io::ErrorKind::InvalidInput));

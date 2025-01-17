@@ -25,14 +25,15 @@
 use std::convert::{TryFrom, TryInto};
 
 use tari_common_types::types::{PublicKey, Signature};
+use tari_max_size::MaxSizeString;
 use tari_utilities::ByteArray;
 
 use crate::{
-    consensus::MaxSizeString,
     proto,
     transactions::transaction_components::{
         BuildInfo,
         CodeTemplateRegistration,
+        ConfidentialOutputData,
         SideChainFeature,
         TemplateType,
         ValidatorNodeRegistration,
@@ -55,8 +56,11 @@ impl From<SideChainFeature> for proto::types::side_chain_feature::SideChainFeatu
             SideChainFeature::ValidatorNodeRegistration(template_reg) => {
                 proto::types::side_chain_feature::SideChainFeature::ValidatorNodeRegistration(template_reg.into())
             },
-            SideChainFeature::TemplateRegistration(template_reg) => {
+            SideChainFeature::CodeTemplateRegistration(template_reg) => {
                 proto::types::side_chain_feature::SideChainFeature::TemplateRegistration(template_reg.into())
+            },
+            SideChainFeature::ConfidentialOutput(output_data) => {
+                proto::types::side_chain_feature::SideChainFeature::ConfidentialOutput(output_data.into())
             },
         }
     }
@@ -71,7 +75,10 @@ impl TryFrom<proto::types::side_chain_feature::SideChainFeature> for SideChainFe
                 Ok(SideChainFeature::ValidatorNodeRegistration(vn_reg.try_into()?))
             },
             proto::types::side_chain_feature::SideChainFeature::TemplateRegistration(template_reg) => {
-                Ok(SideChainFeature::TemplateRegistration(template_reg.try_into()?))
+                Ok(SideChainFeature::CodeTemplateRegistration(template_reg.try_into()?))
+            },
+            proto::types::side_chain_feature::SideChainFeature::ConfidentialOutput(output_data) => {
+                Ok(SideChainFeature::ConfidentialOutput(output_data.try_into()?))
             },
         }
     }
@@ -83,7 +90,7 @@ impl TryFrom<proto::types::ValidatorNodeRegistration> for ValidatorNodeRegistrat
 
     fn try_from(value: proto::types::ValidatorNodeRegistration) -> Result<Self, Self::Error> {
         Ok(Self::new(ValidatorNodeSignature::new(
-            PublicKey::from_bytes(&value.public_key).map_err(|e| e.to_string())?,
+            PublicKey::from_canonical_bytes(&value.public_key).map_err(|e| e.to_string())?,
             value
                 .signature
                 .map(Signature::try_from)
@@ -107,7 +114,7 @@ impl TryFrom<proto::types::TemplateRegistration> for CodeTemplateRegistration {
 
     fn try_from(value: proto::types::TemplateRegistration) -> Result<Self, Self::Error> {
         Ok(Self {
-            author_public_key: PublicKey::from_bytes(&value.author_public_key).map_err(|e| e.to_string())?,
+            author_public_key: PublicKey::from_canonical_bytes(&value.author_public_key).map_err(|e| e.to_string())?,
             author_signature: value
                 .author_signature
                 .map(Signature::try_from)
@@ -146,6 +153,25 @@ impl From<CodeTemplateRegistration> for proto::types::TemplateRegistration {
     }
 }
 
+// -------------------------------- ConfidentialOutputData -------------------------------- //
+impl TryFrom<proto::types::ConfidentialOutputData> for ConfidentialOutputData {
+    type Error = String;
+
+    fn try_from(value: proto::types::ConfidentialOutputData) -> Result<Self, Self::Error> {
+        Ok(ConfidentialOutputData {
+            claim_public_key: PublicKey::from_canonical_bytes(&value.claim_public_key).map_err(|e| e.to_string())?,
+        })
+    }
+}
+
+impl From<ConfidentialOutputData> for proto::types::ConfidentialOutputData {
+    fn from(value: ConfidentialOutputData) -> Self {
+        Self {
+            claim_public_key: value.claim_public_key.to_vec(),
+        }
+    }
+}
+
 // -------------------------------- TemplateType -------------------------------- //
 impl TryFrom<proto::types::TemplateType> for TemplateType {
     type Error = String;
@@ -156,6 +182,8 @@ impl TryFrom<proto::types::TemplateType> for TemplateType {
             proto::types::template_type::TemplateType::Wasm(wasm) => Ok(TemplateType::Wasm {
                 abi_version: wasm.abi_version.try_into().map_err(|_| "abi_version overflowed")?,
             }),
+            proto::types::template_type::TemplateType::Flow(_flow) => Ok(TemplateType::Flow),
+            proto::types::template_type::TemplateType::Manifest(_manifest) => Ok(TemplateType::Manifest),
         }
     }
 }
@@ -168,6 +196,16 @@ impl From<TemplateType> for proto::types::TemplateType {
                     proto::types::WasmInfo {
                         abi_version: abi_version.into(),
                     },
+                )),
+            },
+            TemplateType::Flow => Self {
+                template_type: Some(proto::types::template_type::TemplateType::Flow(
+                    proto::types::FlowInfo {},
+                )),
+            },
+            TemplateType::Manifest => Self {
+                template_type: Some(proto::types::template_type::TemplateType::Manifest(
+                    proto::types::ManifestInfo {},
                 )),
             },
         }

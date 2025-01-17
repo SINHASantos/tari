@@ -9,25 +9,19 @@
 //!
 //! [CommsBuilder]: crate::CommsBuilder
 #[macro_use]
-extern crate lazy_static;
-
-#[macro_use]
 mod macros;
 
 mod builder;
 pub use builder::{CommsBuilder, CommsBuilderError, CommsNode, UnspawnedCommsNode};
 
 pub mod connection_manager;
-pub use connection_manager::{validate_peer_addresses, PeerConnection, PeerConnectionError};
+pub use connection_manager::{PeerConnection, PeerConnectionError};
 
 pub mod connectivity;
 
 pub mod peer_manager;
 pub use peer_manager::{NodeIdentity, OrNotFound, PeerManager};
-
 pub mod framing;
-
-pub mod rate_limit;
 
 mod multiplexing;
 pub use multiplexing::Substream;
@@ -40,7 +34,6 @@ pub mod backoff;
 pub mod bounded_executor;
 pub mod memsocket;
 pub mod protocol;
-pub mod runtime;
 #[macro_use]
 pub mod message;
 pub mod net_address;
@@ -52,8 +45,10 @@ pub mod types;
 #[macro_use]
 pub mod utils;
 
-// TODO: Test utils should be part of a `tari_comms_test` crate
-// #[cfg(test)]
+pub mod peer_validator;
+
+mod bans;
+pub use bans::{BAN_DURATION_LONG, BAN_DURATION_SHORT};
 pub mod test_utils;
 pub mod traits;
 
@@ -62,10 +57,17 @@ pub mod traits;
 
 pub mod multiaddr {
     // Re-export so that client code does not have to have multiaddr as a dependency
-    pub use ::multiaddr::{Error, Multiaddr, Protocol};
+    pub use ::multiaddr::{multiaddr, Error, Multiaddr, Protocol};
 }
 
 pub use async_trait::async_trait;
 pub use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[cfg(feature = "rpc")]
 pub use tower::make::MakeService;
+
+/// Was the connection closed due to minimize_connections
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Minimized {
+    Yes,
+    No,
+}

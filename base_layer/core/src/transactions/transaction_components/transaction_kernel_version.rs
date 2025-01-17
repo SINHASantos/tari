@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, BorshSerialize, BorshDeserialize)]
 #[repr(u8)]
+#[borsh(use_discriminant = true)]
 pub enum TransactionKernelVersion {
     V0 = 0,
 }
@@ -21,6 +22,13 @@ impl TransactionKernelVersion {
         self as u8
     }
 }
+
+impl Default for TransactionKernelVersion {
+    fn default() -> Self {
+        Self::get_current_version()
+    }
+}
+
 impl TryFrom<u8> for TransactionKernelVersion {
     type Error = String;
 

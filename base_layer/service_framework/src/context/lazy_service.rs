@@ -95,12 +95,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::{
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        },
-        task::Poll,
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
     };
 
     use futures::future::{self, poll_fn};
@@ -153,10 +150,10 @@ mod test {
         assert!(fut.poll_unpin(&mut cx).is_ready());
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::redundant_closure)]
     #[should_panic]
-    fn call_before_ready_should_panic() {
+    async fn call_before_ready_should_panic() {
         let flag = Arc::new(AtomicBool::new(false));
         let fut = mock_fut(flag);
         let mut service = LazyService::new(fut, |_: ()| service_fn(|num: u8| future::ok::<_, ()>(num)));
@@ -164,6 +161,6 @@ mod test {
         let mut cx = panic_context();
 
         assert!(service.poll_ready(&mut cx).is_pending());
-        let _ = service.call(123);
+        let _ = service.call(123).await;
     }
 }

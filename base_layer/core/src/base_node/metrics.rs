@@ -45,7 +45,7 @@ pub fn target_difficulty_sha() -> &'static IntGauge {
     &METER
 }
 
-pub fn target_difficulty_monero() -> &'static IntGauge {
+pub fn target_difficulty_randomx() -> &'static IntGauge {
     static METER: Lazy<IntGauge> = Lazy::new(|| {
         tari_metrics::register_int_gauge(
             "base_node::blockchain::target_difficulty_monero",
@@ -130,19 +130,6 @@ pub fn rejected_blocks(height: u64, hash: &FixedHash) -> IntCounter {
         tari_metrics::register_int_counter_vec(
             "base_node::blockchain::rejected_blocks",
             "Number of block rejected by the base node",
-            &["height", "block_hash"],
-        )
-        .unwrap()
-    });
-
-    METER.with_label_values(&[&height.to_string(), &hash.to_hex()])
-}
-
-pub fn rejected_local_blocks(height: u64, hash: &FixedHash) -> IntCounter {
-    static METER: Lazy<IntCounterVec> = Lazy::new(|| {
-        tari_metrics::register_int_counter_vec(
-            "base_node::blockchain::rejected_local_blocks",
-            "Number of local block rejected by the base node",
             &["height", "block_hash"],
         )
         .unwrap()

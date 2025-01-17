@@ -29,9 +29,10 @@ use crate::peer_manager::{peer_id::PeerId, NodeId, Peer, PeerManagerError};
 type Predicate<'a, A> = Box<dyn FnMut(&A) -> bool + Send + 'a>;
 
 /// Sort options for `PeerQuery`
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub enum PeerQuerySortBy<'a> {
     /// No sorting
+    #[default]
     None,
     /// Sort by distance from a given node id
     DistanceFrom(&'a NodeId),
@@ -39,12 +40,6 @@ pub enum PeerQuerySortBy<'a> {
     LastConnected,
     /// Sort by distance from a given node followed by last connected
     DistanceFromLastConnected(&'a NodeId),
-}
-
-impl Default for PeerQuerySortBy<'_> {
-    fn default() -> Self {
-        PeerQuerySortBy::None
-    }
 }
 
 /// Represents a query which can be performed on the peer database
@@ -95,7 +90,6 @@ impl<'a> PeerQuery<'a> {
 
     /// Returns true if the specified select predicate returns true. If the
     /// select predicate was not specified, this always returns true.
-    // TODO: This mut is incorrect and can be removed
     #[allow(clippy::wrong_self_convention)]
     fn is_selected(&mut self, peer: &Peer) -> bool {
         self.select_predicate
@@ -220,18 +214,17 @@ mod test {
 
     use super::*;
     use crate::{
-        net_address::MultiaddressesWithStats,
-        peer_manager::{
-            node_id::NodeId,
-            peer::{Peer, PeerFlags},
-            PeerFeatures,
-        },
+        net_address::{MultiaddressesWithStats, PeerAddressSource},
+        peer_manager::{peer::PeerFlags, PeerFeatures},
     };
 
     fn create_test_peer(ban_flag: bool) -> Peer {
         let (_sk, pk) = RistrettoPublicKey::random_keypair(&mut OsRng);
         let node_id = NodeId::from_key(&pk);
-        let net_addresses = MultiaddressesWithStats::from("/ip4/1.2.3.4/tcp/8000".parse::<Multiaddr>().unwrap());
+        let net_addresses = MultiaddressesWithStats::from_addresses_with_source(
+            vec!["/ip4/1.2.3.4/tcp/8000".parse::<Multiaddr>().unwrap()],
+            &PeerAddressSource::Config,
+        );
         let mut peer = Peer::new(
             pk,
             node_id,
@@ -249,7 +242,7 @@ mod test {
 
     #[test]
     fn limit_query() {
-        // Create 20 peers were the 1st and last one is bad
+        // Create some good peers
         let db = HashmapDatabase::new();
         let mut id_counter = 0;
 
@@ -265,11 +258,7 @@ mod test {
 
     #[test]
     fn select_where_query() {
-        // Create peer manager with random peers
-        let mut sample_peers = Vec::new();
-        // Create 20 peers were the 1st and last one is bad
-        let _rng = rand::rngs::OsRng;
-        sample_peers.push(create_test_peer(true));
+        // Create some good and bad peers
         let db = HashmapDatabase::new();
         let mut id_counter = 0;
 
@@ -295,11 +284,7 @@ mod test {
 
     #[test]
     fn select_where_limit_query() {
-        // Create peer manager with random peers
-        let mut sample_peers = Vec::new();
-        // Create 20 peers were the 1st and last one is bad
-        let _rng = rand::rngs::OsRng;
-        sample_peers.push(create_test_peer(true));
+        // Create some good and bad peers
         let db = HashmapDatabase::new();
         let mut id_counter = 0;
 
@@ -336,11 +321,7 @@ mod test {
 
     #[test]
     fn sort_by_query() {
-        // Create peer manager with random peers
-        let mut sample_peers = Vec::new();
-        // Create 20 peers were the 1st and last one is bad
-        let _rng = rand::rngs::OsRng;
-        sample_peers.push(create_test_peer(true));
+        // Create some good and bad peers
         let db = HashmapDatabase::new();
         let mut id_counter = 0;
 

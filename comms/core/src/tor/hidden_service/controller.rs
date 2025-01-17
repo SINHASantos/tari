@@ -31,7 +31,6 @@ use tokio::{sync::broadcast, time};
 
 use crate::{
     multiaddr::Multiaddr,
-    runtime::task,
     socks,
     tor::{
         control_client::{
@@ -84,7 +83,7 @@ pub struct HiddenServiceController {
     proxied_port_mapping: PortMapping,
     socks_address_override: Option<Multiaddr>,
     socks_auth: socks::Authentication,
-    identity: Option<TorIdentity>,
+    pub identity: Option<TorIdentity>,
     hs_flags: HsFlags,
     is_authenticated: bool,
     proxy_opts: TorProxyOpts,
@@ -126,6 +125,7 @@ impl HiddenServiceController {
 
     pub async fn initialize_transport(&mut self) -> Result<SocksTransport, HiddenServiceControllerError> {
         self.connect_and_auth().await?;
+
         let socks_addr = self.get_socks_address().await?;
         Ok(SocksTransport::new(SocksConfig {
             proxy_address: socks_addr,
@@ -145,7 +145,7 @@ impl HiddenServiceController {
         let mut shutdown_signal = hidden_service.shutdown_signal.clone();
         let mut event_stream = self.client.as_ref().unwrap().get_event_stream();
 
-        task::spawn({
+        tokio::spawn({
             async move {
                 loop {
                     let either = future::select(&mut shutdown_signal, event_stream.next()).await;
@@ -365,7 +365,7 @@ impl HiddenServiceController {
             },
         };
 
-        let identity = self.identity.as_ref().map(Clone::clone).expect("already checked");
+        let identity = self.identity.clone().expect("already checked");
         debug!(
             target: LOG_TARGET,
             "Added hidden service with service id '{}' on port '{}'", identity.service_id, identity.onion_port

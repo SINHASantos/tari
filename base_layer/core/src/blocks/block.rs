@@ -32,7 +32,6 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use log::*;
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::{FixedHash, PrivateKey};
-use tari_utilities::hex::Hex;
 use thiserror::Error;
 
 use crate::{
@@ -41,7 +40,7 @@ use crate::{
     proof_of_work::ProofOfWork,
     transactions::{
         aggregated_body::AggregateBody,
-        tari_amount::MicroTari,
+        tari_amount::MicroMinotari,
         transaction_components::{
             KernelFeatures,
             OutputType,
@@ -59,10 +58,6 @@ use crate::{
 pub enum BlockValidationError {
     #[error("A transaction in the block failed to validate: `{0}`")]
     TransactionError(#[from] TransactionError),
-    #[error("Invalid input in block")]
-    InvalidInput,
-    #[error("Contains kernels or inputs that are not yet spendable")]
-    MaturityError,
     #[error("Mismatched {kind} MMR roots")]
     MismatchedMmrRoots { kind: &'static str },
     #[error("MMR size for {mmr_tree} does not match. Expected: {expected}, received: {actual}")]
@@ -71,14 +66,16 @@ pub enum BlockValidationError {
         expected: u64,
         actual: u64,
     },
-    #[error("The block weight ({actual_weight}) is above the maximum ({max_weight})")]
-    BlockTooLarge { actual_weight: u64, max_weight: u64 },
 }
 
-/// A Tari block. Blocks are linked together into a blockchain.
+/// A Minotari block. Blocks are linked together into a blockchain.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Block {
+    /// The BlockHeader contains all the metadata for the block, including proof of work, a link to the previous block
+    /// and the transaction kernels.
     pub header: BlockHeader,
+    /// The components of the block or transaction. The same struct can be used for either, since in Mimblewimble,
+    /// blocks consist of inputs, outputs and kernels, rather than transactions.
     pub body: AggregateBody,
 }
 
@@ -92,51 +89,26 @@ impl Block {
     }
 
     /// This function will calculate the total fees contained in a block
-    pub fn calculate_fees(&self) -> MicroTari {
+    pub fn calculate_fees(&self) -> MicroMinotari {
         self.body.kernels().iter().fold(0.into(), |sum, x| sum + x.fee)
-    }
-
-    /// This function will check spent kernel rules like tx lock height etc
-    pub fn check_kernel_rules(&self) -> Result<(), BlockValidationError> {
-        self.body.check_kernel_rules(self.header.height)?;
-        Ok(())
     }
 
     /// Run through the outputs of the block and check that
     /// 1. There is exactly ONE coinbase output
-    /// 1. The output's maturity is correctly set
-    /// 1. The amount is correct.
+    /// 2. The output's maturity is correctly set
+    /// 3. The amount is correct.
     pub fn check_coinbase_output(
         &self,
-        reward: MicroTari,
+        reward: MicroMinotari,
         consensus_constants: &ConsensusConstants,
         factories: &CryptoFactories,
     ) -> Result<(), BlockValidationError> {
         self.body.check_coinbase_output(
             reward,
-            consensus_constants.coinbase_lock_height(),
+            consensus_constants.coinbase_min_maturity(),
             factories,
             self.header.height,
         )?;
-        Ok(())
-    }
-
-    /// Run through the outputs of the block and check that
-    /// 1. only coinbase outputs may have metadata set,
-    /// 1. coinbase metadata length does not exceed its limit
-    pub fn check_output_features(&self, consensus_constants: &ConsensusConstants) -> Result<(), BlockValidationError> {
-        self.body
-            .check_output_features(consensus_constants.coinbase_output_features_extra_max_length())?;
-
-        Ok(())
-    }
-
-    /// Checks that all STXO rules (maturity etc) and kernel heights are followed
-    pub fn check_spend_rules(&self) -> Result<(), BlockValidationError> {
-        self.body.check_utxo_rules(self.header.height)?;
-        if self.body.max_kernel_timelock() > self.header.height {
-            return Err(BlockValidationError::MaturityError);
-        }
         Ok(())
     }
 
@@ -149,8 +121,8 @@ impl Block {
         Vec<TransactionOutput>,
         Vec<TransactionKernel>,
     ) {
-        let (i, o, k) = self.body.dissolve();
-        (self.header, i, o, k)
+        let (inputs, outputs, kernels) = self.body.dissolve();
+        (self.header, inputs, outputs, kernels)
     }
 
     /// Destroys the block and returns the pieces of the block: header, body
@@ -177,7 +149,7 @@ impl Display for Block {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         writeln!(f, "----------------- Block -----------------")?;
         writeln!(f, "--- Header ---")?;
-        writeln!(f, "Hash: {}", self.header.hash().to_hex())?;
+        writeln!(f, "Hash: {}", self.header.hash())?;
         writeln!(f, "{}", self.header)?;
         writeln!(f, "---  Body  ---")?;
         writeln!(f, "{}", self.body)
@@ -189,7 +161,6 @@ pub struct BlockBuilder {
     inputs: Vec<TransactionInput>,
     outputs: Vec<TransactionOutput>,
     kernels: Vec<TransactionKernel>,
-    total_fee: MicroTari,
 }
 
 impl BlockBuilder {
@@ -199,7 +170,6 @@ impl BlockBuilder {
             inputs: Vec::new(),
             outputs: Vec::new(),
             kernels: Vec::new(),
-            total_fee: MicroTari::from(0),
         }
     }
 
@@ -223,9 +193,6 @@ impl BlockBuilder {
 
     /// This function adds the provided transaction kernels to the block WITHOUT updating kernel_mmr_size in the header
     pub fn add_kernels(mut self, mut kernels: Vec<TransactionKernel>) -> Self {
-        for kernel in &kernels {
-            self.total_fee += kernel.fee;
-        }
         self.kernels.append(&mut kernels);
         self
     }
@@ -242,7 +209,7 @@ impl BlockBuilder {
     pub fn add_transaction(mut self, tx: Transaction) -> Self {
         let (inputs, outputs, kernels) = tx.body.dissolve();
         self = self.add_inputs(inputs);
-        self.header.output_mmr_size += outputs.len() as u64;
+        self.header.output_smt_size += outputs.len() as u64;
         self = self.add_outputs(outputs);
         self.header.kernel_mmr_size += kernels.len() as u64;
         self = self.add_kernels(kernels);
@@ -280,33 +247,34 @@ pub struct NewBlock {
     /// The block header.
     pub header: BlockHeader,
     /// Coinbase kernel of the block
-    pub coinbase_kernel: TransactionKernel,
-    pub coinbase_output: TransactionOutput,
+    pub coinbase_kernels: Vec<TransactionKernel>,
+    /// Coinbase output of the block
+    pub coinbase_outputs: Vec<TransactionOutput>,
     /// The scalar `s` component of the kernel excess signatures of the transactions contained in the block.
     pub kernel_excess_sigs: Vec<PrivateKey>,
 }
 
 impl From<&Block> for NewBlock {
     fn from(block: &Block) -> Self {
-        let coinbase_kernel = block
+        let coinbase_kernels = block
             .body
             .kernels()
-            .iter()
-            .find(|k| k.features.contains(KernelFeatures::COINBASE_KERNEL))
-            .cloned()
-            .expect("Invalid block given to NewBlock::from, no coinbase kernel");
-        let coinbase_output = block
+            .clone()
+            .into_iter()
+            .filter(|k| k.features.contains(KernelFeatures::COINBASE_KERNEL))
+            .collect();
+        let coinbase_outputs = block
             .body
             .outputs()
-            .iter()
-            .find(|o| o.features.output_type == OutputType::Coinbase)
-            .cloned()
-            .expect("Invalid block given to NewBlock::from, no coinbase output");
+            .clone()
+            .into_iter()
+            .filter(|o| o.features.output_type == OutputType::Coinbase)
+            .collect();
 
         Self {
             header: block.header.clone(),
-            coinbase_kernel,
-            coinbase_output,
+            coinbase_kernels,
+            coinbase_outputs,
             kernel_excess_sigs: block
                 .body
                 .kernels()

@@ -21,62 +21,112 @@
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use rand::{CryptoRng, Rng};
-use tari_common_types::types::{CommitmentFactory, PrivateKey, PublicKey};
-use tari_core::transactions::{
-    tari_amount::MicroTari,
-    test_helpers::{create_unblinded_output, TestParams as TestParamsHelpers},
-    transaction_components::{OutputFeatures, TransactionInput, UnblindedOutput},
+use tari_core::{
+    covenants::Covenant,
+    transactions::{
+        key_manager::{MemoryDbKeyManager, TransactionKeyManagerInterface},
+        tari_amount::MicroMinotari,
+        test_helpers::{create_wallet_output_with_data, TestParams},
+        transaction_components::{
+            encrypted_data::PaymentId,
+            OutputFeatures,
+            RangeProofType,
+            TransactionOutput,
+            TransactionOutputVersion,
+            WalletOutput,
+        },
+        transaction_protocol::sender::TransactionSenderMessage,
+    },
 };
-use tari_crypto::keys::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait};
-use tari_script::script;
-
-pub struct TestParams {
-    pub spend_key: PrivateKey,
-    pub change_spend_key: PrivateKey,
-    pub offset: PrivateKey,
-    pub nonce: PrivateKey,
-    pub public_nonce: PublicKey,
-}
-impl TestParams {
-    pub fn new<R: Rng + CryptoRng>(rng: &mut R) -> TestParams {
-        let r = PrivateKey::random(rng);
-        TestParams {
-            spend_key: PrivateKey::random(rng),
-            change_spend_key: PrivateKey::random(rng),
-            offset: PrivateKey::random(rng),
-            public_nonce: PublicKey::from_secret_key(&r),
-            nonce: r,
-        }
-    }
-}
+use tari_key_manager::key_manager_service::KeyManagerInterface;
+use tari_script::{inputs, script, TariScript};
 
 pub async fn make_input<R: Rng + CryptoRng>(
     _rng: &mut R,
-    val: MicroTari,
-    factory: &CommitmentFactory,
-) -> (TransactionInput, UnblindedOutput) {
-    let test_params = TestParamsHelpers::new();
-    let utxo = create_unblinded_output(script!(Nop), OutputFeatures::default(), &test_params, val);
-    (
-        utxo.as_transaction_input(factory)
-            .expect("Should be able to make transaction input"),
-        utxo,
+    val: MicroMinotari,
+    features: &OutputFeatures,
+    key_manager: &MemoryDbKeyManager,
+) -> WalletOutput {
+    let test_params = TestParams::new(key_manager).await;
+    create_wallet_output_with_data(TariScript::default(), features.clone(), &test_params, val, key_manager)
+        .await
+        .unwrap()
+}
+
+pub async fn make_fake_input_from_copy(
+    wallet_output: &mut WalletOutput,
+    key_manager: &MemoryDbKeyManager,
+) -> WalletOutput {
+    let (commitment_mask_key, script_key) = key_manager.get_next_commitment_mask_and_script_key().await.unwrap();
+    wallet_output.spending_key_id = commitment_mask_key.key_id;
+    wallet_output.script_key_id = script_key.key_id;
+    wallet_output.clone()
+}
+
+pub async fn create_wallet_output_from_sender_data(
+    info: &TransactionSenderMessage,
+    key_manager: &MemoryDbKeyManager,
+) -> WalletOutput {
+    let test_params = TestParams::new(key_manager).await;
+    let sender_data = info.single().unwrap();
+    let public_script_key = key_manager
+        .get_public_key_at_key_id(&test_params.script_key_id)
+        .await
+        .unwrap();
+    let encrypted_data = key_manager
+        .encrypt_data_for_recovery(
+            &test_params.commitment_mask_key_id,
+            None,
+            sender_data.amount.as_u64(),
+            PaymentId::Empty,
+        )
+        .await
+        .unwrap();
+    let mut utxo = WalletOutput::new(
+        TransactionOutputVersion::get_current_version(),
+        sender_data.amount,
+        test_params.commitment_mask_key_id.clone(),
+        sender_data.features.clone(),
+        sender_data.script.clone(),
+        inputs!(public_script_key),
+        test_params.script_key_id.clone(),
+        sender_data.sender_offset_public_key.clone(),
+        Default::default(),
+        0,
+        Covenant::default(),
+        encrypted_data,
+        MicroMinotari::zero(),
+        PaymentId::Empty,
+        key_manager,
     )
+    .await
+    .unwrap();
+    let output_message = TransactionOutput::metadata_signature_message(&utxo);
+    utxo.metadata_signature = key_manager
+        .get_receiver_partial_metadata_signature(
+            &test_params.commitment_mask_key_id,
+            &sender_data.amount.into(),
+            &sender_data.sender_offset_public_key,
+            &sender_data.ephemeral_public_nonce,
+            &TransactionOutputVersion::get_current_version(),
+            &output_message,
+            RangeProofType::BulletProofPlus,
+        )
+        .await
+        .unwrap();
+    utxo
 }
 
 pub async fn make_input_with_features<R: Rng + CryptoRng>(
     _rng: &mut R,
-    value: MicroTari,
-    factory: &CommitmentFactory,
-    features: Option<OutputFeatures>,
-) -> (TransactionInput, UnblindedOutput) {
-    let test_params = TestParamsHelpers::new();
-    let utxo = create_unblinded_output(script!(Nop), features.unwrap_or_default(), &test_params, value);
-    (
-        utxo.as_transaction_input(factory)
-            .expect("Should be able to make transaction input"),
-        utxo,
-    )
+    value: MicroMinotari,
+    features: OutputFeatures,
+    key_manager: &MemoryDbKeyManager,
+) -> WalletOutput {
+    let test_params = TestParams::new(key_manager).await;
+    create_wallet_output_with_data(script!(Nop).unwrap(), features, &test_params, value, key_manager)
+        .await
+        .unwrap()
 }
 
 /// This macro unlocks a Mutex or RwLock. If the lock is

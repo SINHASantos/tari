@@ -43,6 +43,9 @@ pub mod loader;
 mod network;
 pub use network::Network;
 mod common_config;
+mod config_list;
+mod dns_name_server_list;
+mod multiaddr_list;
 pub mod name_server;
 pub mod serializers;
 mod string_list;
@@ -51,7 +54,10 @@ pub mod utils;
 use std::{iter::FromIterator, net::SocketAddr};
 
 pub use common_config::CommonConfig;
+pub use config_list::ConfigList;
+pub use dns_name_server_list::{deserialize_dns_name_server_list, DnsNameServerList};
 use multiaddr::{Error, Multiaddr, Protocol};
+pub use multiaddr_list::MultiaddrList;
 pub use string_list::StringList;
 
 /// Interpret a string as either a socket address (first) or a multiaddr format string.
@@ -67,13 +73,13 @@ pub fn socket_or_multi(addr: &str) -> Result<Multiaddr, Error> {
 
 /// Implement this trait to specify custom configuration overrides for a network when loading the config
 pub trait ConfigOverrideProvider {
-    fn get_config_property_overrides(&self, default_network: Network) -> Vec<(String, String)>;
+    fn get_config_property_overrides(&self, network: &Network) -> Vec<(String, String)>;
 }
 
 pub struct NoConfigOverrides;
 
 impl ConfigOverrideProvider for NoConfigOverrides {
-    fn get_config_property_overrides(&self, _default_network: Network) -> Vec<(String, String)> {
+    fn get_config_property_overrides(&self, _network: &Network) -> Vec<(String, String)> {
         Vec::new()
     }
 }

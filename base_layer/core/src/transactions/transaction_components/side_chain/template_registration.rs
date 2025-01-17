@@ -23,8 +23,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::{PublicKey, Signature};
-
-use crate::consensus::{MaxSizeBytes, MaxSizeString};
+use tari_max_size::{MaxSizeBytes, MaxSizeString};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize, Serialize, BorshSerialize, BorshDeserialize)]
 pub struct CodeTemplateRegistration {
@@ -44,6 +43,10 @@ pub struct CodeTemplateRegistration {
 pub enum TemplateType {
     /// Indicates that the template is a WASM module
     Wasm { abi_version: u16 },
+    /// A flow template
+    Flow,
+    /// A manifest template
+    Manifest,
 }
 
 // -------------------------------- BuildInfo -------------------------------- //

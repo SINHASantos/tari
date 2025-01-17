@@ -20,7 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{iter, sync::Arc, time::Duration};
+use std::{iter, sync::Arc};
 
 use log::*;
 use tari_shutdown::ShutdownSignal;
@@ -36,13 +36,11 @@ use crate::{
         ConnectionManagerEvent,
         ConnectionManagerRequest,
         ConnectionManagerRequester,
-        ListenerInfo,
-        LivenessCheck,
-        LivenessStatus,
+        SelfLivenessCheck,
+        SelfLivenessStatus,
     },
     connectivity::{ConnectivityEventRx, ConnectivityManager, ConnectivityRequest, ConnectivityRequester},
     multiaddr::Multiaddr,
-    noise::NoiseConfig,
     peer_manager::{NodeIdentity, PeerManager},
     protocol::{
         ProtocolExtension,
@@ -127,12 +125,6 @@ impl UnspawnedCommsNode {
         self
     }
 
-    /// Set to true to enable self liveness checking for the configured public address
-    pub fn set_liveness_check(mut self, interval: Option<Duration>) -> Self {
-        self.builder = self.builder.set_liveness_check(interval);
-        self
-    }
-
     /// Spawn a new node using the specified [Transport](crate::transports::Transport).
     #[allow(clippy::too_many_lines)]
     pub async fn spawn_with_transport<TTransport>(self, transport: TTransport) -> Result<CommsNode, CommsBuilderError>
@@ -143,7 +135,7 @@ impl UnspawnedCommsNode {
         let UnspawnedCommsNode {
             builder,
             connection_manager_request_rx,
-            mut connection_manager_requester,
+            connection_manager_requester,
             connectivity_requester,
             connectivity_rx,
             node_identity,
@@ -155,7 +147,6 @@ impl UnspawnedCommsNode {
 
         let CommsBuilder {
             dial_backoff,
-            hidden_service_ctl,
             connection_manager_config,
             connectivity_config,
             ..
@@ -187,12 +178,9 @@ impl UnspawnedCommsNode {
 
         //---------------------------------- Connection Manager --------------------------------------------//
 
-        let noise_config = NoiseConfig::new(node_identity.clone());
-
         let mut connection_manager = ConnectionManager::new(
             connection_manager_config.clone(),
             transport.clone(),
-            noise_config,
             dial_backoff,
             connection_manager_request_rx,
             node_identity.clone(),
@@ -220,46 +208,37 @@ impl UnspawnedCommsNode {
             "Your node's network ID is '{}'",
             node_identity.node_id()
         );
-
-        let listening_info = connection_manager_requester.wait_until_listening().await?;
-        let mut hidden_service = None;
-        if let Some(mut ctl) = hidden_service_ctl {
-            ctl.set_proxied_addr(listening_info.bind_address());
-            let hs = ctl.create_hidden_service().await?;
-            let onion_addr = hs.get_onion_address();
-            if node_identity.public_address() != onion_addr {
-                node_identity.set_public_address(onion_addr);
-            }
-            hidden_service = Some(hs);
-        }
         info!(
             target: LOG_TARGET,
-            "Your node's public address is '{}'",
-            node_identity.public_address()
+            "Your node's public addresses are '{}'",
+            node_identity
+                .public_addresses()
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         // Spawn liveness check now that we have the final address
-        let liveness_watch = connection_manager_config
-            .liveness_self_check_interval
-            .map(|interval| {
-                LivenessCheck::spawn(
-                    transport,
-                    node_identity.public_address(),
-                    interval,
-                    shutdown_signal.clone(),
-                )
-            })
-            .unwrap_or_else(|| watch::channel(LivenessStatus::Disabled).1);
+        let public_addresses = node_identity.public_addresses();
+        let liveness_watch = if public_addresses.is_empty() {
+            watch::channel(SelfLivenessStatus::Disabled).1
+        } else {
+            connection_manager_config
+                .self_liveness_self_check_interval
+                .map(|interval| {
+                    SelfLivenessCheck::spawn(transport, public_addresses, interval, shutdown_signal.clone())
+                })
+                .unwrap_or_else(|| watch::channel(SelfLivenessStatus::Disabled).1)
+        };
 
         Ok(CommsNode {
             shutdown_signal,
             connection_manager_requester,
             connectivity_requester,
-            listening_info,
             node_identity,
             peer_manager,
             liveness_watch,
-            hidden_service,
             complete_signals: ext_context.drain_complete_signals(),
         })
     }
@@ -301,12 +280,8 @@ pub struct CommsNode {
     node_identity: Arc<NodeIdentity>,
     /// Shared PeerManager instance
     peer_manager: Arc<PeerManager>,
-    /// The bind addresses of the listener(s)
-    listening_info: ListenerInfo,
     /// Current liveness status
-    liveness_watch: watch::Receiver<LivenessStatus>,
-    /// `Some` if the comms node is configured to run via a hidden service, otherwise `None`
-    hidden_service: Option<tor::HiddenService>,
+    liveness_watch: watch::Receiver<SelfLivenessStatus>,
     /// The 'reciprocal' shutdown signals for each comms service
     complete_signals: Vec<ShutdownSignal>,
 }
@@ -315,6 +290,10 @@ impl CommsNode {
     /// Get a subscription to `ConnectionManagerEvent`s
     pub fn subscribe_connection_manager_events(&self) -> broadcast::Receiver<Arc<ConnectionManagerEvent>> {
         self.connection_manager_requester.get_event_subscription()
+    }
+
+    pub fn connection_manager_requester(&mut self) -> &mut ConnectionManagerRequester {
+        &mut self.connection_manager_requester
     }
 
     /// Get a subscription to `ConnectivityEvent`s
@@ -337,24 +316,9 @@ impl CommsNode {
         &self.node_identity
     }
 
-    /// Return the Ip/Tcp address that this node is listening on
-    pub fn listening_address(&self) -> &Multiaddr {
-        self.listening_info.bind_address()
-    }
-
-    /// Return [ListenerInfo]
-    pub fn listening_info(&self) -> &ListenerInfo {
-        &self.listening_info
-    }
-
     /// Returns the current liveness status
-    pub fn liveness_status(&self) -> LivenessStatus {
+    pub fn liveness_status(&self) -> SelfLivenessStatus {
         *self.liveness_watch.borrow()
-    }
-
-    /// Return the Ip/Tcp address that this node is listening on
-    pub fn hidden_service(&self) -> Option<&tor::HiddenService> {
-        self.hidden_service.as_ref()
     }
 
     /// Return a handle that is used to call the connectivity service.

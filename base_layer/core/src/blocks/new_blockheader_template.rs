@@ -22,15 +22,15 @@
 
 use std::fmt::{Display, Error, Formatter};
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
-use tari_common_types::types::{BlindingFactor, BlockHash};
+use tari_common_types::types::{BlockHash, PrivateKey};
 use tari_utilities::hex::Hex;
 
 use crate::{blocks::block_header::BlockHeader, proof_of_work::ProofOfWork};
-
 /// The NewBlockHeaderTemplate is used for the construction of a new mineable block. It contains all the metadata for
 /// the block that the Base Node is able to complete on behalf of a Miner.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, BorshSerialize, BorshDeserialize)]
 pub struct NewBlockHeaderTemplate {
     /// Version of the block
     pub version: u16,
@@ -40,9 +40,9 @@ pub struct NewBlockHeaderTemplate {
     pub prev_hash: BlockHash,
     /// Total accumulated sum of kernel offsets since genesis block. We can derive the kernel offset sum for *this*
     /// block from the total kernel offset of the previous block header.
-    pub total_kernel_offset: BlindingFactor,
+    pub total_kernel_offset: PrivateKey,
     /// Sum of script offsets for all kernels in this block.
-    pub total_script_offset: BlindingFactor,
+    pub total_script_offset: PrivateKey,
     /// Proof of work summary
     pub pow: ProofOfWork,
 }
@@ -58,15 +58,24 @@ impl NewBlockHeaderTemplate {
             pow: header.pow,
         }
     }
+
+    pub fn empty() -> Self {
+        Self {
+            version: 0,
+            height: 0,
+            prev_hash: Default::default(),
+            total_kernel_offset: Default::default(),
+            total_script_offset: Default::default(),
+            pow: Default::default(),
+        }
+    }
 }
 
 impl Display for NewBlockHeaderTemplate {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), Error> {
         let msg = format!(
             "Version: {}\nBlock height: {}\nPrevious block hash: {}\n",
-            self.version,
-            self.height,
-            self.prev_hash.to_hex(),
+            self.version, self.height, self.prev_hash,
         );
         fmt.write_str(&msg)?;
         fmt.write_str(&format!(

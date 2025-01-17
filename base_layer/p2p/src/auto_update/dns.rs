@@ -29,7 +29,8 @@ use std::{
 use anyhow::anyhow;
 use futures::future;
 use tari_common::configuration::bootstrap::ApplicationType;
-use tari_utilities::hex::{from_hex, Hex};
+use tari_utilities::hex::{from_hex, Hex, HexError};
+use thiserror::Error;
 
 use super::{error::AutoUpdateError, AutoUpdateConfig, Version};
 use crate::dns::{default_trust_anchor, DnsClient};
@@ -132,6 +133,18 @@ impl DnsSoftwareUpdate {
     }
 }
 
+#[derive(Debug, Error, PartialEq)]
+enum DnsError {
+    #[error("Could not convert into hex: `{0}`")]
+    HexError(String),
+}
+
+impl From<HexError> for DnsError {
+    fn from(e: HexError) -> Self {
+        DnsError::HexError(e.to_string())
+    }
+}
+
 /// Software update records
 #[derive(Debug, Clone)]
 pub struct UpdateSpec {
@@ -162,7 +175,7 @@ impl FromStr for UpdateSpec {
             .next()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow!("No hash in TXT record"))?;
-        let hash = from_hex(hash)?;
+        let hash = from_hex(hash).map_err(|e| DnsError::HexError(format!("{}", e)))?;
         if parts.next().is_some() {
             return Err(anyhow!("String contained too many parts"));
         }
@@ -191,7 +204,7 @@ impl Display for UpdateSpec {
 
 #[cfg(test)]
 mod test {
-    use trust_dns_client::{
+    use hickory_client::{
         op::Query,
         proto::{
             rr::{rdata, Name, RData, RecordType},
@@ -205,14 +218,14 @@ mod test {
 
     fn create_txt_record(contents: Vec<&str>) -> DnsResponse {
         let resp_query = Query::query(Name::from_str("test.local.").unwrap(), RecordType::A);
-        let mut record = Record::new();
-        record
-            .set_record_type(RecordType::TXT)
-            .set_data(Some(RData::TXT(rdata::TXT::new(
-                contents.into_iter().map(ToString::to_string).collect(),
-            ))));
 
-        mock::message(resp_query, vec![record], vec![], vec![]).into()
+        let origin = Name::parse("example.com.", None).unwrap();
+        let record = Record::from_rdata(
+            origin,
+            86300,
+            RData::TXT(rdata::TXT::new(contents.into_iter().map(ToString::to_string).collect())),
+        );
+        DnsResponse::from_message(mock::message(resp_query, vec![record], vec![], vec![])).unwrap()
     }
 
     mod update_spec {
@@ -232,14 +245,13 @@ mod test {
         use std::time::Duration;
 
         use super::*;
-        use crate::DEFAULT_DNS_NAME_SERVER;
 
         impl AutoUpdateConfig {
             fn get_test_defaults() -> Self {
                 Self {
                     override_from: None,
-                    name_server: DEFAULT_DNS_NAME_SERVER.parse().unwrap(),
-                    update_uris: vec!["test.local".to_string()],
+                    name_server: Default::default(),
+                    update_uris: vec!["test.local".to_string()].into(),
                     use_dnssec: true,
                     download_base_url: "https://tari-binaries.s3.amazonaws.com/latest".to_string(),
                     hashes_url: "https://raw.githubusercontent.com/tari-project/tari/development/meta/hashes.txt"

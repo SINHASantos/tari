@@ -22,10 +22,34 @@
 
 use thiserror::Error;
 
+use crate::{
+    common::{BanPeriod, BanReason},
+    transactions::transaction_components::TransactionError,
+};
+
 #[derive(Debug, Error)]
 pub enum UnconfirmedPoolError {
     #[error("The HashMap and BTreeMap are out of sync")]
     StorageOutofSync,
+    #[error("Mempool encountered an internal error: {0}")]
+    InternalError(String),
     #[error("Transaction has no kernels")]
     TransactionNoKernels,
+    #[error("Transaction error: `{0}`")]
+    TransactionError(#[from] TransactionError),
+}
+impl UnconfirmedPoolError {
+    pub fn get_ban_reason(&self) -> Option<BanReason> {
+        match self {
+            UnconfirmedPoolError::StorageOutofSync | UnconfirmedPoolError::InternalError(_) => None,
+            err @ UnconfirmedPoolError::TransactionNoKernels => Some(BanReason {
+                reason: err.to_string(),
+                ban_duration: BanPeriod::Long,
+            }),
+            err @ UnconfirmedPoolError::TransactionError(_) => Some(BanReason {
+                reason: format!("Invalid transaction: {}", err),
+                ban_duration: BanPeriod::Long,
+            }),
+        }
+    }
 }

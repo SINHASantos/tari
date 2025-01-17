@@ -20,17 +20,13 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::cmp::max;
-
-use super::{tari_amount::MicroTari, weight::TransactionWeight};
+use super::{tari_amount::MicroMinotari, weight::TransactionWeight};
 use crate::transactions::aggregated_body::AggregateBody;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Fee(TransactionWeight);
 
 impl Fee {
-    pub(crate) const MINIMUM_TRANSACTION_FEE: MicroTari = MicroTari(101);
-
     pub fn new(weight: TransactionWeight) -> Self {
         Self(weight)
     }
@@ -40,26 +36,26 @@ impl Fee {
     /// are guaranteed to hold between calculations. for e.g. fee(1,1,1,4) + fee(1,1,1,12) != fee(1,1,1,16)
     pub fn calculate(
         &self,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         num_kernels: usize,
         num_inputs: usize,
         num_outputs: usize,
-        rounded_metadata_byte_size: usize,
-    ) -> MicroTari {
-        let weight = self
-            .weighting()
-            .calculate(num_kernels, num_inputs, num_outputs, rounded_metadata_byte_size);
-        MicroTari::from(weight) * fee_per_gram
+        rounded_features_and_scripts_byte_size: usize,
+    ) -> MicroMinotari {
+        let weight = self.weighting().calculate(
+            num_kernels,
+            num_inputs,
+            num_outputs,
+            rounded_features_and_scripts_byte_size,
+        );
+        // Saturating multiplication is used here to prevent overflow only; invalid values will be caught with
+        // validation
+        MicroMinotari::from(weight.saturating_mul(fee_per_gram.0))
     }
 
-    pub fn calculate_body(&self, fee_per_gram: MicroTari, body: &AggregateBody) -> MicroTari {
-        let weight = self.weighting().calculate_body(body);
-        MicroTari::from(weight) * fee_per_gram
-    }
-
-    /// Normalizes the given fee returning a fee that is equal to or above the minimum fee
-    pub fn normalize(fee: MicroTari) -> MicroTari {
-        max(Self::MINIMUM_TRANSACTION_FEE, fee)
+    pub fn calculate_body(&self, fee_per_gram: MicroMinotari, body: &AggregateBody) -> std::io::Result<MicroMinotari> {
+        let weight = self.weighting().calculate_body(body)?;
+        Ok(MicroMinotari::from(weight) * fee_per_gram)
     }
 
     pub fn weighting(&self) -> &TransactionWeight {
@@ -100,8 +96,8 @@ mod test {
             f1.weighting().params().output_weight
         );
         assert_eq!(
-            f0.weighting().params().metadata_bytes_per_gram,
-            f1.weighting().params().metadata_bytes_per_gram
+            f0.weighting().params().features_and_scripts_bytes_per_gram,
+            f1.weighting().params().features_and_scripts_bytes_per_gram
         );
     }
 
@@ -117,7 +113,8 @@ mod test {
         let aggregate_body = AggregateBody::new(vec![input], vec![], vec![]);
         let fee = Fee::new(TransactionWeight::latest());
         assert_eq!(
-            fee.calculate_body(100.into(), &aggregate_body),
+            fee.calculate_body(100.into(), &aggregate_body)
+                .unwrap_or_else(|e| panic!("Failed with error: {}", e)),
             fee.calculate(100.into(), 0, 1, 0, 0)
         )
     }

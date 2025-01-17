@@ -73,7 +73,6 @@ impl SocksTransport {
 
     pub fn create_socks_tcp_transport() -> TcpTransport {
         let mut tcp_transport = TcpTransport::new();
-        tcp_transport.set_nodelay(true);
         tcp_transport.set_dns_resolver(SystemDnsResolver);
         tcp_transport
     }

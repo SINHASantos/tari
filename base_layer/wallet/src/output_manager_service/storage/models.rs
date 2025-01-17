@@ -20,15 +20,17 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, convert::TryFrom};
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use derivative::Derivative;
-use tari_common_types::types::{BlockHash, BulletRangeProof, Commitment, HashOutput, PrivateKey};
+use tari_common_types::{
+    transaction::TxId,
+    types::{BlockHash, Commitment, HashOutput},
+};
 use tari_core::transactions::{
-    transaction_components::UnblindedOutput,
-    transaction_protocol::RewindData,
-    CryptoFactories,
+    key_manager::{TariKeyId, TransactionKeyManagerInterface},
+    transaction_components::{encrypted_data::PaymentId, WalletOutput},
 };
 use tari_script::{ExecutionStack, TariScript};
 
@@ -37,119 +39,106 @@ use crate::output_manager_service::{
     storage::{OutputSource, OutputStatus},
 };
 
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
-pub struct DbUnblindedOutput {
+pub struct DbWalletOutput {
     pub commitment: Commitment,
-    pub unblinded_output: UnblindedOutput,
+    pub wallet_output: WalletOutput,
     pub hash: HashOutput,
     pub status: OutputStatus,
     pub mined_height: Option<u64>,
     pub mined_in_block: Option<BlockHash>,
-    pub mined_mmr_position: Option<u64>,
-    pub mined_timestamp: Option<NaiveDateTime>,
+    pub mined_timestamp: Option<DateTime<Utc>>,
     pub marked_deleted_at_height: Option<u64>,
     pub marked_deleted_in_block: Option<BlockHash>,
     pub spending_priority: SpendingPriority,
     pub source: OutputSource,
+    pub received_in_tx_id: Option<TxId>,
+    pub spent_in_tx_id: Option<TxId>,
+    pub payment_id: PaymentId,
 }
 
-impl DbUnblindedOutput {
-    pub fn from_unblinded_output(
-        output: UnblindedOutput,
-        factory: &CryptoFactories,
+impl DbWalletOutput {
+    pub async fn from_wallet_output<KM: TransactionKeyManagerInterface>(
+        output: WalletOutput,
+        key_manager: &KM,
         spend_priority: Option<SpendingPriority>,
         source: OutputSource,
-    ) -> Result<DbUnblindedOutput, OutputManagerStorageError> {
-        let tx_out = output.as_transaction_output(factory)?;
-        Ok(DbUnblindedOutput {
-            hash: tx_out.hash(),
-            commitment: tx_out.commitment,
-            unblinded_output: output,
+        received_in_tx_id: Option<TxId>,
+        spent_in_tx_id: Option<TxId>,
+    ) -> Result<DbWalletOutput, OutputManagerStorageError> {
+        let tx_output = output.to_transaction_output(key_manager).await?;
+        let payment_id = output.payment_id.clone();
+        Ok(DbWalletOutput {
+            hash: tx_output.hash(),
+            commitment: tx_output.commitment,
+            wallet_output: output,
             status: OutputStatus::NotStored,
             mined_height: None,
             mined_in_block: None,
-            mined_mmr_position: None,
             mined_timestamp: None,
             marked_deleted_at_height: None,
             marked_deleted_in_block: None,
             spending_priority: spend_priority.unwrap_or(SpendingPriority::Normal),
             source,
-        })
-    }
-
-    pub fn rewindable_from_unblinded_output(
-        output: UnblindedOutput,
-        factory: &CryptoFactories,
-        rewind_data: &RewindData,
-        spending_priority: Option<SpendingPriority>,
-        proof: Option<&BulletRangeProof>,
-        source: OutputSource,
-    ) -> Result<DbUnblindedOutput, OutputManagerStorageError> {
-        let tx_out = output.as_rewindable_transaction_output(factory, rewind_data, proof)?;
-        Ok(DbUnblindedOutput {
-            hash: tx_out.hash(),
-            commitment: tx_out.commitment,
-            unblinded_output: output,
-            status: OutputStatus::NotStored,
-            mined_height: None,
-            mined_in_block: None,
-            mined_mmr_position: None,
-            mined_timestamp: None,
-            marked_deleted_at_height: None,
-            marked_deleted_in_block: None,
-            spending_priority: spending_priority.unwrap_or(SpendingPriority::Normal),
-            source,
+            received_in_tx_id,
+            spent_in_tx_id,
+            payment_id,
         })
     }
 }
 
-impl From<DbUnblindedOutput> for UnblindedOutput {
-    fn from(value: DbUnblindedOutput) -> UnblindedOutput {
-        value.unblinded_output
+impl From<DbWalletOutput> for WalletOutput {
+    fn from(value: DbWalletOutput) -> WalletOutput {
+        value.wallet_output
     }
 }
 
-impl PartialEq for DbUnblindedOutput {
-    fn eq(&self, other: &DbUnblindedOutput) -> bool {
-        self.unblinded_output.value == other.unblinded_output.value
+impl PartialEq for DbWalletOutput {
+    fn eq(&self, other: &DbWalletOutput) -> bool {
+        self.wallet_output.value == other.wallet_output.value
     }
 }
 
-impl PartialOrd<DbUnblindedOutput> for DbUnblindedOutput {
+impl PartialOrd<DbWalletOutput> for DbWalletOutput {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.unblinded_output.value.partial_cmp(&other.unblinded_output.value)
+        Some(self.cmp(other))
     }
 }
 
-impl Ord for DbUnblindedOutput {
+impl Ord for DbWalletOutput {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.unblinded_output.value.cmp(&other.unblinded_output.value)
+        self.wallet_output.value.cmp(&other.wallet_output.value)
     }
 }
 
-impl Eq for DbUnblindedOutput {}
+impl Eq for DbWalletOutput {}
 
-#[derive(Debug, Clone)]
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SpendingPriority {
     Normal,
     HtlcSpendAsap,
-    Unknown,
 }
 
-impl From<u32> for SpendingPriority {
-    fn from(value: u32) -> Self {
+impl TryFrom<u32> for SpendingPriority {
+    type Error = String;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            0 => SpendingPriority::Normal,
-            1 => SpendingPriority::HtlcSpendAsap,
-            _ => SpendingPriority::Unknown,
+            0 => Ok(SpendingPriority::Normal),
+            1 => Ok(SpendingPriority::HtlcSpendAsap),
+            _ => Err(format!("Invalid spending priority value: {}", value)),
         }
     }
 }
 
-impl From<SpendingPriority> for u32 {
+impl From<SpendingPriority> for i32 {
     fn from(value: SpendingPriority) -> Self {
         match value {
-            SpendingPriority::Normal | SpendingPriority::Unknown => 0,
+            SpendingPriority::Normal => 0,
             SpendingPriority::HtlcSpendAsap => 1,
         }
     }
@@ -159,8 +148,7 @@ impl From<SpendingPriority> for u32 {
 #[derivative(Debug)]
 pub struct KnownOneSidedPaymentScript {
     pub script_hash: Vec<u8>,
-    #[derivative(Debug = "ignore")]
-    pub private_key: PrivateKey,
+    pub script_key_id: TariKeyId,
     pub script: TariScript,
     pub input: ExecutionStack,
     pub script_lock_height: u64,

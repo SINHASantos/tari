@@ -33,6 +33,8 @@ enum TariUtxoSort {
  */
 struct Balance;
 
+struct BulletRangeProof;
+
 struct ByteVector;
 
 /**
@@ -72,14 +74,17 @@ struct Contact;
 
 struct ContactsLivenessData;
 
+struct ContactsServiceHandle;
+
+/**
+ * A covenant allows a UTXO to specify some restrictions on how it is spent in a future transaction.
+ * See https://rfc.tari.com/RFC-0250_Covenants.html for details.
+ */
 struct Covenant;
 
 struct EmojiSet;
 
-/**
- * value: u64 + tag: [u8; 16]
- */
-struct EncryptedValue;
+struct EncryptedData;
 
 struct FeePerGramStat;
 
@@ -115,7 +120,7 @@ struct P2pConfig;
  * use tari_utilities::{hex::Hex, ByteArray};
  *
  * let mut rng = rand::thread_rng();
- * let _p1 = RistrettoPublicKey::from_bytes(&[
+ * let _p1 = RistrettoPublicKey::from_canonical_bytes(&[
  *     224, 196, 24, 247, 200, 217, 196, 205, 215, 57, 91, 147, 234, 18, 79, 58, 217, 144, 33,
  *     187, 104, 29, 252, 51, 2, 169, 217, 154, 46, 83, 230, 78,
  * ]);
@@ -143,7 +148,7 @@ struct RistrettoPublicKey;
  * use tari_utilities::{hex::Hex, ByteArray};
  *
  * let mut rng = rand::thread_rng();
- * let _k1 = RistrettoSecretKey::from_bytes(&[
+ * let _k1 = RistrettoSecretKey::from_canonical_bytes(&[
  *     1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
  *     0, 0,
  * ]);
@@ -154,6 +159,8 @@ struct RistrettoPublicKey;
 struct RistrettoSecretKey;
 
 struct TariAddress;
+
+struct TariBaseNodeState;
 
 struct TariCompletedTransactions;
 
@@ -186,7 +193,8 @@ struct TransportConfig;
 
 /**
  * An unblinded output is one where the value and spending key (blinding factor) are known. This can be used to
- * build both inputs and outputs (every input comes from an output)
+ * build both inputs and outputs (every input comes from an output). This is only used for import and export where
+ * serialization is important.
  */
 struct UnblindedOutput;
 
@@ -248,9 +256,18 @@ typedef struct TariAddress TariWalletAddress;
  *     "8063d85e151abee630e643e2b3dc47bfaeb8aa859c9d10d60847985f286aad19",
  * )
  * .unwrap();
- * let u_a = RistrettoSecretKey::from_bytes(b"10000000000000000000000010000000").unwrap();
- * let u_x = RistrettoSecretKey::from_bytes(b"a00000000000000000000000a0000000").unwrap();
- * let u_y = RistrettoSecretKey::from_bytes(b"a00000000000000000000000a0000000").unwrap();
+ * let u_a = RistrettoSecretKey::from_hex(
+ *     "a8fb609c5ab7cc07548b076b6c25cc3237c4526fb7a6dcb83b26f457b172c20a",
+ * )
+ * .unwrap();
+ * let u_x = RistrettoSecretKey::from_hex(
+ *     "0e689df8ad4ad9d2fd5aaf8cb0a66d85cb0d4b7a380405514d453625813b0b0f",
+ * )
+ * .unwrap();
+ * let u_y = RistrettoSecretKey::from_hex(
+ *     "f494050bd0d4ed0ec514cdce9430d0564df6b35d2a12b7daa0e99c7d94a06509",
+ * )
+ * .unwrap();
  * let sig = RistrettoComAndPubSig::new(ephemeral_commitment, ephemeral_pubkey, u_a, u_x, u_y);
  * ```
  *
@@ -260,12 +277,13 @@ typedef struct TariAddress TariWalletAddress;
  * ```rust
  * # use tari_crypto::ristretto::*;
  * # use tari_crypto::keys::*;
- * # use tari_crypto::hash::blake2::Blake256;
+ * # use blake2::Blake2b;
  * # use digest::Digest;
  * # use tari_crypto::commitment::HomomorphicCommitmentFactory;
  * # use tari_crypto::ristretto::pedersen::*;
  * use tari_crypto::ristretto::pedersen::commitment_factory::PedersenCommitmentFactory;
  * use tari_utilities::hex::Hex;
+ * use digest::consts::U64;
  *
  * let mut rng = rand::thread_rng();
  * let a_val = RistrettoSecretKey::random(&mut rng);
@@ -274,7 +292,7 @@ typedef struct TariAddress TariWalletAddress;
  * let a_nonce = RistrettoSecretKey::random(&mut rng);
  * let x_nonce = RistrettoSecretKey::random(&mut rng);
  * let y_nonce = RistrettoSecretKey::random(&mut rng);
- * let e = Blake256::digest(b"Maskerade"); // In real life, this should be strong Fiat-Shamir!
+ * let e = Blake2b::<U64>::digest(b"Maskerade"); // In real life, this should be strong Fiat-Shamir!
  * let factory = PedersenCommitmentFactory::default();
  * let commitment = factory.commit(&x_val, &a_val);
  * let pubkey = RistrettoPublicKey::from_secret_key(&y_val);
@@ -300,7 +318,14 @@ typedef struct OutputFeatures TariOutputFeatures;
 
 typedef struct Covenant TariCovenant;
 
-typedef struct EncryptedValue TariEncryptedValue;
+typedef struct EncryptedData TariEncryptedOpenings;
+
+/**
+ * Specify the range proof
+ */
+typedef struct BulletRangeProof RangeProof;
+
+typedef RangeProof TariRangeProof;
 
 typedef struct Contact TariContact;
 
@@ -329,7 +354,10 @@ struct TariUtxo {
   uint64_t value;
   uint64_t mined_height;
   uint64_t mined_timestamp;
+  uint64_t lock_height;
   uint8_t status;
+  const char *coinbase_extra;
+  const char *payment_id;
 };
 
 #ifdef __cplusplus
@@ -612,6 +640,24 @@ struct ByteVector *public_key_get_bytes(TariPublicKey *pk,
                                         int *error_out);
 
 /**
+ * Converts public key to emoji encoding
+ *
+ * ## Arguments
+ * `pk` - The pointer to a TariPublicKey
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut c_char` - Returns a pointer to a char array. Note that it returns empty
+ * if emoji is null or if there was an error creating the emoji string from public key
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+char *public_key_get_emoji_encoding(TariPublicKey *pk,
+                                    int *error_out);
+
+/**
  * Creates a TariPublicKey from a TariPrivateKey
  *
  * ## Arguments
@@ -698,25 +744,6 @@ struct ByteVector *tari_address_get_bytes(TariWalletAddress *address,
                                           int *error_out);
 
 /**
- * Creates a TariWalletAddress from a TariPrivateKey
- *
- * ## Arguments
- * `secret_key` - The pointer to a TariPrivateKey
- * `network` - an u8 indicating the network
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter.
- *
- * ## Returns
- * `*mut TariWalletAddress` - Returns a pointer to a TariWalletAddress
- *
- * # Safety
- * The ```private_key_destroy``` method must be called when finished with a private key to prevent a memory leak
- */
-TariWalletAddress *tari_address_from_private_key(TariPrivateKey *secret_key,
-                                                 unsigned int network,
-                                                 int *error_out);
-
-/**
  * Creates a TariWalletAddress from a char array
  *
  * ## Arguments
@@ -731,8 +758,8 @@ TariWalletAddress *tari_address_from_private_key(TariPrivateKey *secret_key,
  * # Safety
  * The ```public_key_destroy``` method must be called when finished with a TariWalletAddress to prevent a memory leak
  */
-TariWalletAddress *tari_address_from_hex(const char *address,
-                                         int *error_out);
+TariWalletAddress *tari_address_from_base58(const char *address,
+                                            int *error_out);
 
 /**
  * Creates a char array from a TariWalletAddress in emoji format
@@ -753,6 +780,127 @@ char *tari_address_to_emoji_id(TariWalletAddress *address,
                                int *error_out);
 
 /**
+ * Creates a char array from a TariWalletAddress's network
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut c_char` - Returns a pointer to a char array. Note that it returns empty
+ * if there was an error from TariWalletAddress
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+char *tari_address_network(TariWalletAddress *address,
+                           int *error_out);
+
+/**
+ * Returns the u8 representation of a TariWalletAddress's network
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `u8` - Returns u8 representing the network. On failure, returns 0. This may be valid so always check the error out
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+uint8_t tari_address_network_u8(TariWalletAddress *address,
+                                int *error_out);
+
+/**
+ * Returns the u8 representation of a TariWalletAddress's checksum
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `u8` - Returns u8 representing the checksum.. On failure, returns 0. This may be valid so always check the error out
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+uint8_t tari_address_checksum_u8(TariWalletAddress *address,
+                                 int *error_out);
+
+/**
+ * Creates a char array from a TariWalletAddress's features
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut c_char` - Returns a pointer to a char array. Note that it returns empty
+ * if there was an error from TariWalletAddress
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+char *tari_address_features(TariWalletAddress *address,
+                            int *error_out);
+
+/**
+ * Creates a char array from a TariWalletAddress's features
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * u8` - Returns u8 representing the features. On failure, returns 0. This may be valid so always check the error out
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+uint8_t tari_address_features_u8(TariWalletAddress *address,
+                                 int *error_out);
+
+/**
+ * Creates a public key from a TariWalletAddress's view key
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariPublicKey` - Returns a pointer to a TariPublicKey. Note that it returns null if there is no key present
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+TariPublicKey *tari_address_view_key(TariWalletAddress *address,
+                                     int *error_out);
+
+/**
+ * Creates a public key from a TariWalletAddress's spend key
+ *
+ * ## Arguments
+ * `address` - The pointer to a TariWalletAddress
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariPublicKey` - Returns a pointer to a TariPublicKey. Note that it returns null
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+TariPublicKey *tari_address_spend_key(TariWalletAddress *address,
+                                      int *error_out);
+
+/**
  * Creates a TariWalletAddress from a char array in emoji format
  *
  * ## Arguments
@@ -768,6 +916,21 @@ char *tari_address_to_emoji_id(TariWalletAddress *address,
  */
 TariWalletAddress *emoji_id_to_tari_address(const char *emoji,
                                             int *error_out);
+
+/**
+ * Does a lookup of the emoji character for a byte, using the emoji encoding of tari
+ *
+ * ## Arguments
+ * `byte` - u8 byte to lookup the emoji for
+ *
+ * ## Returns
+ * `*mut c_char` - Returns a pointer to a char array. Note that it returns empty
+ * if emoji is null or if there was an error creating the emoji string from TariWalletAddress
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+char *byte_to_emoji(uint8_t byte);
 
 /**
  * -------------------------------------------------------------------------------------------- ///
@@ -820,7 +983,7 @@ void commitment_and_public_signature_destroy(TariComAndPubSignature *compub_sig)
  * Creates an unblinded output
  *
  * ## Arguments
- * `amount` - The value of the UTXO in MicroTari
+ * `amount` - The value of the UTXO in MicroMinotari
  * `spending_key` - The private spending key
  * `source_address` - The tari address of the source of the transaction
  * `features` - Options for an output's structure or use
@@ -829,7 +992,7 @@ void commitment_and_public_signature_destroy(TariComAndPubSignature *compub_sig)
  * `script_private_key` - Tari script private key, k_S, is used to create the script signature
  * `covenant` - The covenant that will be executed when spending this output
  * `message` - The message that the transaction will have
- * `encrypted_value` - Encrypted value.
+ * `encrypted_data` - Encrypted data.
  * `minimum_value_promise` - The minimum value of the commitment that is proven by the range proof
  * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
  * as an out parameter.
@@ -839,7 +1002,8 @@ void commitment_and_public_signature_destroy(TariComAndPubSignature *compub_sig)
  * transaction is null
  *
  * # Safety
- * None
+ *  The ```tari_unblinded_output_destroy``` function must be called when finished with a TariUnblindedOutput to
+ * prevent a memory leak
  */
 TariUnblindedOutput *create_tari_unblinded_output(unsigned long long amount,
                                                   TariPrivateKey *spending_key,
@@ -850,9 +1014,10 @@ TariUnblindedOutput *create_tari_unblinded_output(unsigned long long amount,
                                                   TariPublicKey *sender_offset_public_key,
                                                   TariPrivateKey *script_private_key,
                                                   TariCovenant *covenant,
-                                                  TariEncryptedValue *encrypted_value,
+                                                  TariEncryptedOpenings *encrypted_data,
                                                   unsigned long long minimum_value_promise,
                                                   unsigned long long script_lock_height,
+                                                  TariRangeProof *range_proof,
                                                   int *error_out);
 
 /**
@@ -868,6 +1033,41 @@ TariUnblindedOutput *create_tari_unblinded_output(unsigned long long amount,
  * None
  */
 void tari_unblinded_output_destroy(TariUnblindedOutput *output);
+
+/**
+ * returns the TariUnblindedOutput as a json string
+ *
+ * ## Arguments
+ * `output` - The pointer to a TariUnblindedOutput
+ *
+ * ## Returns
+ * `*mut c_char` - Returns a pointer to a char array. Note that it returns an empty char array if
+ * TariUnblindedOutput is null or the position is invalid
+ *
+ * # Safety
+ *  The ```tari_unblinded_output_destroy``` function must be called when finished with a TariUnblindedOutput to
+ * prevent a memory leak
+ */
+char *tari_unblinded_output_to_json(TariUnblindedOutput *output,
+                                    int *error_out);
+
+/**
+ * Creates a TariUnblindedOutput from a char array
+ *
+ * ## Arguments
+ * `output_json` - The pointer to a char array which is json of the TariUnblindedOutput
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariUnblindedOutput` - Returns a pointer to a TariUnblindedOutput. Note that it returns ptr::null_mut()
+ * if key is null or if there was an error creating the TariUnblindedOutput from key
+ *
+ * # Safety
+ * The ```tari_unblinded_output_destroy``` function must be called when finished with a TariUnblindedOutput to
+ */
+TariUnblindedOutput *create_tari_unblinded_output_from_json(const char *output_json,
+                                                            int *error_out);
 
 /**
  * -------------------------------------------------------------------------------------------- ///
@@ -923,39 +1123,6 @@ TariUnblindedOutput *unblinded_outputs_get_at(struct TariUnblindedOutputs *outpu
 void unblinded_outputs_destroy(struct TariUnblindedOutputs *outputs);
 
 /**
- * Import an external UTXO into the wallet as a non-rewindable (i.e. non-recoverable) output. This will add a spendable
- * UTXO (as EncumberedToBeReceived) and create a faux completed transaction to record the event.
- *
- * ## Arguments
- * `wallet` - The TariWallet pointer
- * `amount` - The value of the UTXO in MicroTari
- * `spending_key` - The private spending key
- * `source_address` - The tari address of the source of the transaction
- * `features` - Options for an output's structure or use
- * `metadata_signature` - UTXO signature with the script offset private key, k_O
- * `sender_offset_public_key` - Tari script offset pubkey, K_O
- * `script_private_key` - Tari script private key, k_S, is used to create the script signature
- * `covenant` - The covenant that will be executed when spending this output
- * `message` - The message that the transaction will have
- * `encrypted_value` - Encrypted value.
- * `minimum_value_promise` - The minimum value of the commitment that is proven by the range proof
- * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
- * as an out parameter.
- *
- * ## Returns
- * `c_ulonglong` -  Returns the TransactionID of the generated transaction, note that it will be zero if the
- * transaction is null
- *
- * # Safety
- * None
- */
-unsigned long long wallet_import_external_utxo_as_non_rewindable(struct TariWallet *wallet,
-                                                                 TariUnblindedOutput *output,
-                                                                 TariWalletAddress *source_address,
-                                                                 const char *message,
-                                                                 int *error_out);
-
-/**
  * Get the TariUnblindedOutputs from a TariWallet
  *
  * ## Arguments
@@ -973,6 +1140,33 @@ unsigned long long wallet_import_external_utxo_as_non_rewindable(struct TariWall
  */
 struct TariUnblindedOutputs *wallet_get_unspent_outputs(struct TariWallet *wallet,
                                                         int *error_out);
+
+/**
+ * Import an external UTXO into the wallet as a non-rewindable (i.e. non-recoverable) output. This will add a spendable
+ * UTXO (as EncumberedToBeReceived) and create a faux completed transaction to record the event.
+ *
+ * ## Arguments
+ * `wallet` - The TariWallet pointer
+ * `output` - The pointer to a TariUnblindedOutput
+ * `range_proof` - The pointer to a TariRangeProof. If the 'range_proof_type' is 'RevealedValue', a default range proof
+ *  can be provided.
+ * `source_address` - The tari address of the source of the transaction
+ * `message` - The message that the transaction will have
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` -  Returns the TransactionID of the generated transaction, note that it will be zero if the
+ * transaction is null
+ *
+ * # Safety
+ * None
+ */
+unsigned long long wallet_import_external_utxo_as_non_rewindable(struct TariWallet *wallet,
+                                                                 TariUnblindedOutput *output,
+                                                                 TariWalletAddress *source_address,
+                                                                 const char *payment_id,
+                                                                 int *error_out);
 
 /**
  * -------------------------------------------------------------------------------------------- ///
@@ -1060,6 +1254,109 @@ TariPrivateKey *private_key_from_hex(const char *key,
 
 /**
  * -------------------------------------------------------------------------------------------- ///
+ * -------------------------------- Range Proof ----------------------------------------------- ///
+ * Creates a default TariRangeProof
+ *
+ * ## Arguments
+ * None.
+ *
+ * ## Returns
+ * `*mut TariRangeProof` - Returns a pointer to a TariRangeProof. Note that it returns ptr::null_mut()
+ * if bytes is null or if there was an error creating the TariRangeProof from bytes
+ *
+ * # Safety
+ * The ```range_proof_destroy``` method must be called when finished with a TariRangeProof to prevent a memory leak
+ */
+TariRangeProof *range_proof_default(void);
+
+/**
+ * Gets a TariRangeProof from a TariUnblindedOutput
+ *
+ * ## Arguments
+ * `unblinded_output` - The pointer to a TariUnblindedOutput
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariRangeProof` - Returns a TariRangeProof, note that it returns ptr::null_mut()
+ * if TariUnblindedOutput is null or position is invalid
+ *
+ * # Safety
+ * The ```range_proof_destroy``` method must be called when finished with a TariRangeProof to prevent a memory leak
+ */
+TariRangeProof *range_proof_get(TariUnblindedOutput *unblinded_output,
+                                int *error_out);
+
+/**
+ * Creates a TariRangeProof from a ByteVector
+ *
+ * ## Arguments
+ * `bytes` - The pointer to a ByteVector
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariRangeProof` - Returns a pointer to a TariRangeProof. Note that it returns ptr::null_mut()
+ * if bytes is null or if there was an error creating the TariRangeProof from bytes
+ *
+ * # Safety
+ * The ```range_proof_destroy``` method must be called when finished with a TariRangeProof to prevent a memory leak
+ */
+TariRangeProof *range_proof_from_bytes(struct ByteVector *bytes_ptr,
+                                       int *error_out);
+
+/**
+ * Creates a TariRangeProof from a char array
+ *
+ * ## Arguments
+ * `char_ptr` - The pointer to a char array which is hex encoded
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariRangeProof` - Returns a pointer to a TariRangeProof. Note that it returns ptr::null_mut()
+ * if proof is null or if there was an error creating the TariRangeProof from proof
+ *
+ * # Safety
+ * The ```range_proof_destroy``` method must be called when finished with a TariRangeProof to prevent a memory leak
+ */
+TariRangeProof *range_proof_from_hex(const char *char_ptr,
+                                     int *error_out);
+
+/**
+ * Gets a ByteVector from a TariRangeProof
+ *
+ * ## Arguments
+ * `proof` - The pointer to a TariRangeProof
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut ByteVectror` - Returns a pointer to a ByteVector. Note that it returns ptr::null_mut()
+ * if pk is null
+ *
+ * # Safety
+ * The ```byte_vector_destroy``` must be called when finished with a ByteVector to prevent a memory leak
+ */
+struct ByteVector *range_proof_get_bytes(TariRangeProof *proof_ptr,
+                                         int *error_out);
+
+/**
+ * Frees memory for a TariRangeProof
+ *
+ * ## Arguments
+ * `proof` - The pointer to a TariRangeProof
+ *
+ * ## Returns
+ * `()` - Does not return a value, equivalent to void in C
+ *
+ * # Safety
+ * None
+ */
+void range_proof_destroy(TariRangeProof *proof_ptr);
+
+/**
+ * -------------------------------------------------------------------------------------------- ///
  * --------------------------------------- Covenant --------------------------------------------///
  * Creates a TariCovenant from a ByteVector containing the covenant bytes
  *
@@ -1092,45 +1389,74 @@ void covenant_destroy(TariCovenant *covenant);
 
 /**
  * -------------------------------------------------------------------------------------------- ///
- * --------------------------------------- EncryptedValue --------------------------------------------///
- * Creates a TariEncryptedValue from a ByteVector containing the encrypted_value bytes
+ * --------------------------------------- EncryptedOpenings --------------------------------------------///
+ * Creates a TariEncryptedOpenings from a ByteVector containing the encrypted_data bytes
  *
  * ## Arguments
- * `encrypted_value_bytes` - The encrypted_value bytes as a ByteVector
+ * `encrypted_data_bytes` - The encrypted_data bytes as a ByteVector
  *
  * ## Returns
- * `TariEncryptedValue` - Returns an encrypted value. Note that it will be ptr::null_mut() if any argument is
+ * `TariEncryptedOpenings` - Returns encrypted data. Note that it will be ptr::null_mut() if any argument is
  * null or if there was an error with the contents of bytes
  *
  * # Safety
- * The ```encrypted_value_destroy``` function must be called when finished with a TariEncryptedValue to prevent a
+ * The ```encrypted_data_destroy``` function must be called when finished with a TariEncryptedOpenings to prevent a
  * memory leak
  */
-TariEncryptedValue *encrypted_value_create_from_bytes(const struct ByteVector *encrypted_value_bytes,
-                                                      int *error_out);
+TariEncryptedOpenings *encrypted_data_create_from_bytes(const struct ByteVector *encrypted_data_bytes,
+                                                        int *error_out);
 
 /**
- * Creates a ByteVector containing the encrypted_value bytes from a TariEncryptedValue
+ * Extract the transaction type from a TariEncryptedOpenings
  *
  * ## Arguments
- * `encrypted_value` - The encrypted_value as a TariEncryptedValue
+ * `encrypted_data` - The encrypted data
+ * `commitment_bytes` - The public commitment component as a ByteVector
+ * `wallet` - The TariWallet pointe
  *
  * ## Returns
- * `ByteVector` - Returns a ByteVector containing the encrypted_value bytes. Note that it will be ptr::null_mut() if
+ *  `0` => `PaymentToOther`,
+ *  `1` => `PaymentToSelf`,
+ *  `2` => `Burn`,
+ *  `3` => `CoinSplit`,
+ *  `4` => `CoinJoin`,
+ *  `5` => `ValidatorNodeRegistration`,
+ *  `6` => `ClaimAtomicSwap`,
+ *  `7` => `HtlcAtomicSwapRefund`,
+ *  `8` => `CodeTemplateRegistration`,
+ *  `9` => `ImportedUtxoNoneRewindable`,
+ *  `99` => `None`
+ *
+ * # Safety
+ * None
+ */
+unsigned int transaction_type_from_encrypted_data(const TariEncryptedOpenings *encrypted_data,
+                                                  const struct ByteVector *commitment_bytes,
+                                                  struct TariWallet *wallet,
+                                                  int *error_out);
+
+/**
+ * Creates a ByteVector containing the encrypted_data bytes from a TariEncryptedOpenings
+ *
+ * ## Arguments
+ * `encrypted_data` - The encrypted_data as a TariEncryptedOpenings
+ *
+ * ## Returns
+ * `ByteVector` - Returns a ByteVector containing the encrypted_data bytes. Note that it will be ptr::null_mut() if
  * any argument is null or if there was an error with the contents of bytes
  *
  * # Safety
- * The ```encrypted_value_destroy``` function must be called when finished with a TariEncryptedValue to prevent a
+ * The `encrypted_data_destroy` function must be called when finished with a TariEncryptedOpenings to prevent a
  * memory leak
  */
-struct ByteVector *encrypted_value_as_bytes(const TariEncryptedValue *encrypted_value,
-                                            int *error_out);
+struct ByteVector *encrypted_data_as_bytes(const TariEncryptedOpenings *encrypted_data,
+                                           int *error_out);
 
 /**
- * Frees memory for a TariEncryptedValue
+ * Frees memory for a TariEncryptedOpenings
  *
  * ## Arguments
- * `encrypted_value` - The pointer to a TariEncryptedValue
+ * `encrypted_data` - The pointer to a TariEncryptedOpenings
  *
  * ## Returns
  * `()` - Does not return a value, equivalent to void in C
@@ -1138,7 +1464,7 @@ struct ByteVector *encrypted_value_as_bytes(const TariEncryptedValue *encrypted_
  * # Safety
  * None
  */
-void encrypted_value_destroy(TariEncryptedValue *encrypted_value);
+void encrypted_data_destroy(TariEncryptedOpenings *encrypted_data);
 
 /**
  * -------------------------------------------------------------------------------------------- ///
@@ -1150,6 +1476,7 @@ void encrypted_value_destroy(TariEncryptedValue *encrypted_value);
  * `output_type` - The encoded value of the output type as a byte
  * `maturity` - The encoded value maturity as bytes
  * `metadata` - The metadata componenet as a ByteVector. It cannot be null
+ * `encrypted_data` - The encrypted_data component as a ByteVector. It can be null  to model a None value.
  * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
  * as an out parameter.
  *
@@ -1165,6 +1492,7 @@ TariOutputFeatures *output_features_create_from_bytes(unsigned char version,
                                                       unsigned short output_type,
                                                       unsigned long long maturity,
                                                       const struct ByteVector *metadata,
+                                                      unsigned short range_proof_type,
                                                       int *error_out);
 
 /**
@@ -1196,6 +1524,25 @@ void output_features_destroy(TariOutputFeatures *output_features);
  * None
  */
 struct TariSeedWords *seed_words_create(void);
+
+/**
+ * Create an instance of TariSeedWords from optionally encrypted cipher seed
+ *
+ * ## Arguments
+ * `cipher_bytes`: base58 encoded string pointer of the cipher bytes
+ * `passphrase`: optional passphrase to decrypt the cipher bytes
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `TariSeedWords` - Returns an  TariSeedWords instance
+ *
+ * # Safety
+ * Tari seed words need to be destroyed
+ */
+struct TariSeedWords *seed_words_create_from_cipher(const char *cipher_bytes,
+                                                    const char *passphrase,
+                                                    int *error_out);
 
 /**
  * Create a TariSeedWords instance containing the entire mnemonic wordlist for the requested language
@@ -1265,6 +1612,7 @@ char *seed_words_get_at(struct TariSeedWords *seed_words,
  * ## Returns
  * 'c_uchar' - Returns a u8 version of the `SeedWordPushResult` enum indicating whether the word was not a valid seed
  * word, if the push was successful and whether the push was successful and completed the full Seed Phrase.
+ * `passphrase` - Optional passphrase to use when generating the seed phrase
  *  `seed_words` is only modified in the event of a `SuccessfulPush`.
  *     '0' -> InvalidSeedWord
  *     '1' -> SuccessfulPush
@@ -1276,6 +1624,7 @@ char *seed_words_get_at(struct TariSeedWords *seed_words,
  */
 unsigned char seed_words_push_word(struct TariSeedWords *seed_words,
                                    const char *word,
+                                   const char *passphrase,
                                    int *error_out);
 
 /**
@@ -1312,6 +1661,7 @@ void seed_words_destroy(struct TariSeedWords *seed_words);
  */
 TariContact *contact_create(const char *alias,
                             TariWalletAddress *address,
+                            bool favourite,
                             int *error_out);
 
 /**
@@ -1331,6 +1681,24 @@ TariContact *contact_create(const char *alias,
  */
 char *contact_get_alias(TariContact *contact,
                         int *error_out);
+
+/**
+ * Gets the favourite status of the TariContact
+ *
+ * ## Arguments
+ * `contact` - The pointer to a TariContact
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `bool` - Returns a bool indicating the favourite status of a contact. NOTE this will return false if the pointer is
+ * null as well.
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string from rust to prevent a memory leak
+ */
+bool contact_get_favourite(TariContact *contact,
+                           int *error_out);
 
 /**
  * Gets the TariWalletAddress of the TariContact
@@ -1448,14 +1816,14 @@ TariWalletAddress *liveness_data_get_public_key(TariContactsLivenessData *livene
  *
  * ## Returns
  * `*mut c_int` - Returns a pointer to a c_int if the optional latency data (in milli-seconds (ms)) exists, with a
- * value of '-1' if it is None. Note that it also returns '-1' if liveness_data is null.
+ * value of '0' if it is None. Note that it also returns '0' if liveness_data is null.
  *
  * # Safety
  * The ```liveness_data_destroy``` method must be called when finished with a TariContactsLivenessData to prevent a
  * memory leak
  */
-int liveness_data_get_latency(TariContactsLivenessData *liveness_data,
-                              int *error_out);
+unsigned int liveness_data_get_latency(TariContactsLivenessData *liveness_data,
+                                       int *error_out);
 
 /**
  * Gets the last_seen time (in local time) from a TariContactsLivenessData
@@ -1858,7 +2226,7 @@ unsigned long long completed_transaction_get_timestamp(TariCompletedTransaction 
                                                        int *error_out);
 
 /**
- * Gets the message of a TariCompletedTransaction
+ * Gets the payment ID of a TariCompletedTransaction
  *
  * ## Arguments
  * `transaction` - The pointer to a TariCompletedTransaction
@@ -1872,8 +2240,8 @@ unsigned long long completed_transaction_get_timestamp(TariCompletedTransaction 
  * # Safety
  * The ```string_destroy``` method must be called when finished with string coming from rust to prevent a memory leak
  */
-const char *completed_transaction_get_message(TariCompletedTransaction *transaction,
-                                              int *error_out);
+const char *completed_transaction_get_payment_id(TariCompletedTransaction *transaction,
+                                                 int *error_out);
 
 /**
  * This function checks to determine if a TariCompletedTransaction was originally a TariPendingOutboundTransaction
@@ -1935,6 +2303,41 @@ unsigned long long completed_transaction_get_confirmations(TariCompletedTransact
  */
 int completed_transaction_get_cancellation_reason(TariCompletedTransaction *tx,
                                                   int *error_out);
+
+/**
+ * returns the TariCompletedTransaction as a json string
+ *
+ * ## Arguments
+ * `tx` - The pointer to a TariCompletedTransaction
+ *
+ * ## Returns
+ * `*mut c_char` - Returns a pointer to a char array. Note that it returns an empty char array if
+ * TariCompletedTransaction is null or the position is invalid
+ *
+ * # Safety
+ *  The ```completed_transaction_destroy``` function must be called when finished with a TariCompletedTransaction to
+ * prevent a memory leak
+ */
+char *tari_completed_transaction_to_json(TariCompletedTransaction *tx,
+                                         int *error_out);
+
+/**
+ * Creates a TariUnblindedOutput from a char array
+ *
+ * ## Arguments
+ * `tx_json` - The pointer to a char array which is json of the TariCompletedTransaction
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariCompletedTransaction` - Returns a pointer to a TariCompletedTransaction. Note that it returns
+ * ptr::null_mut() if key is null or if there was an error creating the TariCompletedTransaction from key
+ *
+ * # Safety
+ * The ```completed_transaction_destroy``` function must be called when finished with a TariCompletedTransaction to
+ */
+TariCompletedTransaction *create_tari_completed_transaction_from_json(const char *tx_json,
+                                                                      int *error_out);
 
 /**
  * Frees memory for a TariCompletedTransaction
@@ -2039,7 +2442,7 @@ unsigned long long pending_outbound_transaction_get_timestamp(TariPendingOutboun
                                                               int *error_out);
 
 /**
- * Gets the message of a TariPendingOutboundTransaction
+ * Gets the payment ID of a TariPendingOutboundTransaction
  *
  * ## Arguments
  * `transaction` - The pointer to a TariPendingOutboundTransaction
@@ -2054,8 +2457,8 @@ unsigned long long pending_outbound_transaction_get_timestamp(TariPendingOutboun
  *  The ```string_destroy``` method must be called when finished with a string coming from rust to prevent a memory
  * leak
  */
-const char *pending_outbound_transaction_get_message(TariPendingOutboundTransaction *transaction,
-                                                     int *error_out);
+const char *pending_outbound_transaction_get_payment_id(TariPendingOutboundTransaction *transaction,
+                                                        int *error_out);
 
 /**
  * Gets the status of a TariPendingOutboundTransaction
@@ -2170,7 +2573,7 @@ unsigned long long pending_inbound_transaction_get_timestamp(TariPendingInboundT
                                                              int *error_out);
 
 /**
- * Gets the message of a TariPendingInboundTransaction
+ * Gets the payment ID of a TariPendingInboundTransaction
  *
  * ## Arguments
  * `transaction` - The pointer to a TariPendingInboundTransaction
@@ -2185,8 +2588,8 @@ unsigned long long pending_inbound_transaction_get_timestamp(TariPendingInboundT
  *  The ```string_destroy``` method must be called when finished with a string coming from rust to prevent a memory
  * leak
  */
-const char *pending_inbound_transaction_get_message(TariPendingInboundTransaction *transaction,
-                                                    int *error_out);
+const char *pending_inbound_transaction_get_payment_id(TariPendingInboundTransaction *transaction,
+                                                       int *error_out);
 
 /**
  * Gets the status of a TariPendingInboundTransaction
@@ -2387,7 +2790,7 @@ void transport_config_destroy(TariTransportConfig *transport);
  * `database_path` - The database path char array pointer which. This is the folder path where the
  * database files will be created and the application has write access to
  * `discovery_timeout_in_secs`: specify how long the Discovery Timeout for the wallet is.
- * `network`: name of network to connect to. Valid values are: esmeralda, dibbler, igor, localnet, mainnet
+ * `exclude_dial_test_addresses`: exclude dialing of test addresses; this should be 'true' for production wallets
  * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
  * as an out parameter.
  *
@@ -2404,6 +2807,7 @@ TariCommsConfig *comms_config_create(const char *public_address,
                                      const char *datastore_path,
                                      unsigned long long discovery_timeout_in_secs,
                                      unsigned long long saf_message_duration_in_secs,
+                                     bool exclude_dial_test_addresses,
                                      int *error_out);
 
 /**
@@ -2438,12 +2842,54 @@ struct TariPublicKeys *comms_list_connected_public_keys(struct TariWallet *walle
                                                         int *error_out);
 
 /**
+ * Gets the length of the public keys vector
+ *
+ * ## Arguments
+ * `public_keys` - Pointer to TariPublicKeys
+ *
+ * ## Returns
+ * `c_uint` - Length of the TariPublicKeys vector, 0 if is null
+ *
+ * # Safety
+ * None
+ */
+unsigned int public_keys_get_length(const struct TariPublicKeys *public_keys, int *error_out);
+
+/**
+ * Gets a ByteVector at position in a EmojiSet
+ *
+ * ## Arguments
+ * `public_keys` - The pointer to a TariPublicKeys
+ * `position` - The integer position
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `ByteVector` - Returns a ByteVector. Note that the ByteVector will be null if ptr
+ * is null or if the position is invalid
+ *
+ * # Safety
+ * The ```byte_vector_destroy``` function must be called when finished with the ByteVector to prevent a memory leak.
+ */
+TariPublicKey *public_keys_get_at(const struct TariPublicKeys *public_keys,
+                                  unsigned int position,
+                                  int *error_out);
+
+/**
  * Creates a TariWallet
  *
  * ## Arguments
+ * Context - a pointer to some context used by all the callbacks
  * `config` - The TariCommsConfig pointer
  * `log_path` - An optional file path to the file where the logs will be written. If no log is required pass *null*
  * pointer.
+ * `log_verbosity` - how verbose should logging be as a c_int 0-5, or 11
+ *        0 => Off
+ *        1 => Error
+ *        2 => Warn
+ *        3 => Info
+ *        4 => Debug
+ *        5 | 11 => Trace // Cranked up to 11
  * `num_rolling_log_files` - Specifies how many rolling log files to produce, if no rolling files are wanted then set
  * this to 0
  * `size_per_log_file_bytes` - Specifies the size, in bytes, at which the logs files will roll over, if no
@@ -2451,8 +2897,11 @@ struct TariPublicKeys *comms_list_connected_public_keys(struct TariWallet *walle
  * `passphrase` - An optional string that represents the passphrase used to
  * encrypt/decrypt the databases for this wallet. If it is left Null no encryption is used. If the databases have been
  * encrypted then the correct passphrase is required or this function will fail.
+ * `seed_passphrase` - an optional string, if present this will derypt the seed words
  * `seed_words` - An optional instance of TariSeedWords, used to create a wallet for recovery purposes.
  * If this is null, then a new master key is created for the wallet.
+ * `dns_seed_name_servers_str` - An optional list of DNS servers to query to get hold of the seed peer list.
+ * `use_dns_sec` - Use DNSSEC when querying the DNS servers.
  * `callback_received_transaction` - The callback function pointer matching the function signature. This will be
  * called when an inbound transaction is received.
  * `callback_received_transaction_reply` - The callback function
@@ -2531,31 +2980,91 @@ struct TariPublicKeys *comms_list_connected_public_keys(struct TariWallet *walle
  * # Safety
  * The ```wallet_destroy``` method must be called when finished with a TariWallet to prevent a memory leak
  */
-struct TariWallet *wallet_create(TariCommsConfig *config,
+struct TariWallet *wallet_create(void *context,
+                                 TariCommsConfig *config,
                                  const char *log_path,
+                                 int log_verbosity,
                                  unsigned int num_rolling_log_files,
                                  unsigned int size_per_log_file_bytes,
                                  const char *passphrase,
+                                 const char *seed_passphrase,
                                  const struct TariSeedWords *seed_words,
                                  const char *network_str,
-                                 void (*callback_received_transaction)(TariPendingInboundTransaction*),
-                                 void (*callback_received_transaction_reply)(TariCompletedTransaction*),
-                                 void (*callback_received_finalized_transaction)(TariCompletedTransaction*),
-                                 void (*callback_transaction_broadcast)(TariCompletedTransaction*),
-                                 void (*callback_transaction_mined)(TariCompletedTransaction*),
-                                 void (*callback_transaction_mined_unconfirmed)(TariCompletedTransaction*, uint64_t),
-                                 void (*callback_faux_transaction_confirmed)(TariCompletedTransaction*),
-                                 void (*callback_faux_transaction_unconfirmed)(TariCompletedTransaction*, uint64_t),
-                                 void (*callback_transaction_send_result)(unsigned long long, TariTransactionSendStatus*),
-                                 void (*callback_transaction_cancellation)(TariCompletedTransaction*, uint64_t),
-                                 void (*callback_txo_validation_complete)(uint64_t, uint64_t),
-                                 void (*callback_contacts_liveness_data_updated)(TariContactsLivenessData*),
-                                 void (*callback_balance_updated)(TariBalance*),
-                                 void (*callback_transaction_validation_complete)(uint64_t, uint64_t),
-                                 void (*callback_saf_messages_received)(void),
-                                 void (*callback_connectivity_status)(uint64_t),
+                                 const char *dns_seeds_str,
+                                 const char *dns_seed_name_servers_str,
+                                 bool use_dns_sec,
+                                 void (*callback_received_transaction)(void *context,
+                                                                       TariPendingInboundTransaction*),
+                                 void (*callback_received_transaction_reply)(void *context,
+                                                                             TariCompletedTransaction*),
+                                 void (*callback_received_finalized_transaction)(void *context,
+                                                                                 TariCompletedTransaction*),
+                                 void (*callback_transaction_broadcast)(void *context,
+                                                                        TariCompletedTransaction*),
+                                 void (*callback_transaction_mined)(void *context,
+                                                                    TariCompletedTransaction*),
+                                 void (*callback_transaction_mined_unconfirmed)(void *context,
+                                                                                TariCompletedTransaction*,
+                                                                                uint64_t),
+                                 void (*callback_faux_transaction_confirmed)(void *context,
+                                                                             TariCompletedTransaction*),
+                                 void (*callback_faux_transaction_unconfirmed)(void *context,
+                                                                               TariCompletedTransaction*,
+                                                                               uint64_t),
+                                 void (*callback_transaction_send_result)(void *context,
+                                                                          unsigned long long,
+                                                                          TariTransactionSendStatus*),
+                                 void (*callback_transaction_cancellation)(void *context,
+                                                                           TariCompletedTransaction*,
+                                                                           uint64_t),
+                                 void (*callback_txo_validation_complete)(void *context,
+                                                                          uint64_t,
+                                                                          uint64_t),
+                                 void (*callback_contacts_liveness_data_updated)(void *context,
+                                                                                 TariContactsLivenessData*),
+                                 void (*callback_balance_updated)(void *context, TariBalance*),
+                                 void (*callback_transaction_validation_complete)(void *context,
+                                                                                  uint64_t,
+                                                                                  uint64_t),
+                                 void (*callback_saf_messages_received)(void *context),
+                                 void (*callback_connectivity_status)(void *context, uint64_t),
+                                 void (*callback_wallet_scanned_height)(void *context, uint64_t),
+                                 void (*callback_base_node_state)(void *context,
+                                                                  struct TariBaseNodeState*),
                                  bool *recovery_in_progress,
                                  int *error_out);
+
+/**
+ * Retrieves the version of an app that last accessed the wallet database
+ *
+ * ## Arguments
+ * `config` - The TariCommsConfig pointer
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ * ## Returns
+ * `*mut c_char` - Returns the pointer to the hexadecimal representation of the signature and
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string coming from rust to prevent a memory leak
+ */
+char *wallet_get_last_version(TariCommsConfig *config,
+                              int *error_out);
+
+/**
+ * Retrieves the network of an app that last accessed the wallet database
+ *
+ * ## Arguments
+ * `config` - The TariCommsConfig pointer
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ * ## Returns
+ * `*mut c_char` - Returns the pointer to the hexadecimal representation of the signature and
+ *
+ * # Safety
+ * The ```string_destroy``` method must be called when finished with a string coming from rust to prevent a memory leak
+ */
+char *wallet_get_last_network(TariCommsConfig *config,
+                              int *error_out);
 
 /**
  * Retrieves the balance from a wallet
@@ -2582,9 +3091,9 @@ TariBalance *wallet_get_balance(struct TariWallet *wallet,
  * * `page_size` - A number of items per page,
  * * `sorting` - An enum representing desired sorting,
  * * `dust_threshold` - A value filtering threshold. Outputs whose values are <= `dust_threshold` are not listed in the
- * result.
+ *   result.
  * * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null.
- * Functions as an out parameter.
+ *   Functions as an out parameter.
  *
  * ## Returns
  * `*mut TariVector` - Returns a struct with an array pointer, length and capacity (needed for proper destruction
@@ -2609,11 +3118,11 @@ struct TariVector *wallet_get_utxos(struct TariWallet *wallet,
  * ## Arguments
  * * `wallet` - The TariWallet pointer,
  * * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null.
- * Functions as an out parameter.
+ *   Functions as an out parameter.
  *
  * ## Returns
  * `*mut TariVector` - Returns a struct with an array pointer, length and capacity (needed for proper destruction
- * after use).
+ *     after use).
  *
  * ## States
  * 0 - Unspent
@@ -2647,7 +3156,7 @@ struct TariVector *wallet_get_all_utxos(struct TariWallet *wallet,
  * * `number_of_splits` - The number of times to split the amount
  * * `fee_per_gram` - The transaction fee
  * * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null.
- * Functions as an out parameter.
+ *   Functions as an out parameter.
  *
  * ## Returns
  * `c_ulonglong` - Returns the transaction id.
@@ -2671,7 +3180,7 @@ uint64_t wallet_coin_split(struct TariWallet *wallet,
  *   (see `Commitment::to_hex()`)
  * * `fee_per_gram` - The transaction fee
  * * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null.
- * Functions as an out parameter.
+ *   Functions as an out parameter.
  *
  * ## Returns
  * `TariVector` - Returns the transaction id.
@@ -2788,10 +3297,27 @@ bool wallet_verify_message_signature(struct TariWallet *wallet,
  * # Safety
  * None
  */
-bool wallet_add_base_node_peer(struct TariWallet *wallet,
+bool wallet_set_base_node_peer(struct TariWallet *wallet,
                                TariPublicKey *public_key,
                                const char *address,
                                int *error_out);
+
+/**
+ * Gets all seed peers known by the wallet
+ *
+ * ## Arguments
+ * `wallet` - The TariWallet pointer
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `TariPublicKeys` - Returns a list of all known public keys
+ *
+ * # Safety
+ * None
+ */
+struct TariPublicKeys *wallet_get_seed_peers(struct TariWallet *wallet,
+                                             int *error_out);
 
 /**
  * Upserts a TariContact to the TariWallet. If the contact does not exist it will be Inserted. If it does exist the
@@ -2939,9 +3465,30 @@ unsigned long long wallet_send_transaction(struct TariWallet *wallet,
                                            unsigned long long amount,
                                            struct TariVector *commitments,
                                            unsigned long long fee_per_gram,
-                                           const char *message,
                                            bool one_sided,
+                                           const char *payment_id_string,
                                            int *error_out);
+
+/**
+ * Sends a TariPendingOutboundTransaction
+ *
+ * ## Arguments
+ * `wallet` - The TariWallet pointer
+ * `destination` - The TariWalletAddress pointer of the peer
+ * `fee_per_gram` - The transaction fee
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `unsigned long long` - Returns 0 if unsuccessful or the TxId of the sent transaction if successful
+ *
+ * # Safety
+ * None
+ */
+unsigned long long scrape_wallet(struct TariWallet *wallet,
+                                 TariWalletAddress *destination,
+                                 unsigned long long fee_per_gram,
+                                 int *error_out);
 
 /**
  * Gets a fee estimate for an amount
@@ -2958,7 +3505,7 @@ unsigned long long wallet_send_transaction(struct TariWallet *wallet,
  * as an out parameter.
  *
  * ## Returns
- * `unsigned long long` - Returns 0 if unsuccessful or the fee estimate in MicroTari if successful
+ * `unsigned long long` - Returns 0 if unsuccessful or the fee estimate in MicroMinotari if successful
  *
  * # Safety
  * None
@@ -2967,8 +3514,8 @@ unsigned long long wallet_get_fee_estimate(struct TariWallet *wallet,
                                            unsigned long long amount,
                                            struct TariVector *commitments,
                                            unsigned long long fee_per_gram,
-                                           unsigned long long num_kernels,
-                                           unsigned long long num_outputs,
+                                           unsigned int num_kernels,
+                                           unsigned int num_outputs,
                                            int *error_out);
 
 /**
@@ -3192,7 +3739,7 @@ TariCompletedTransaction *wallet_get_cancelled_transaction_by_id(struct TariWall
                                                                  int *error_out);
 
 /**
- * Get the TariWalletAddress from a TariWallet
+ * Get the interactive TariWalletAddress from a TariWallet
  *
  * ## Arguments
  * `wallet` - The TariWallet pointer
@@ -3206,8 +3753,26 @@ TariCompletedTransaction *wallet_get_cancelled_transaction_by_id(struct TariWall
  * # Safety
  * The ```tari_address_destroy``` method must be called when finished with a TariWalletAddress to prevent a memory leak
  */
-TariWalletAddress *wallet_get_tari_address(struct TariWallet *wallet,
-                                           int *error_out);
+TariWalletAddress *wallet_get_tari_interactive_address(struct TariWallet *wallet,
+                                                       int *error_out);
+
+/**
+ * Get the one_sided only TariWalletAddress from a TariWallet
+ *
+ * ## Arguments
+ * `wallet` - The TariWallet pointer
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut TariWalletAddress` - returns the address, note that ptr::null_mut() is returned
+ * if wc is null
+ *
+ * # Safety
+ * The ```tari_address_destroy``` method must be called when finished with a TariWalletAddress to prevent a memory leak
+ */
+TariWalletAddress *wallet_get_tari_one_sided_address(struct TariWallet *wallet,
+                                                     int *error_out);
 
 /**
  * Cancel a Pending Transaction
@@ -3413,7 +3978,7 @@ bool wallet_is_recovery_in_progress(struct TariWallet *wallet,
  *
  * ## Arguments
  * `wallet` - The TariWallet pointer.
- * `base_node_public_key` - The TariPublicKey pointer of the Base Node the recovery process will use
+ * `base_node_public_keys` - An optional TariPublicKeys pointer of the Base Nodes the recovery process must use
  * `recovery_progress_callback` - The callback function pointer that will be used to asynchronously communicate
  * progress to the client. The first argument of the callback is an event enum encoded as a u8 as follows:
  * ```
@@ -3433,7 +3998,7 @@ bool wallet_is_recovery_in_progress(struct TariWallet *wallet,
  *     - ConnectedToBaseNode, 0, 1
  *     - ConnectionToBaseNodeFailed, number of retries, retry limit
  *     - Progress, current block, total number of blocks
- *     - Completed, total number of UTXO's recovered, MicroTari recovered,
+ *     - Completed, total number of UTXO's recovered, MicroMinotari recovered,
  *     - ScanningRoundFailed, number of retries, retry limit
  *     - RecoveryFailed, 0, 0
  *
@@ -3444,7 +4009,7 @@ bool wallet_is_recovery_in_progress(struct TariWallet *wallet,
  *       started
  *     - In Progress callbacks will be of the form (n, m) where n < m
  *     - If the process completed successfully then the final `Completed` callback will return how many UTXO's were
- *       scanned and how much MicroTari was recovered
+ *       scanned and how much MicroMinotari was recovered
  *     - If there is an error in the connection process then the `ConnectionToBaseNodeFailed` will be returned
  *     - If there is a minor error in scanning then `ScanningRoundFailed` will be returned and another connection/sync
  *       attempt will be made
@@ -3466,8 +4031,11 @@ bool wallet_is_recovery_in_progress(struct TariWallet *wallet,
  * None
  */
 bool wallet_start_recovery(struct TariWallet *wallet,
-                           TariPublicKey *base_node_public_key,
-                           void (*recovery_progress_callback)(uint8_t, uint64_t, uint64_t),
+                           struct TariPublicKeys *base_node_public_keys,
+                           void (*recovery_progress_callback)(void *context,
+                                                              uint8_t,
+                                                              uint64_t,
+                                                              uint64_t),
                            const char *recovered_output_message,
                            int *error_out);
 
@@ -3740,6 +4308,196 @@ unsigned long long fee_per_gram_stat_get_max_fee_per_gram(TariFeePerGramStat *fe
  * None
  */
 void fee_per_gram_stat_destroy(TariFeePerGramStat *fee_per_gram_stat);
+
+/**
+ * Returns a ptr to the ContactsServiceHandle for use with chat
+ *
+ * ## Arguments
+ * `wallet` - The wallet instance
+ * `error_out` - Pointer to an int which will be modified
+ *
+ * ## Returns
+ * `*mut ContactsServiceHandle` an opaque pointer used in chat sideloading initialization
+ *
+ * # Safety
+ * You should release the returned pointer after it's been used to initialize chat using `contacts_handle_destroy`
+ */
+struct ContactsServiceHandle *contacts_handle(struct TariWallet *wallet,
+                                              int *error_out);
+
+/**
+ * Frees memory for a ContactsServiceHandle
+ *
+ * ## Arguments
+ * `contacts_handle` - The pointer to a ContactsServiceHandle
+ *
+ * ## Returns
+ * `()` - Does not return a value, equivalent to void in C
+ *
+ * # Safety
+ * None
+ */
+void contacts_handle_destroy(struct ContactsServiceHandle *contacts_handle);
+
+/**
+ * Extracts a `NodeId` represented as a vector of bytes wrapped into a `ByteVector`
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut ByteVector` - Returns a ByteVector or null if the NodeId is None.
+ *
+ * # Safety
+ * None
+ */
+struct ByteVector *basenode_state_get_node_id(struct TariBaseNodeState *ptr,
+                                              int *error_out);
+
+/**
+ * Extracts height of th elongest chain from the `TariBaseNodeState`
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a TariBaseNodeState
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - The current chain height, or the block number of the longest valid chain, or `None` if there is no
+ * chain
+ *
+ * # Safety
+ * None
+ */
+unsigned long long basenode_state_get_height_of_the_longest_chain(struct TariBaseNodeState *ptr,
+                                                                  int *error_out);
+
+/**
+ * Extracts a best block hash [`FixedHash`] represented as a vector of bytes wrapped into a `ByteVector`
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut ByteVector` - The block hash of the current tip of the longest valid chain. Returns a ByteVector or null if
+ * the NodeId is None.
+ *
+ * # Safety
+ * None
+ */
+struct ByteVector *basenode_state_get_best_block(struct TariBaseNodeState *ptr,
+                                                 int *error_out);
+
+/**
+ * Extracts a timestamp of the best block
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - Timestamp of the tip block in the longest valid chain
+ *
+ * # Safety
+ * None
+ */
+unsigned long long basenode_state_get_best_block_timestamp(struct TariBaseNodeState *ptr,
+                                                           int *error_out);
+
+/**
+ * Extracts a pruning horizon
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - The configured number of blocks back from the tip that this database tracks. A value of 0 indicates
+ * that pruning mode is disabled and the node will keep full blocks from the time it was set. If pruning horizon
+ * was previously enabled, previously pruned blocks will remain pruned. If set from initial sync, full blocks
+ * are preserved from genesis (i.e. the database is in full archival mode).
+ *
+ * # Safety
+ * None
+ */
+unsigned long long basenode_state_get_pruning_horizon(struct TariBaseNodeState *ptr,
+                                                      int *error_out);
+
+/**
+ * Extracts a pruned height
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - The height of the pruning horizon. This indicates from what height a full block can be provided
+ * (exclusive). If `pruned_height` is equal to the `best_block_height` no blocks can be
+ * provided. Archival nodes wil always have an `pruned_height` of zero.
+ *
+ * # Safety
+ * None
+ */
+unsigned long long basenode_state_get_pruned_height(struct TariBaseNodeState *ptr,
+                                                    int *error_out);
+
+/**
+ * Denotes whether a base node is fully synced or not.
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `*mut c_ulonglong` - An array of the length of 2 `c_ulonglong`
+ *
+ * # Safety
+ * None
+ */
+bool basenode_state_get_is_node_synced(struct TariBaseNodeState *ptr,
+                                       int *error_out);
+
+/**
+ * Extracts the timestamp of when the base node was last updated.
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - Timestamp.
+ *
+ * # Safety
+ * None
+ */
+unsigned long long basenode_state_get_node_updated_at(struct TariBaseNodeState *ptr,
+                                                      int *error_out);
+
+/**
+ * Extracts the connection latency to the base node.
+ *
+ * ## Arguments
+ * `ptr` - The pointer to a `TariBaseNodeState`
+ * `error_out` - Pointer to an int which will be modified to an error code should one occur, may not be null. Functions
+ * as an out parameter.
+ *
+ * ## Returns
+ * `c_ulonglong` - Latency value measured in microseconds.
+ *
+ * # Safety
+ * None
+ */
+unsigned long long basenode_state_get_latency(struct TariBaseNodeState *ptr,
+                                              int *error_out);
 
 #ifdef __cplusplus
 } // extern "C"

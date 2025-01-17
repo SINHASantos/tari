@@ -23,7 +23,10 @@
 use tari_comms_dht::outbound::DhtOutboundError;
 use thiserror::Error;
 
-use crate::base_node::comms_interface::CommsInterfaceError;
+use crate::{
+    base_node::{comms_interface::CommsInterfaceError, service::initializer::ExtractBlockError},
+    common::{BanPeriod, BanReason},
+};
 
 #[derive(Debug, Error)]
 pub enum BaseNodeServiceError {
@@ -35,4 +38,21 @@ pub enum BaseNodeServiceError {
     InvalidRequest(String),
     #[error("Invalid response error: `{0}`")]
     InvalidResponse(String),
+    #[error("Invalid block error: `{0}`")]
+    InvalidBlockMessage(#[from] ExtractBlockError),
+}
+
+impl BaseNodeServiceError {
+    pub fn get_ban_reason(&self) -> Option<BanReason> {
+        match self {
+            BaseNodeServiceError::CommsInterfaceError(e) => e.get_ban_reason(),
+            BaseNodeServiceError::DhtOutboundError(_) => None,
+            err @ BaseNodeServiceError::InvalidRequest(_) |
+            err @ BaseNodeServiceError::InvalidResponse(_) |
+            err @ BaseNodeServiceError::InvalidBlockMessage(_) => Some(BanReason {
+                reason: err.to_string(),
+                ban_duration: BanPeriod::Long,
+            }),
+        }
+    }
 }

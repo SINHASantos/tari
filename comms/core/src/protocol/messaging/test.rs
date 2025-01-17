@@ -33,25 +33,30 @@ use tokio::{
     time,
 };
 
-use super::protocol::{MessagingEvent, MessagingEventReceiver, MessagingProtocol, MESSAGING_PROTOCOL};
+use super::protocol::{MessagingEventReceiver, MessagingProtocol};
 use crate::{
     message::{InboundMessage, MessageTag, MessagingReplyRx, OutboundMessage},
     multiplexing::Substream,
     net_address::MultiaddressesWithStats,
     peer_manager::{NodeId, NodeIdentity, Peer, PeerFeatures, PeerFlags, PeerManager},
-    protocol::{messaging::SendFailReason, ProtocolEvent, ProtocolNotification},
-    runtime,
-    runtime::task,
+    protocol::{
+        messaging::{MessagingEvent, SendFailReason},
+        ProtocolEvent,
+        ProtocolId,
+        ProtocolNotification,
+    },
     test_utils::{
         mocks::{create_connectivity_mock, create_peer_connection_mock_pair, ConnectivityManagerMockState},
         node_id,
         node_identity::build_node_identity,
-        transport,
     },
     types::{CommsDatabase, CommsPublicKey},
 };
 
 static TEST_MSG1: Bytes = Bytes::from_static(b"TEST_MSG1");
+static TEST_MSG2: Bytes = Bytes::from_static(b"TEST_MSG2");
+
+static MESSAGING_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"test/msg");
 
 async fn spawn_messaging_protocol() -> (
     Arc<PeerManager>,
@@ -77,14 +82,16 @@ async fn spawn_messaging_protocol() -> (
     let (events_tx, events_rx) = broadcast::channel(100);
 
     let msg_proto = MessagingProtocol::new(
+        MESSAGING_PROTOCOL_ID.clone(),
         requester,
         proto_rx,
         request_rx,
         events_tx,
         inbound_msg_tx,
         shutdown.to_signal(),
-    );
-    task::spawn(msg_proto.run());
+    )
+    .set_message_received_event_enabled(true);
+    tokio::spawn(msg_proto.run());
 
     (
         peer_manager,
@@ -98,43 +105,56 @@ async fn spawn_messaging_protocol() -> (
     )
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn new_inbound_substream_handling() {
-    let (peer_manager, _, _, proto_tx, _, mut inbound_msg_rx, mut events_rx, _shutdown) =
+    let (peer_manager, _, conn_man_mock, proto_tx, outbound_msg_tx, mut inbound_msg_rx, mut events_rx, _shutdown) =
         spawn_messaging_protocol().await;
 
     let expected_node_id = node_id::random();
     let (_, pk) = CommsPublicKey::random_keypair(&mut OsRng);
-    peer_manager
-        .add_peer(Peer::new(
-            pk.clone(),
-            expected_node_id.clone(),
-            MultiaddressesWithStats::default(),
-            PeerFlags::empty(),
-            PeerFeatures::COMMUNICATION_CLIENT,
-            Default::default(),
-            Default::default(),
-        ))
-        .await
-        .unwrap();
+    let peer1 = Peer::new(
+        pk.clone(),
+        expected_node_id.clone(),
+        MultiaddressesWithStats::default(),
+        PeerFlags::empty(),
+        PeerFeatures::COMMUNICATION_CLIENT,
+        Default::default(),
+        Default::default(),
+    );
+    peer_manager.add_peer(peer1.clone()).await.unwrap();
 
-    // Create connected memory sockets - we use each end of the connection as if they exist on different nodes
-    let (_, muxer_ours, mut muxer_theirs) = transport::build_multiplexed_connections().await;
+    let (_, pk) = CommsPublicKey::random_keypair(&mut OsRng);
+    let peer2 = Peer::new(
+        pk.clone(),
+        expected_node_id.clone(),
+        MultiaddressesWithStats::default(),
+        PeerFlags::empty(),
+        PeerFeatures::COMMUNICATION_CLIENT,
+        Default::default(),
+        Default::default(),
+    );
 
-    // Notify the messaging protocol that a new substream has been established that wants to talk the messaging.
-    let stream_ours = muxer_ours.get_yamux_control().open_stream().await.unwrap();
+    let (_, conn1_state, conn2, _conn2_state) = create_peer_connection_mock_pair(peer1.clone(), peer2.clone()).await;
+
+    conn_man_mock.add_active_connection(conn2).await;
+
+    let (reply_tx, _reply_rx) = oneshot::channel();
+    let out_msg = OutboundMessage {
+        tag: MessageTag::new(),
+        reply: reply_tx.into(),
+        peer_node_id: peer1.node_id.clone(),
+        body: TEST_MSG1.clone(),
+    };
+    outbound_msg_tx.send(out_msg).unwrap();
+
+    let stream_theirs = conn1_state.next_incoming_substream().await.unwrap();
     proto_tx
         .send(ProtocolNotification::new(
-            MESSAGING_PROTOCOL.clone(),
-            ProtocolEvent::NewInboundSubstream(expected_node_id.clone(), stream_ours),
+            MESSAGING_PROTOCOL_ID.clone(),
+            ProtocolEvent::NewInboundSubstream(expected_node_id.clone(), stream_theirs),
         ))
         .await
         .unwrap();
-
-    let stream_theirs = muxer_theirs.incoming_mut().next().await.unwrap();
-    let mut framed_theirs = MessagingProtocol::framed(stream_theirs);
-
-    framed_theirs.send(TEST_MSG1.clone()).await.unwrap();
 
     let in_msg = time::timeout(Duration::from_secs(5), inbound_msg_rx.recv())
         .await
@@ -148,12 +168,12 @@ async fn new_inbound_substream_handling() {
         .await
         .unwrap()
         .unwrap();
-    unpack_enum!(MessagingEvent::MessageReceived(node_id, tag) = &*event);
+    unpack_enum!(MessagingEvent::MessageReceived(node_id, tag) = &event);
     assert_eq!(tag, &expected_tag);
     assert_eq!(*node_id, expected_node_id);
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn send_message_request() {
     let (_, node_identity, conn_man_mock, _, request_tx, _, _, _shutdown) = spawn_messaging_protocol().await;
 
@@ -179,7 +199,7 @@ async fn send_message_request() {
     assert_eq!(peer_conn_mock1.call_count(), 1);
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn send_message_dial_failed() {
     let (_, _, conn_manager_mock, _, request_tx, _, mut event_tx, _shutdown) = spawn_messaging_protocol().await;
 
@@ -190,7 +210,7 @@ async fn send_message_dial_failed() {
     request_tx.send(out_msg).unwrap();
 
     let event = event_tx.recv().await.unwrap();
-    unpack_enum!(MessagingEvent::OutboundProtocolExited(_node_id) = &*event);
+    unpack_enum!(MessagingEvent::OutboundProtocolExited(_node_id) = &event);
     let reply = reply_rx.await.unwrap().unwrap_err();
     unpack_enum!(SendFailReason::PeerDialFailed = reply);
 
@@ -199,7 +219,7 @@ async fn send_message_dial_failed() {
     assert!(calls.iter().all(|evt| evt.starts_with("DialPeer")));
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn send_message_substream_bulk_failure() {
     const NUM_MSGS: usize = 10;
     let (_, node_identity, conn_manager_mock, _, mut request_tx, _, mut events_rx, _shutdown) =
@@ -262,11 +282,11 @@ async fn send_message_substream_bulk_failure() {
         .await
         .unwrap()
         .unwrap();
-    unpack_enum!(MessagingEvent::OutboundProtocolExited(node_id) = &*event);
+    unpack_enum!(MessagingEvent::OutboundProtocolExited(node_id) = &event);
     assert_eq!(node_id, peer_node_id);
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn many_concurrent_send_message_requests() {
     const NUM_MSGS: usize = 100;
     let (_, _, conn_man_mock, _, request_tx, _, _, _shutdown) = spawn_messaging_protocol().await;
@@ -314,7 +334,7 @@ async fn many_concurrent_send_message_requests() {
     assert_eq!(peer_conn_mock1.call_count(), 1);
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn many_concurrent_send_message_requests_that_fail() {
     const NUM_MSGS: usize = 100;
     let (_, _, _, _, request_tx, _, _, _shutdown) = spawn_messaging_protocol().await;
@@ -340,4 +360,103 @@ async fn many_concurrent_send_message_requests_that_fail() {
     let unordered = reply_rxs.into_iter().collect::<FuturesUnordered<_>>();
     let results = unordered.collect::<Vec<_>>().await;
     assert!(results.into_iter().map(|r| r.unwrap()).all(|r| r.is_err()));
+}
+
+#[tokio::test]
+async fn new_inbound_substream_only_single_session_permitted() {
+    let (peer_manager, node_identity_1, conn_man_mock, proto_tx, _, mut inbound_msg_rx, _, _shutdown) =
+        spawn_messaging_protocol().await;
+
+    let expected_node_id = node_id::random();
+    let peer1 = node_identity_1.to_peer();
+
+    let (_, pk) = CommsPublicKey::random_keypair(&mut OsRng);
+    let peer2 = Peer::new(
+        pk.clone(),
+        expected_node_id.clone(),
+        MultiaddressesWithStats::default(),
+        PeerFlags::empty(),
+        PeerFeatures::COMMUNICATION_CLIENT,
+        Default::default(),
+        Default::default(),
+    );
+    peer_manager.add_peer(peer2.clone()).await.unwrap();
+
+    let (conn1, conn1_state, _, conn2_state) = create_peer_connection_mock_pair(peer1.clone(), peer2.clone()).await;
+
+    conn_man_mock.add_active_connection(conn1).await;
+
+    // Create connected memory sockets - we use each end of the connection as if they exist on different nodes
+    // let (_, muxer_ours, mut muxer_theirs) = transport::build_multiplexed_connections().await;
+    // Spawn a task to deal with incoming substreams
+    tokio::spawn({
+        let expected_node_id = expected_node_id.clone();
+        async move {
+            while let Some(stream_theirs) = conn2_state.next_incoming_substream().await {
+                proto_tx
+                    .send(ProtocolNotification::new(
+                        MESSAGING_PROTOCOL_ID.clone(),
+                        ProtocolEvent::NewInboundSubstream(expected_node_id.clone(), stream_theirs),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+
+    // Open first stream
+    let stream_ours = conn1_state.open_substream().await.unwrap();
+    let mut framed_ours = MessagingProtocol::framed(stream_ours);
+    framed_ours.send(TEST_MSG1.clone()).await.unwrap();
+
+    // Message comes through
+    let in_msg = time::timeout(Duration::from_secs(5), inbound_msg_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(in_msg.source_peer, expected_node_id);
+    assert_eq!(in_msg.body, TEST_MSG1);
+
+    // Check the second stream closes immediately
+    let stream_ours2 = conn1_state.open_substream().await.unwrap();
+
+    let mut framed_ours2 = MessagingProtocol::framed(stream_ours2);
+    // Check that it eventually exits. The first send will initiate the substream and send. Once the other side closes
+    // the connection it takes a few sends for that to be detected and the substream to be closed.
+    loop {
+        // This message will not go through
+        if let Err(e) = framed_ours2.send(TEST_MSG2.clone()).await {
+            assert_eq!(
+                e.to_string().split(':').nth(1).map(|s| s.trim()),
+                Some("connection is closed"),
+                "Expected connection to be closed but got '{e}'"
+            );
+            break;
+        }
+    }
+
+    // First stream still open
+    framed_ours.send(TEST_MSG1.clone()).await.unwrap();
+    let in_msg = time::timeout(Duration::from_secs(5), inbound_msg_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(in_msg.source_peer, expected_node_id);
+    assert_eq!(in_msg.body, TEST_MSG1);
+
+    // Close the first
+    framed_ours.close().await.unwrap();
+
+    // Open another one for messaging
+    let stream_ours = conn1_state.open_substream().await.unwrap();
+    let mut framed_ours = MessagingProtocol::framed(stream_ours);
+    framed_ours.send(TEST_MSG1.clone()).await.unwrap();
+
+    // The third message comes through
+    let in_msg = time::timeout(Duration::from_secs(5), inbound_msg_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(in_msg.source_peer, expected_node_id);
+    assert_eq!(in_msg.body, TEST_MSG1);
 }

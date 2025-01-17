@@ -97,12 +97,11 @@ mod test {
     };
 
     use async_trait::async_trait;
-    use futures::{executor::block_on, future};
+    use futures::executor::block_on;
     use tari_shutdown::Shutdown;
     use tower::service_fn;
 
     use super::*;
-    use crate::{initializer::ServiceInitializer, ServiceInitializerContext};
 
     #[tokio::test]
     async fn service_defn_simple() {
@@ -151,7 +150,7 @@ mod test {
                 service_fn(|_: ()| future::ok::<_, ()>(handle.0));
             });
 
-            self.state.fetch_add(1, Ordering::AcqRel);
+            self.state.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }

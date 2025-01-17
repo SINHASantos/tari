@@ -20,42 +20,86 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-/// Simple syntax for expressing covenants.
+/// This macro has three different patterns that it can match against based on the syntax provided.
+///
+/// The first pattern matches when the macro is called with an identifier followed by parentheses and optional arguments
+/// ($token($($args:tt)*)). This pattern is useful when you want to create a covenant with some specific arguments.
+///
+/// The second pattern matches when the macro is called with just an identifier followed by empty parentheses
+/// ($token()). This pattern is useful when you want to create a covenant without any arguments.
+///
+/// The third pattern matches when the macro is called with empty parentheses (()). This pattern is used when you want
+/// to create a covenant with no additional arguments. Simple syntax for expressing covenants.
 ///
 /// ```rust,ignore
 /// // Before height 42, this may only be spent into an output with flag 8 (NON_FUNGIBLE)
-/// let covenant = covenant!(or(absolute_height(@uint(42)), field_eq(@field::features_flags, @uint(8)));
+/// let covenant = covenant!(or(absolute_height(@uint(42)), field_eq(@field::features_flags, @uint(8)))).unwrap();
 /// covenant.execute(...)?;
 /// ```
+
 #[macro_export]
 macro_rules! covenant {
     ($token:ident($($args:tt)*)) => {{
         let mut covenant = $crate::covenants::Covenant::new();
-        $crate::__covenant_inner!(@ { covenant } $token($($args)*));
-        covenant
+        // We declare and use a closure to ensure that the covenant is returned as a Result
+         let ops = ||{
+            $crate::__covenant_inner!(@ { covenant } $token($($args)*),);
+            Ok::<_, $crate::covenants::CovenantError>(covenant)
+        };
+        ops()
     }};
 
     ($token:ident()) => {{
         let mut covenant = $crate::covenants::Covenant::new();
-        $crate::__covenant_inner!(@ { covenant } $token());
-        covenant
+        // We declare and use a closure to ensure that the covenant is returned as a Result
+        let ops = ||{
+            $crate::__covenant_inner!(@ { covenant } $token(),);
+            Ok::<_, $crate::covenants::CovenantError>(covenant)
+        };
+        ops()
     }};
 
-    () => { $crate::covenants::Covenant::new() };
+    () => { Ok::<_, $crate::covenants::CovenantError>($crate::covenants::Covenant::new()) };
 }
 
 #[macro_export]
+// Macro for different pattern matching rules:
+//
+//     1. @ { $covenant:ident } => {}: This rule matches an empty input and does nothing.
+//
+//     2. @ { $covenant:ident } $token:ident() $(,)? => { ... }: This rule matches a token followed by empty
+//        parentheses. It invokes a method push_token on the covenant object with the generated CovenantToken::$token().
+//
+//     3. @ { $covenant:ident } @field::$field:ident, $($tail:tt)* => { ... }: This rule matches a token @field::$field
+//        followed by a comma-separated list of tokens. It invokes a method push_token on the covenant object with the
+//        generated CovenantToken::field($crate::covenants::OutputField::$field()). Then it recursively calls
+//        __covenant_inner! with the remaining tokens.
+//
+//     4. @ { $covenant:ident } @field::$field:ident $(,)? => { ... }: This rule matches a single @field::$field token
+//        followed by an optional comma. It delegates to the previous rule to handle the token.
+//
+//     5. @ { $covenant:ident } @fields($(@field::$field:ident),+ $(,)?)) => { ... }: This rule matches @fields followed
+//        by a comma-separated list of @field::$field tokens wrapped in parentheses. It invokes a method push_token on
+//        the covenant object with the generated CovenantToken::fields vector containing OutputField::$field instances.
+//        It then recursively calls __covenant_inner! with the remaining tokens.
+//
+//     6. @ { $covenant:ident } @fields($(@field::$field:ident),+ $(,)?), $($tail:tt)* => { ... }: This rule is similar
+//        to the previous one but allows for additional tokens after the @fields list. It behaves similarly by
+//        generating the CovenantToken::fields vector and recursively calling __covenant_inner! with the remaining
+//        tokens.
+//
+//     This macro pattern is called a tt-muncher (tee hee)
 macro_rules! __covenant_inner {
-    (@ { $covenant:ident }) => {};
+    (@ { $covenant:ident }) => { };
 
     // token()
     (@ { $covenant:ident } $token:ident() $(,)?) => {
-        $covenant.push_token($crate::covenants::CovenantToken::$token());
+       $covenant.push_token($crate::covenants::CovenantToken::$token())?
     };
 
     // @field::name, ...
     (@ { $covenant:ident } @field::$field:ident, $($tail:tt)*) => {
-        $covenant.push_token($crate::covenants::CovenantToken::field($crate::covenants::OutputField::$field()));
+        $covenant.push_token($crate::covenants::CovenantToken::field($crate::covenants::OutputField::$field()))?;
         $crate::__covenant_inner!(@ { $covenant } $($tail)*)
     };
 
@@ -73,14 +117,14 @@ macro_rules! __covenant_inner {
     (@ { $covenant:ident } @fields($(@field::$field:ident),+ $(,)?), $($tail:tt)*) => {
         $covenant.push_token($crate::covenants::CovenantToken::fields(vec![
             $($crate::covenants::OutputField::$field()),+
-        ]));
+        ]))?;
         $crate::__covenant_inner!(@ { $covenant } $($tail)*)
     };
 
     // @covenant_lit(...), ...
     (@ { $covenant:ident } @covenant_lit($($inner:tt)*), $($tail:tt)*) => {
-        let inner = $crate::covenant!($($inner)*);
-        $covenant.push_token($crate::covenants::CovenantToken::covenant(inner));
+        $crate::covenant!($($inner)*)?;
+        $covenant.push_token($crate::covenants::CovenantToken::covenant(inner))?;
         $crate::__covenant_inner!(@ { $covenant } $($tail)*)
     };
 
@@ -92,13 +136,13 @@ macro_rules! __covenant_inner {
     // @output_type(expr1), ...
     (@ { $covenant:ident } @output_type($arg:expr $(,)?), $($tail:tt)*) => {
         use $crate::transactions::transaction_components::OutputType::*;
-        $covenant.push_token($crate::covenants::CovenantToken::output_type($arg));
+        $covenant.push_token($crate::covenants::CovenantToken::output_type($arg))?;
         $crate::__covenant_inner!(@ { $covenant } $($tail)*)
     };
 
     // @arg(expr1, expr2, ...), ...
     (@ { $covenant:ident } @$arg:ident($($args:expr),* $(,)?), $($tail:tt)*) => {
-        $covenant.push_token($crate::covenants::CovenantToken::$arg($($args),*));
+        $covenant.push_token($crate::covenants::CovenantToken::$arg($($args),*))?;
         $crate::__covenant_inner!(@ { $covenant } $($tail)*)
     };
 
@@ -109,23 +153,24 @@ macro_rules! __covenant_inner {
 
     // token(), ...
     (@ { $covenant:ident } $token:ident(), $($tail:tt)*) => {
-        $covenant.push_token($crate::covenants::CovenantToken::$token());
+        $covenant.push_token($crate::covenants::CovenantToken::$token())?;
         $crate::__covenant_inner!(@ { $covenant } $($tail)*)
     };
-      // token(filter1, filter2, ...)
+
+    // token(filter1, filter2, ...)
     (@ { $covenant:ident } $token:ident($($args:tt)+)) => {
         $crate::__covenant_inner!(@ { $covenant } $token($($args)+),)
     };
 
     // token(filter1, filter2, ...), ...
     (@ { $covenant:ident } $token:ident($($args:tt)+), $($tail:tt)*) => {
-        $covenant.push_token($crate::covenants::CovenantToken::$token());
+        $covenant.push_token($crate::covenants::CovenantToken::$token())?;
         $crate::__covenant_inner!(@ { $covenant } $($args)+ $($tail)*)
     };
 
     // token(...)
-    (@ { $covenant:ident } $token:ident($($args:tt)+)) => {
-        $covenant.push_token($crate::covenants::CovenantToken::$token());
+    (@ { $covenant:ident } $token:ident($($args:tt)+),) => {
+        $covenant.push_token($crate::covenants::CovenantToken::$token())?;
         $crate::__covenant_inner!(@ { $covenant } $($args)+)
     };
 }
@@ -144,7 +189,7 @@ mod test {
 
     #[test]
     fn simple() {
-        let covenant = covenant!(identity());
+        let covenant = covenant!(identity()).unwrap();
         assert_eq!(covenant.tokens().len(), 1);
         assert!(matches!(
             covenant.tokens()[0],
@@ -162,8 +207,8 @@ mod test {
         };
         let dest_pk = PublicKey::from_hex("b0c1f788f137ba0cdc0b61e89ee43b80ebf5cca4136d3229561bf11eba347849").unwrap();
         let sender_pk = dest_pk.clone();
-        let script = script!(HashSha256 PushHash(Box::new(hash)) Equal IfThen PushPubKey(Box::new(dest_pk)) Else CheckHeightVerify(100) PushPubKey(Box::new(sender_pk)) EndIf);
-        let covenant = covenant!(field_eq(@field::script, @script(script.clone())));
+        let script = script!(HashSha256 PushHash(Box::new(hash)) Equal IfThen PushPubKey(Box::new(dest_pk)) Else CheckHeightVerify(100) PushPubKey(Box::new(sender_pk)) EndIf).unwrap();
+        let covenant = covenant!(field_eq(@field::script, @script(script.clone()))).unwrap();
 
         let decoded = Covenant::from_bytes(&mut covenant.to_bytes().as_bytes()).unwrap();
         assert_eq!(covenant, decoded);

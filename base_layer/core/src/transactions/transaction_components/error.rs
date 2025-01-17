@@ -23,62 +23,97 @@
 // Portions of this file were originally copyrighted (c) 2018 The Grin Developers, issued under the Apache License,
 // Version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0.
 
+#[cfg(feature = "ledger")]
+use minotari_ledger_wallet_comms::error::LedgerDeviceError;
 use serde::{Deserialize, Serialize};
-use tari_crypto::{errors::RangeProofError, signatures::CommitmentAndPublicKeySignatureError};
+use tari_crypto::{
+    errors::RangeProofError,
+    signatures::{CommitmentAndPublicKeySignatureError, SchnorrSignatureError},
+};
+use tari_key_manager::key_manager_service::KeyManagerServiceError;
 use tari_script::ScriptError;
 use thiserror::Error;
 
-use crate::covenants::CovenantError;
+use crate::transactions::transaction_components::EncryptedDataError;
 
 //----------------------------------------     TransactionError   ----------------------------------------------------//
-#[derive(Clone, Debug, PartialEq, Error, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Error, Deserialize, Serialize, Eq)]
 pub enum TransactionError {
-    #[error("Error validating the transaction: {0}")]
-    ValidationError(String),
+    #[error("Error building the transaction: {0}")]
+    BuilderError(String),
+    #[error("Error serializing transaction: {0}")]
+    SerializationError(String),
     #[error("Signature is invalid: {0}")]
     InvalidSignatureError(String),
-    #[error("Transaction kernel does not contain a signature")]
-    NoSignatureError,
     #[error("A range proof construction or verification has produced an error: {0}")]
-    RangeProofError(#[from] RangeProofError),
-    #[error("An error occurred while performing a commitment signature: {0}")]
-    SigningError(#[from] CommitmentAndPublicKeySignatureError),
-    #[error("Invalid kernel in body : {0}")]
+    RangeProofError(String),
+    #[error("Invalid kernel in body: {0}")]
     InvalidKernel(String),
     #[error("Invalid coinbase in body")]
     InvalidCoinbase,
     #[error("Invalid coinbase maturity in body")]
     InvalidCoinbaseMaturity,
-    #[error("More than one coinbase in body")]
-    MoreThanOneCoinbase,
+    #[error("More than one coinbase kernel in body")]
+    MoreThanOneCoinbaseKernel,
     #[error("No coinbase in body")]
     NoCoinbase,
     #[error("Input maturity not reached")]
     InputMaturity,
-    #[error("Tari script error : {0}")]
+    #[error("Tari script error: {0}")]
     ScriptError(#[from] ScriptError),
-    #[error("Error performing conversion: {0}")]
-    ConversionError(String),
     #[error("The script offset in body does not balance")]
     ScriptOffset,
     #[error("Error executing script: {0}")]
     ScriptExecutionError(String),
-    #[error("TransactionInput is missing the data from the output being spent")]
-    MissingTransactionInputData,
-    #[error("Error executing covenant: {0}")]
-    CovenantError(String),
-    #[error("Committee contains too many members: contains {len} members but maximum is {max}")]
-    InvalidCommitteeLength { len: usize, max: usize },
-    #[error("Missing validator node signature")]
-    MissingValidatorNodeSignature,
+    #[error("Compact TransactionInput is missing {0}")]
+    CompactInputMissingData(String),
     #[error("Only coinbase outputs may have extra coinbase info")]
     NonCoinbaseHasOutputFeaturesCoinbaseExtra,
     #[error("Coinbase extra size is {len} but the maximum is {max}")]
     InvalidOutputFeaturesCoinbaseExtraSize { len: usize, max: u32 },
+    #[error("KeyManager encountered an error: {0}")]
+    KeyManagerError(String),
+    #[error("EncryptedData error: {0}")]
+    EncryptedDataError(String),
+    #[cfg(feature = "ledger")]
+    #[error("Ledger device error: {0}")]
+    LedgerDeviceError(#[from] LedgerDeviceError),
+    #[error("Ledger is not supported: {0}")]
+    LedgerNotSupported(String),
+    #[error("Transaction has a zero weight, not possible")]
+    ZeroWeight,
+    #[error("Output with commitment {0} not found in transaction body")]
+    OutputNotFound(String),
+    #[error("Unsupported TariKeyId: `{0}`")]
+    UnsupportedTariKeyId(String),
 }
 
-impl From<CovenantError> for TransactionError {
-    fn from(err: CovenantError) -> Self {
-        TransactionError::CovenantError(err.to_string())
+impl From<KeyManagerServiceError> for TransactionError {
+    fn from(err: KeyManagerServiceError) -> Self {
+        TransactionError::KeyManagerError(err.to_string())
+    }
+}
+
+impl From<EncryptedDataError> for TransactionError {
+    fn from(err: EncryptedDataError) -> Self {
+        TransactionError::EncryptedDataError(err.to_string())
+    }
+}
+
+impl From<RangeProofError> for TransactionError {
+    fn from(e: RangeProofError) -> Self {
+        TransactionError::RangeProofError(e.to_string())
+    }
+}
+
+impl From<CommitmentAndPublicKeySignatureError> for TransactionError {
+    fn from(e: CommitmentAndPublicKeySignatureError) -> Self {
+        TransactionError::InvalidSignatureError(e.to_string())
+    }
+}
+
+impl From<SchnorrSignatureError> for TransactionError {
+    fn from(e: SchnorrSignatureError) -> Self {
+        TransactionError::InvalidSignatureError(e.to_string())
     }
 }

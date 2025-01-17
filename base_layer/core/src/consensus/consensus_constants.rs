@@ -36,11 +36,12 @@ use crate::{
     consensus::network::NetworkConsensus,
     proof_of_work::{Difficulty, PowAlgorithm},
     transactions::{
-        tari_amount::{uT, MicroTari, T},
+        tari_amount::{uT, MicroMinotari},
         transaction_components::{
             OutputFeatures,
             OutputFeaturesVersion,
             OutputType,
+            RangeProofType,
             TransactionInputVersion,
             TransactionKernelVersion,
             TransactionOutputVersion,
@@ -49,45 +50,55 @@ use crate::{
     },
 };
 
+const ANNUAL_BLOCKS: u64 = 30 /* blocks/hr */ * 24 /* hr /d */ * 366 /* days / yr */;
+
 /// This is the inner struct used to control all consensus values.
 #[derive(Debug, Clone)]
 pub struct ConsensusConstants {
     /// The height at which these constants become effective
     effective_from_height: u64,
-    /// The min absolute height maturity a coinbase utxo must have
-    coinbase_lock_height: u64,
+    /// The minimum maturity a coinbase utxo must have, in number of blocks
+    coinbase_min_maturity: u64,
     /// Current version of the blockchain
     blockchain_version: u16,
-    /// Current version of the blockchain
+    /// The blockchain version that are accepted. Values outside of this range will be rejected.
     valid_blockchain_version_range: RangeInclusive<u16>,
-    /// The Future Time Limit (FTL) of the blockchain in seconds. This is the max allowable timestamp that is excepted.
-    /// We use T*N/20 where T = desired chain target time, and N = block_window
+    /// The Future Time Limit (FTL) of the blockchain in seconds. This is the max allowable timestamp that is accepted.
+    /// We suggest using T*N/20 where T = desired chain target time, and N = block_window
     future_time_limit: u64,
     /// When doing difficulty adjustments and FTL calculations this is the amount of blocks we look at
     /// <https://github.com/zawy12/difficulty-algorithms/issues/14>
     difficulty_block_window: u64,
     /// Maximum transaction weight used for the construction of new blocks.
     max_block_transaction_weight: u64,
-    /// This is how many blocks we use to count towards the median timestamp to ensure the block chain moves forward
+    /// This is how many blocks we use to count towards the median timestamp to ensure the block chain timestamp moves
+    /// forward
     median_timestamp_count: usize,
     /// This is the initial emission curve amount
-    pub(in crate::consensus) emission_initial: MicroTari,
-    /// This is the emission curve delay for the int
+    pub(in crate::consensus) emission_initial: MicroMinotari,
+    /// This is the emission curve decay factor as a sum of fraction powers of two. e.g. [1,2] would be 1/2 + 1/4. [2]
+    /// would be 1/4
     pub(in crate::consensus) emission_decay: &'static [u64],
-    /// This is the emission curve tail amount
-    pub(in crate::consensus) emission_tail: MicroTari,
-    /// This is the maximum age a monero merge mined seed can be reused
+    /// The tail emission inflation rate in basis points (bips). 100 bips = 1 percentage_point
+    pub(in crate::consensus) inflation_bips: u64,
+    /// The length, in blocks of each tail emission epoch (where the reward is held constant)
+    pub(in crate::consensus) tail_epoch_length: u64,
+    /// This is the maximum age a Monero merge mined seed can be reused
     /// Monero forces a change every height mod 2048 blocks
     max_randomx_seed_height: u64,
+    /// Monero Coinbases are unlimited in size, but we limited the extra field to only a certain bytes.
+    max_extra_field_size: usize,
     /// This keeps track of the block split targets and which algo is accepted
     /// Ideally this should count up to 100. If this does not you will reduce your target time.
     proof_of_work: HashMap<PowAlgorithm, PowAlgorithmConstants>,
     /// This is to keep track of the value inside of the genesis block
-    faucet_value: MicroTari,
+    pre_mine_value: MicroMinotari,
     /// Transaction Weight params
     transaction_weight: TransactionWeight,
     /// Maximum byte size of TariScript
     max_script_byte_size: usize,
+    /// Maximum byte size of encrypted data
+    max_extra_encrypted_data_byte_size: usize,
     /// Range of valid transaction input versions
     input_version_range: RangeInclusive<TransactionInputVersion>,
     /// Range of valid transaction output (and features) versions
@@ -96,18 +107,24 @@ pub struct ConsensusConstants {
     kernel_version_range: RangeInclusive<TransactionKernelVersion>,
     /// An allowlist of output types
     permitted_output_types: &'static [OutputType],
+    /// The allowlist of range proof types
+    permitted_range_proof_types: [(OutputType, &'static [RangeProofType]); 5],
     /// Coinbase outputs are allowed to have metadata, but it has the following length limit
     coinbase_output_features_extra_max_length: u32,
+    /// Maximum number of token elements permitted in covenants
+    max_covenant_length: u32,
     /// Epoch duration in blocks
     vn_epoch_length: u64,
     /// The number of Epochs that a validator node registration is valid
-    vn_validity_period: VnEpoch,
-    vn_registration_min_deposit_amount: MicroTari,
+    vn_validity_period_epochs: VnEpoch,
+    /// The min amount of micro Minotari to deposit for a registration transaction to be allowed onto the blockchain
+    vn_registration_min_deposit_amount: MicroMinotari,
+    /// The period that the registration funds are required to be locked up.
     vn_registration_lock_height: u64,
+    /// The period after which the VNs will be reshuffled.
     vn_registration_shuffle_interval: VnEpoch,
 }
 
-// todo: remove this once OutputFeaturesVersion is removed in favor of just TransactionOutputVersion
 #[derive(Debug, Clone)]
 pub struct OutputVersionRange {
     pub outputs: RangeInclusive<TransactionOutputVersion>,
@@ -132,17 +149,18 @@ fn version_zero() -> (
     (input_version_range, output_version_range, kernel_version_range)
 }
 
-/// This is just a convenience struct to put all the info into a hashmap for each algorithm
+/// This is a convenience struct to put all the info into a hashmap for each algorithm
 #[derive(Clone, Debug)]
 pub struct PowAlgorithmConstants {
-    /// NB this is very important to set this as 6 * the target time
-    pub max_target_time: u64,
     pub min_difficulty: Difficulty,
     pub max_difficulty: Difficulty,
-    /// target time is calculated as desired chain target time / block %.
-    /// example 120/0.5 = 240 for a 50% of the blocks, chain target time of 120.
     pub target_time: u64,
 }
+
+const PRE_MINE_VALUE: u64 = 0; // 6_030_157_777_181_012;
+const INITIAL_EMISSION: MicroMinotari = MicroMinotari(13_952_877_857);
+const ESMERALDA_INITIAL_EMISSION: MicroMinotari = INITIAL_EMISSION;
+pub const MAINNET_PRE_MINE_VALUE: MicroMinotari = MicroMinotari((21_000_000_000 - 14_700_000_000) * 1_000_000);
 
 // The target time used by the difficulty adjustment algorithms, their target time is the target block interval * PoW
 // algorithm count
@@ -152,14 +170,19 @@ impl ConsensusConstants {
         self.effective_from_height
     }
 
-    /// This gets the emission curve values as (initial, decay, tail)
-    pub fn emission_amounts(&self) -> (MicroTari, &'static [u64], MicroTari) {
-        (self.emission_initial, self.emission_decay, self.emission_tail)
+    /// This gets the emission curve values as (initial, decay, inflation_bips, epoch_length)
+    pub fn emission_amounts(&self) -> (MicroMinotari, &'static [u64], u64, u64) {
+        (
+            self.emission_initial,
+            self.emission_decay,
+            self.inflation_bips,
+            self.tail_epoch_length,
+        )
     }
 
     /// The min height maturity a coinbase utxo must have.
-    pub fn coinbase_lock_height(&self) -> u64 {
-        self.coinbase_lock_height
+    pub fn coinbase_min_maturity(&self) -> u64 {
+        self.coinbase_min_maturity
     }
 
     /// Current version of the blockchain.
@@ -174,10 +197,10 @@ impl ConsensusConstants {
 
     /// This returns the FTL (Future Time Limit) for blocks.
     /// Any block with a timestamp greater than this is rejected.
+    // converting u64 to i64 is okay as the future time limit is the hundreds so way below u32 even
+    #[allow(clippy::cast_possible_wrap)]
     pub fn ftl(&self) -> EpochTime {
         // Timestamp never negative
-        #[allow(clippy::cast_sign_loss)]
-        #[allow(clippy::cast_possible_wrap)]
         (Utc::now()
             .add(Duration::seconds(self.future_time_limit as i64))
             .timestamp() as u64)
@@ -187,34 +210,47 @@ impl ConsensusConstants {
     /// This returns the FTL(Future Time Limit) for blocks
     /// Any block with a timestamp greater than this is rejected.
     /// This function returns the FTL as a UTC datetime
+    // converting u64 to i64 is okay as the future time limit is the hundreds so way below u32 even
+    #[allow(clippy::cast_possible_wrap)]
     pub fn ftl_as_time(&self) -> DateTime<Utc> {
-        #[allow(clippy::cast_sign_loss)]
-        #[allow(clippy::cast_possible_wrap)]
         Utc::now().add(Duration::seconds(self.future_time_limit as i64))
     }
 
+    /// Monero Coinbases are unlimited in size, but we limited the extra field to only a certain bytes.
+    pub fn max_extra_field_size(&self) -> usize {
+        self.max_extra_field_size
+    }
+
     /// When doing difficulty adjustments and FTL calculations this is the amount of blocks we look at.
-    pub fn get_difficulty_block_window(&self) -> u64 {
+    pub fn difficulty_block_window(&self) -> u64 {
         self.difficulty_block_window
     }
 
     /// Maximum transaction weight used for the construction of new blocks.
-    pub fn get_max_block_transaction_weight(&self) -> u64 {
+    pub fn max_block_transaction_weight(&self) -> u64 {
         self.max_block_transaction_weight
     }
 
     /// Maximum transaction weight used for the construction of new blocks. It leaves place for 1 kernel and 1 output
-    pub fn get_max_block_weight_excluding_coinbase(&self) -> u64 {
-        self.max_block_transaction_weight - self.coinbase_weight()
+    /// with default features, as well as the maximum possible value of the `coinbase_extra` field
+    pub fn max_block_weight_excluding_coinbases(&self, number_of_coinbases: usize) -> std::io::Result<u64> {
+        Ok(self.max_block_transaction_weight - self.calculate_n_output_kernel_weight(number_of_coinbases)?)
     }
 
-    pub fn coinbase_weight(&self) -> u64 {
-        // TODO: We do not know what script, features etc a coinbase has - this should be max coinbase size?
+    fn calculate_n_output_kernel_weight(&self, num_outputs: usize) -> std::io::Result<u64> {
         let output_features = OutputFeatures { ..Default::default() };
-        let metadata_size = self
+        let max_extra_size = self.coinbase_output_features_extra_max_length() as usize;
+
+        let features_and_scripts_size = self.transaction_weight.round_up_features_and_scripts_size(
+            output_features.get_serialized_size()? +
+                max_extra_size +
+                script!(PushPubKey(Box::default()))
+                    .map_err(|e| e.to_std_io_error())?
+                    .get_serialized_size()?,
+        );
+        Ok(self
             .transaction_weight
-            .round_up_metadata_size(output_features.get_serialized_size() + script![Nop].get_serialized_size());
-        self.transaction_weight.calculate(1, 0, 1, metadata_size)
+            .calculate(1, 0, num_outputs, features_and_scripts_size * num_outputs))
     }
 
     pub fn coinbase_output_features_extra_max_length(&self) -> u32 {
@@ -222,64 +258,61 @@ impl ConsensusConstants {
     }
 
     /// The amount of PoW algorithms used by the Tari chain.
-    pub fn get_pow_algo_count(&self) -> u64 {
+    pub fn pow_algo_count(&self) -> u64 {
         self.proof_of_work.len() as u64
     }
 
     /// The target time used by the difficulty adjustment algorithms, their target time is the target block interval /
     /// algo block percentage
-    pub fn get_diff_target_block_interval(&self, pow_algo: PowAlgorithm) -> u64 {
+    pub fn pow_target_block_interval(&self, pow_algo: PowAlgorithm) -> u64 {
         match self.proof_of_work.get(&pow_algo) {
             Some(v) => v.target_time,
             _ => 0,
         }
     }
 
-    /// The maximum time a block is considered to take. Used by the difficulty adjustment algorithms
-    /// Multiplied by the PoW algorithm block percentage.
-    pub fn get_difficulty_max_block_interval(&self, pow_algo: PowAlgorithm) -> u64 {
-        match self.proof_of_work.get(&pow_algo) {
-            Some(v) => v.max_target_time,
-            _ => 0,
-        }
-    }
-
     /// This is how many blocks we use to count towards the median timestamp to ensure the block chain moves forward.
-    pub fn get_median_timestamp_count(&self) -> usize {
+    pub fn median_timestamp_count(&self) -> usize {
         self.median_timestamp_count
     }
 
     /// The maximum serialized byte size of TariScript
-    pub fn get_max_script_byte_size(&self) -> usize {
+    pub fn max_script_byte_size(&self) -> usize {
         self.max_script_byte_size
+    }
+
+    /// The maximum serialized byte size of TariScript
+    pub fn max_extra_encrypted_data_byte_size(&self) -> usize {
+        self.max_extra_encrypted_data_byte_size
     }
 
     /// This is the min initial difficulty that can be requested for the pow
     pub fn min_pow_difficulty(&self, pow_algo: PowAlgorithm) -> Difficulty {
         match self.proof_of_work.get(&pow_algo) {
             Some(v) => v.min_difficulty,
-            _ => 0.into(),
+            _ => Difficulty::min(),
         }
     }
 
-    /// This will return the value of the genesis block faucets
-    pub fn faucet_value(&self) -> MicroTari {
-        self.faucet_value
+    /// This will return the value of the genesis block pre-mine
+    pub fn pre_mine_value(&self) -> MicroMinotari {
+        self.pre_mine_value
     }
 
     pub fn max_pow_difficulty(&self, pow_algo: PowAlgorithm) -> Difficulty {
         match self.proof_of_work.get(&pow_algo) {
             Some(v) => v.max_difficulty,
-            _ => 0.into(),
+            _ => Difficulty::min(),
         }
     }
 
-    /// The maximum age a monero merge mined seed can be reused
+    /// The maximum age a Monero merge mined seed can be reused
     pub fn max_randomx_seed_height(&self) -> u64 {
         self.max_randomx_seed_height
     }
 
-    pub fn transaction_weight(&self) -> &TransactionWeight {
+    /// Gets the transaction weight parameters to calculate the weight of a transaction
+    pub fn transaction_weight_params(&self) -> &TransactionWeight {
         &self.transaction_weight
     }
 
@@ -303,15 +336,25 @@ impl ConsensusConstants {
         self.permitted_output_types
     }
 
-    pub fn validator_node_validity_period(&self) -> VnEpoch {
-        self.vn_validity_period
+    /// Returns the permitted range proof types
+    pub fn permitted_range_proof_types(&self) -> [(OutputType, &[RangeProofType]); 5] {
+        self.permitted_range_proof_types
+    }
+
+    /// The maximum permitted token length of all covenants. A value of 0 is equivalent to disabling covenants.
+    pub fn max_covenant_length(&self) -> u32 {
+        self.max_covenant_length
+    }
+
+    pub fn validator_node_validity_period_epochs(&self) -> VnEpoch {
+        self.vn_validity_period_epochs
     }
 
     pub fn validator_node_registration_shuffle_interval(&self) -> VnEpoch {
         self.vn_registration_shuffle_interval
     }
 
-    pub fn validator_node_registration_min_deposit_amount(&self) -> MicroTari {
+    pub fn validator_node_registration_min_deposit_amount(&self) -> MicroMinotari {
         self.vn_registration_min_deposit_amount
     }
 
@@ -336,118 +379,86 @@ impl ConsensusConstants {
     pub fn localnet() -> Vec<Self> {
         let difficulty_block_window = 90;
         let mut algos = HashMap::new();
-        algos.insert(PowAlgorithm::Sha3, PowAlgorithmConstants {
-            max_target_time: 1800,
-            min_difficulty: 1.into(),
-            max_difficulty: 1.into(),
-            target_time: 300,
+        algos.insert(PowAlgorithm::Sha3x, PowAlgorithmConstants {
+            min_difficulty: Difficulty::min(),
+            max_difficulty: Difficulty::min(),
+            target_time: 240,
         });
-        algos.insert(PowAlgorithm::Monero, PowAlgorithmConstants {
-            max_target_time: 1200,
-            min_difficulty: 1.into(),
-            max_difficulty: 1.into(),
-            target_time: 200,
+        algos.insert(PowAlgorithm::RandomX, PowAlgorithmConstants {
+            min_difficulty: Difficulty::min(),
+            max_difficulty: Difficulty::min(),
+            target_time: 240,
         });
         let (input_version_range, output_version_range, kernel_version_range) = version_zero();
-        vec![ConsensusConstants {
+        let consensus_constants = vec![ConsensusConstants {
             effective_from_height: 0,
-            coinbase_lock_height: 2,
-            blockchain_version: 0,
-            valid_blockchain_version_range: 0..=0,
+            coinbase_min_maturity: 2,
+            blockchain_version: 1,
+            valid_blockchain_version_range: 1..=1,
             future_time_limit: 540,
             difficulty_block_window,
             max_block_transaction_weight: 19500,
             median_timestamp_count: 11,
             emission_initial: 18_462_816_327 * uT,
             emission_decay: &ESMERALDA_DECAY_PARAMS,
-            emission_tail: 800 * T,
+            inflation_bips: 1000,
+            tail_epoch_length: 100,
             max_randomx_seed_height: u64::MAX,
+            max_extra_field_size: 200,
             proof_of_work: algos,
-            faucet_value: (10 * 4000) * T,
+            pre_mine_value: 0.into(),
             transaction_weight: TransactionWeight::latest(),
-            max_script_byte_size: 2048,
+            max_script_byte_size: 512,
+            max_extra_encrypted_data_byte_size: 240,
             input_version_range,
             output_version_range,
             kernel_version_range,
             permitted_output_types: OutputType::all(),
+            permitted_range_proof_types: Self::all_range_proof_types(),
+            max_covenant_length: 100,
             vn_epoch_length: 10,
-            vn_validity_period: VnEpoch(100),
-            vn_registration_min_deposit_amount: MicroTari(0),
+            vn_validity_period_epochs: VnEpoch(100),
+            vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
-            coinbase_output_features_extra_max_length: 64,
-        }]
-    }
-
-    pub fn weatherwax() -> Vec<Self> {
-        let mut algos = HashMap::new();
-        // setting sha3/monero to 40/60 split
-        algos.insert(PowAlgorithm::Sha3, PowAlgorithmConstants {
-            max_target_time: 1800,
-            min_difficulty: 60_000_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 300,
-        });
-        algos.insert(PowAlgorithm::Monero, PowAlgorithmConstants {
-            max_target_time: 1200,
-            min_difficulty: 60_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 200,
-        });
-        let (input_version_range, output_version_range, kernel_version_range) = version_zero();
-        vec![ConsensusConstants {
-            effective_from_height: 0,
-            coinbase_lock_height: 6,
-            blockchain_version: 1,
-            valid_blockchain_version_range: 0..=3,
-            future_time_limit: 540,
-            difficulty_block_window: 90,
-            max_block_transaction_weight: 19500,
-            median_timestamp_count: 11,
-            emission_initial: 5_538_846_115 * uT,
-            emission_decay: &EMISSION_DECAY,
-            emission_tail: 100.into(),
-            max_randomx_seed_height: std::u64::MAX,
-            proof_of_work: algos,
-            faucet_value: (5000 * 4000) * T,
-            transaction_weight: TransactionWeight::v1(),
-            max_script_byte_size: 2048,
-            input_version_range,
-            output_version_range,
-            kernel_version_range,
-            permitted_output_types: Self::current_permitted_output_types(),
-            vn_epoch_length: 60,
-            vn_validity_period: VnEpoch(100),
-            vn_registration_min_deposit_amount: MicroTari(0),
-            vn_registration_lock_height: 0,
-            vn_registration_shuffle_interval: VnEpoch(100),
-            coinbase_output_features_extra_max_length: 64,
-        }]
+            coinbase_output_features_extra_max_length: 256,
+        }];
+        #[cfg(any(test, debug_assertions))]
+        assert_hybrid_pow_constants(&consensus_constants, &[120], &[50], &[50]);
+        consensus_constants
     }
 
     pub fn igor() -> Vec<Self> {
+        // `igor` is a test network, so calculating these constants are allowed rather than being hardcoded.
+        let randomx_split: u64 = 50;
+        let sha3x_split: u64 = 100 - randomx_split;
+        let randomx_target_time = 20;
+        let sha3x_target_time = randomx_target_time * (100 - sha3x_split) / sha3x_split;
+        let target_time: u64 = (randomx_target_time * sha3x_target_time) / (randomx_target_time + sha3x_target_time);
+        let difficulty_block_window = 90;
+        let future_time_limit = target_time * difficulty_block_window / 20;
+
         let mut algos = HashMap::new();
-        // sha3/monero to 40/60 split
-        algos.insert(PowAlgorithm::Sha3, PowAlgorithmConstants {
-            max_target_time: 1800,
-            min_difficulty: 60_000_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 15,
+        algos.insert(PowAlgorithm::Sha3x, PowAlgorithmConstants {
+            // (target_time x 200_000/3) ... for easy testing
+            min_difficulty: Difficulty::from_u64(sha3x_target_time * 67_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: sha3x_target_time,
         });
-        algos.insert(PowAlgorithm::Monero, PowAlgorithmConstants {
-            max_target_time: 1200,
-            min_difficulty: 60_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 10,
+        algos.insert(PowAlgorithm::RandomX, PowAlgorithmConstants {
+            // (target_time x 300/3)     ... for easy testing
+            min_difficulty: Difficulty::from_u64(randomx_target_time * 100).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: randomx_target_time,
         });
         let (input_version_range, output_version_range, kernel_version_range) = version_zero();
-        vec![ConsensusConstants {
+        let consensus_constants = vec![ConsensusConstants {
             effective_from_height: 0,
-            coinbase_lock_height: 6,
+            coinbase_min_maturity: 6,
             blockchain_version: 0,
             valid_blockchain_version_range: 0..=0,
-            future_time_limit: 540,
-            difficulty_block_window: 90,
+            future_time_limit,
+            difficulty_block_window,
             // 65536 =  target_block_size / bytes_per_gram =  (1024*1024) / 16
             // adj. + 95% = 127,795 - this effectively targets ~2Mb blocks closely matching the previous 19500
             // weightings
@@ -455,221 +466,362 @@ impl ConsensusConstants {
             median_timestamp_count: 11,
             emission_initial: 5_538_846_115 * uT,
             emission_decay: &EMISSION_DECAY,
-            emission_tail: 100.into(),
+            inflation_bips: 100,
+            tail_epoch_length: ANNUAL_BLOCKS,
             max_randomx_seed_height: u64::MAX,
+            max_extra_field_size: 200,
             proof_of_work: algos,
-            faucet_value: 0.into(),
+            pre_mine_value: 0.into(), // IGOR_PRE_MINE_VALUE.into(),
             transaction_weight: TransactionWeight::v1(),
-            max_script_byte_size: 2048,
+            max_script_byte_size: 512,
+            max_extra_encrypted_data_byte_size: 256,
             input_version_range,
             output_version_range,
             kernel_version_range,
             // igor is the first network to support the new output types
             permitted_output_types: OutputType::all(),
+            permitted_range_proof_types: Self::all_range_proof_types(),
+            max_covenant_length: 100,
             vn_epoch_length: 10,
-            vn_validity_period: VnEpoch(100),
-            vn_registration_min_deposit_amount: MicroTari(0),
+            vn_validity_period_epochs: VnEpoch(3),
+            vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
-            coinbase_output_features_extra_max_length: 64,
-        }]
-    }
-
-    /// *
-    /// Dibbler testnet has the following characteristics:
-    /// * 2 min blocks on average (5 min SHA-3, 3 min MM)
-    /// * 21 billion tXTR with a 3-year half-life
-    /// * 800 T tail emission (± 1% inflation after initial 21 billion has been mined)
-    /// * Coinbase lock height - 12 hours = 360 blocks
-    pub fn dibbler() -> Vec<Self> {
-        let mut algos = HashMap::new();
-        // sha3/monero to 40/60 split
-        algos.insert(PowAlgorithm::Sha3, PowAlgorithmConstants {
-            max_target_time: 1800,
-            min_difficulty: 60_000_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 300,
-        });
-        algos.insert(PowAlgorithm::Monero, PowAlgorithmConstants {
-            max_target_time: 1200,
-            min_difficulty: 60_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 200,
-        });
-        let (input_version_range, output_version_range, kernel_version_range) = version_zero();
-        vec![
-            ConsensusConstants {
-                effective_from_height: 0,
-                coinbase_lock_height: 360,
-                blockchain_version: 2,
-                valid_blockchain_version_range: 0..=3,
-                future_time_limit: 540,
-                difficulty_block_window: 90,
-                // 65536 =  target_block_size / bytes_per_gram =  (1024*1024) / 16
-                // adj. + 95% = 127,795 - this effectively targets ~2Mb blocks closely matching the previous 19500
-                // weightings
-                max_block_transaction_weight: 127_795,
-                median_timestamp_count: 11,
-                emission_initial: 18_462_816_327 * uT,
-                emission_decay: &DIBBLER_DECAY_PARAMS,
-                emission_tail: 800 * T,
-                max_randomx_seed_height: u64::MAX,
-                proof_of_work: algos.clone(),
-                faucet_value: (10 * 4000) * T,
-                transaction_weight: TransactionWeight::v1(),
-                max_script_byte_size: 2048,
-                input_version_range: input_version_range.clone(),
-                output_version_range: output_version_range.clone(),
-                kernel_version_range: kernel_version_range.clone(),
-                permitted_output_types: Self::current_permitted_output_types(),
-                vn_epoch_length: 60,
-                vn_validity_period: VnEpoch(100),
-                vn_registration_min_deposit_amount: MicroTari(0),
-                vn_registration_lock_height: 0,
-                vn_registration_shuffle_interval: VnEpoch(100),
-                coinbase_output_features_extra_max_length: 64,
-            },
-            ConsensusConstants {
-                effective_from_height: 23000,
-                coinbase_lock_height: 360,
-                // CHANGE: Use v3 blocks from effective height
-                blockchain_version: 3,
-                valid_blockchain_version_range: 0..=3,
-                future_time_limit: 540,
-                difficulty_block_window: 90,
-                max_block_transaction_weight: 127_795,
-                median_timestamp_count: 11,
-                emission_initial: 18_462_816_327 * uT,
-                emission_decay: &DIBBLER_DECAY_PARAMS,
-                emission_tail: 800 * T,
-                max_randomx_seed_height: u64::MAX,
-                proof_of_work: algos,
-                faucet_value: (10 * 4000) * T,
-                transaction_weight: TransactionWeight::v1(),
-                max_script_byte_size: 2048,
-                input_version_range,
-                output_version_range,
-                kernel_version_range,
-                permitted_output_types: Self::current_permitted_output_types(),
-                vn_epoch_length: 60,
-                vn_validity_period: VnEpoch(100),
-                vn_registration_min_deposit_amount: MicroTari(0),
-                vn_registration_lock_height: 0,
-                vn_registration_shuffle_interval: VnEpoch(100),
-                coinbase_output_features_extra_max_length: 64,
-            },
-        ]
+            coinbase_output_features_extra_max_length: 256,
+        }];
+        #[cfg(any(test, debug_assertions))]
+        assert_hybrid_pow_constants(&consensus_constants, &[target_time], &[randomx_split], &[sha3x_split]);
+        consensus_constants
     }
 
     /// *
     /// Esmeralda testnet has the following characteristics:
     /// * 2 min blocks on average (5 min SHA-3, 3 min MM)
-    /// * 21 billion tXTR with a 3-year half-life
+    /// * 21 billion tXTR with a 2.76-year half-life
     /// * 800 T tail emission (± 1% inflation after initial 21 billion has been mined)
     /// * Coinbase lock height - 12 hours = 360 blocks
     pub fn esmeralda() -> Vec<Self> {
         let mut algos = HashMap::new();
-        // sha3/monero to 40/60 split
-        algos.insert(PowAlgorithm::Sha3, PowAlgorithmConstants {
-            max_target_time: 1800,
-            min_difficulty: 60_000_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 300,
+        algos.insert(PowAlgorithm::Sha3x, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(60_000_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
         });
-        algos.insert(PowAlgorithm::Monero, PowAlgorithmConstants {
-            max_target_time: 1200,
-            min_difficulty: 60_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 200,
+        algos.insert(PowAlgorithm::RandomX, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(60_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
         });
         let (input_version_range, output_version_range, kernel_version_range) = version_zero();
-        let consensus_constants_1 = ConsensusConstants {
+        let consensus_constants1 = ConsensusConstants {
             effective_from_height: 0,
-            coinbase_lock_height: 6,
+            coinbase_min_maturity: 6,
             blockchain_version: 0,
             valid_blockchain_version_range: 0..=0,
             future_time_limit: 540,
             difficulty_block_window: 90,
             max_block_transaction_weight: 127_795,
             median_timestamp_count: 11,
-            emission_initial: 18_462_816_327 * uT,
+            emission_initial: ESMERALDA_INITIAL_EMISSION,
             emission_decay: &ESMERALDA_DECAY_PARAMS,
-            emission_tail: 800 * T,
+            inflation_bips: 100,
+            tail_epoch_length: ANNUAL_BLOCKS,
             max_randomx_seed_height: 3000,
+            max_extra_field_size: 200,
             proof_of_work: algos,
-            faucet_value: 0.into(),
+            pre_mine_value: MAINNET_PRE_MINE_VALUE,
             transaction_weight: TransactionWeight::v1(),
-            max_script_byte_size: 2048,
+            max_script_byte_size: 512,
+            max_extra_encrypted_data_byte_size: 256,
             input_version_range,
             output_version_range,
             kernel_version_range,
             permitted_output_types: Self::current_permitted_output_types(),
+            permitted_range_proof_types: Self::current_permitted_range_proof_types(),
+            max_covenant_length: 0,
             vn_epoch_length: 60,
-            vn_validity_period: VnEpoch(100),
-            vn_registration_min_deposit_amount: MicroTari(0),
+            vn_validity_period_epochs: VnEpoch(100),
+            vn_registration_min_deposit_amount: MicroMinotari(0),
+            vn_registration_lock_height: 0,
+            vn_registration_shuffle_interval: VnEpoch(100),
+            coinbase_output_features_extra_max_length: 256,
+        };
+        let mut consensus_constants2 = consensus_constants1.clone();
+        consensus_constants2.blockchain_version = 1;
+        consensus_constants2.effective_from_height = 16000;
+        consensus_constants2.valid_blockchain_version_range = 1..=1;
+        let consensus_constants = vec![consensus_constants1, consensus_constants2];
+        #[cfg(any(test, debug_assertions))]
+        assert_hybrid_pow_constants(&consensus_constants, &[120, 120], &[50, 50], &[50, 50]);
+        consensus_constants
+    }
+
+    /// *
+    /// Stagenet has the following characteristics:
+    /// * 2 min blocks on average (5 min SHA-3, 3 min MM)
+    /// * 21 billion tXTR with a 3-year half-life
+    /// * 800 T tail emission (± 1% inflation after initial 21 billion has been mined)
+    /// * Coinbase lock height - 12 hours = 360 blocks
+    pub fn stagenet() -> Vec<Self> {
+        let mut algos = HashMap::new();
+        algos.insert(PowAlgorithm::Sha3x, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(450_000_000_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
+        });
+        algos.insert(PowAlgorithm::RandomX, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(1_200_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
+        });
+        let (input_version_range, output_version_range, kernel_version_range) = version_zero();
+        let consensus_constants = vec![ConsensusConstants {
+            effective_from_height: 0,
+            coinbase_min_maturity: 360,
+            blockchain_version: 1,
+            valid_blockchain_version_range: 1..=1,
+            future_time_limit: 540,
+            difficulty_block_window: 90,
+            max_block_transaction_weight: 127_795,
+            median_timestamp_count: 11,
+            emission_initial: INITIAL_EMISSION,
+            emission_decay: &EMISSION_DECAY,
+            inflation_bips: 100,
+            tail_epoch_length: ANNUAL_BLOCKS,
+            max_randomx_seed_height: 3000,
+            max_extra_field_size: 200,
+            proof_of_work: algos,
+            pre_mine_value: PRE_MINE_VALUE.into(),
+            transaction_weight: TransactionWeight::v1(),
+            max_script_byte_size: 512,
+            max_extra_encrypted_data_byte_size: 256,
+            input_version_range,
+            output_version_range,
+            kernel_version_range,
+            permitted_output_types: Self::current_permitted_output_types(),
+            permitted_range_proof_types: Self::current_permitted_range_proof_types(),
+            max_covenant_length: 0,
+            vn_epoch_length: 60,
+            vn_validity_period_epochs: VnEpoch(100),
+            vn_registration_min_deposit_amount: MicroMinotari(0),
+            vn_registration_lock_height: 0,
+            vn_registration_shuffle_interval: VnEpoch(100),
+            coinbase_output_features_extra_max_length: 256,
+        }];
+        #[cfg(any(test, debug_assertions))]
+        assert_hybrid_pow_constants(&consensus_constants, &[120], &[50], &[50]);
+        consensus_constants
+    }
+
+    pub fn nextnet() -> Vec<Self> {
+        let mut algos = HashMap::new();
+        algos.insert(PowAlgorithm::Sha3x, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(1_200_000_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
+        });
+        algos.insert(PowAlgorithm::RandomX, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(1_200_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
+        });
+        let (input_version_range, output_version_range, kernel_version_range) = version_zero();
+        let con_1 = ConsensusConstants {
+            effective_from_height: 0,
+            coinbase_min_maturity: 360,
+            blockchain_version: 0,
+            valid_blockchain_version_range: 0..=0,
+            future_time_limit: 540,
+            difficulty_block_window: 90,
+            max_block_transaction_weight: 127_795,
+            median_timestamp_count: 11,
+            emission_initial: INITIAL_EMISSION,
+            emission_decay: &EMISSION_DECAY,
+            inflation_bips: 100,
+            tail_epoch_length: ANNUAL_BLOCKS,
+            max_randomx_seed_height: 3000,
+            max_extra_field_size: 200,
+            proof_of_work: algos,
+            pre_mine_value: PRE_MINE_VALUE.into(),
+            transaction_weight: TransactionWeight::v1(),
+            max_script_byte_size: 512,
+            max_extra_encrypted_data_byte_size: 256,
+            input_version_range,
+            output_version_range,
+            kernel_version_range,
+            permitted_output_types: Self::current_permitted_output_types(),
+            permitted_range_proof_types: Self::current_permitted_range_proof_types(),
+            max_covenant_length: 0,
+            vn_epoch_length: 60,
+            vn_validity_period_epochs: VnEpoch(100),
+            vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
             coinbase_output_features_extra_max_length: 64,
         };
+        let mut con_2 = con_1.clone();
+        con_2.effective_from_height = 33000;
+        con_2.coinbase_output_features_extra_max_length = 256;
+        let mut con_3 = con_2.clone();
+        con_3.effective_from_height = 52000;
+        con_3.blockchain_version = 1;
+        con_3.valid_blockchain_version_range = 1..=1;
 
-        vec![consensus_constants_1]
+        let consensus_constants = vec![con_1, con_2, con_3];
+        #[cfg(any(test, debug_assertions))]
+        assert_hybrid_pow_constants(&consensus_constants, &[120, 120, 120], &[50, 50, 50], &[50, 50, 50]);
+        consensus_constants
     }
 
+    // These values are mainly place holder till the final decision has been made about their values.
     pub fn mainnet() -> Vec<Self> {
-        // Note these values are all placeholders for final values
         let difficulty_block_window = 90;
         let mut algos = HashMap::new();
-        algos.insert(PowAlgorithm::Sha3, PowAlgorithmConstants {
-            max_target_time: 1800,
-            min_difficulty: 40_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 300,
+        algos.insert(PowAlgorithm::Sha3x, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(450_000_000_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
         });
-        algos.insert(PowAlgorithm::Monero, PowAlgorithmConstants {
-            max_target_time: 800,
-            min_difficulty: 70_000_000.into(),
-            max_difficulty: u64::MAX.into(),
-            target_time: 200,
+        algos.insert(PowAlgorithm::RandomX, PowAlgorithmConstants {
+            min_difficulty: Difficulty::from_u64(1_200_000).expect("valid difficulty"),
+            max_difficulty: Difficulty::max(),
+            target_time: 240,
         });
         let (input_version_range, output_version_range, kernel_version_range) = version_zero();
-        vec![ConsensusConstants {
+        let consensus_constants = vec![ConsensusConstants {
             effective_from_height: 0,
-            coinbase_lock_height: 1,
+            coinbase_min_maturity: 720,
             blockchain_version: 1,
-            valid_blockchain_version_range: 0..=0,
+            valid_blockchain_version_range: 1..=1,
             future_time_limit: 540,
             difficulty_block_window,
-            max_block_transaction_weight: 19500,
+            max_block_transaction_weight: 127_795,
             median_timestamp_count: 11,
-            emission_initial: 10_000_000.into(),
+            emission_initial: INITIAL_EMISSION,
             emission_decay: &EMISSION_DECAY,
-            emission_tail: 100.into(),
-            max_randomx_seed_height: u64::MAX,
+            inflation_bips: 100,
+            tail_epoch_length: ANNUAL_BLOCKS,
+            max_randomx_seed_height: 3000,
+            max_extra_field_size: 200,
             proof_of_work: algos,
-            faucet_value: MicroTari::from(0),
+            pre_mine_value: MAINNET_PRE_MINE_VALUE,
             transaction_weight: TransactionWeight::v1(),
-            max_script_byte_size: 2048,
+            max_script_byte_size: 512,
+            max_extra_encrypted_data_byte_size: 256,
             input_version_range,
             output_version_range,
             kernel_version_range,
             permitted_output_types: Self::current_permitted_output_types(),
+            permitted_range_proof_types: Self::current_permitted_range_proof_types(),
+            max_covenant_length: 0,
             vn_epoch_length: 60,
-            vn_validity_period: VnEpoch(100),
-            vn_registration_min_deposit_amount: MicroTari(0),
+            vn_validity_period_epochs: VnEpoch(100),
+            vn_registration_min_deposit_amount: MicroMinotari(0),
             vn_registration_lock_height: 0,
             vn_registration_shuffle_interval: VnEpoch(100),
-            coinbase_output_features_extra_max_length: 64,
-        }]
+            coinbase_output_features_extra_max_length: 256,
+        }];
+        #[cfg(any(test, debug_assertions))]
+        assert_hybrid_pow_constants(&consensus_constants, &[120], &[50], &[50]);
+        consensus_constants
     }
 
     const fn current_permitted_output_types() -> &'static [OutputType] {
         &[OutputType::Coinbase, OutputType::Standard, OutputType::Burn]
     }
+
+    const fn current_permitted_range_proof_types() -> [(OutputType, &'static [RangeProofType]); 5] {
+        [
+            (OutputType::Standard, &[RangeProofType::BulletProofPlus]),
+            (OutputType::Coinbase, &[
+                RangeProofType::BulletProofPlus,
+                RangeProofType::RevealedValue,
+            ]),
+            (OutputType::Burn, &[RangeProofType::BulletProofPlus]),
+            (OutputType::ValidatorNodeRegistration, &[
+                RangeProofType::BulletProofPlus,
+            ]),
+            (OutputType::CodeTemplateRegistration, &[RangeProofType::BulletProofPlus]),
+        ]
+    }
+
+    const fn all_range_proof_types() -> [(OutputType, &'static [RangeProofType]); 5] {
+        [
+            (OutputType::Standard, RangeProofType::all()),
+            (OutputType::Coinbase, RangeProofType::all()),
+            (OutputType::Burn, RangeProofType::all()),
+            (OutputType::ValidatorNodeRegistration, RangeProofType::all()),
+            (OutputType::CodeTemplateRegistration, RangeProofType::all()),
+        ]
+    }
 }
 
-static EMISSION_DECAY: [u64; 5] = [22, 23, 24, 26, 27];
-const DIBBLER_DECAY_PARAMS: [u64; 6] = [21u64, 22, 23, 25, 26, 37]; // less significant values don't matter
-const ESMERALDA_DECAY_PARAMS: [u64; 6] = [21u64, 22, 23, 25, 26, 37]; // less significant values don't matter
+// Assert the hybrid POW constants.
+// Note: The math and constants in this function should not be changed without ample consideration that should include
+//       discussion with the Tari community, modelling and system level tests.
+// For SHA3/Monero to have a 40/60 split:
+//   > sha3x_target_time = randomx_target_time * (100 - 40) / 40
+//   > randomx_target_time = sha3x_target_time * (100 - 60) / 60
+//   > target_time = randomx_target_time * sha3x_target_time / (ramdomx_target_time + sha3x_target_time)
+#[cfg(any(test, debug_assertions))]
+fn assert_hybrid_pow_constants(
+    consensus_constants: &[ConsensusConstants],
+    target_time: &[u64],
+    randomx_split: &[u64], // RamdomX
+    sha3x_split: &[u64],
+) {
+    assert_eq!(consensus_constants.len(), target_time.len());
+    assert_eq!(consensus_constants.len(), randomx_split.len());
+    assert_eq!(consensus_constants.len(), sha3x_split.len());
+
+    for (i, constants) in consensus_constants.iter().enumerate() {
+        let sha3x_constants = constants
+            .proof_of_work
+            .get(&PowAlgorithm::Sha3x)
+            .expect("Sha3 constants not found");
+        let randomx_constants = constants
+            .proof_of_work
+            .get(&PowAlgorithm::RandomX)
+            .expect("RandomX constants not found");
+
+        // POW algorithm dependencies
+        // - Basics
+        assert!(
+            sha3x_constants.min_difficulty <= sha3x_constants.max_difficulty,
+            "SHA3X min_difficulty > max_difficulty"
+        );
+        assert!(
+            randomx_constants.min_difficulty <= randomx_constants.max_difficulty,
+            "RandomX min_difficulty > max_difficulty"
+        );
+        // - Target time (the ratios here are important to determine the SHA3/Monero split and overall block time)
+        assert_eq!(randomx_split[i] + sha3x_split[i], 100, "Split must add up to 100");
+        assert_eq!(
+            sha3x_constants.target_time * sha3x_split[i],
+            randomx_constants.target_time * (100 - sha3x_split[i]),
+            "SHA3 target times are not inversely proportional to SHA3 split"
+        );
+        assert_eq!(
+            randomx_constants.target_time * randomx_split[i],
+            sha3x_constants.target_time * (100 - randomx_split[i]),
+            "Monero target times are not inversely proportional to Monero split"
+        );
+        assert_eq!(
+            target_time[i] * (randomx_constants.target_time + sha3x_constants.target_time),
+            randomx_constants.target_time * sha3x_constants.target_time,
+            "Overall target time is not inversely proportional to target split times"
+        );
+        // General LWMA dependencies
+        assert_eq!(
+            constants.future_time_limit * 20,
+            target_time[i] * constants.difficulty_block_window,
+            "20x future_time_limit is not target_time * difficulty_block_window"
+        );
+    }
+}
+
+const EMISSION_DECAY: [u64; 6] = [21u64, 22, 23, 25, 26, 37];
+const ESMERALDA_DECAY_PARAMS: [u64; 6] = EMISSION_DECAY; // less significant values don't matter
 
 /// Class to create custom consensus constants
 pub struct ConsensusConstantsBuilder {
@@ -679,7 +831,6 @@ pub struct ConsensusConstantsBuilder {
 impl ConsensusConstantsBuilder {
     pub fn new(network: Network) -> Self {
         Self {
-            // TODO: Resolve this unwrap
             consensus: NetworkConsensus::from(network)
                 .create_consensus_constants()
                 .pop()
@@ -698,7 +849,7 @@ impl ConsensusConstantsBuilder {
     }
 
     pub fn with_coinbase_lockheight(mut self, height: u64) -> Self {
-        self.consensus.coinbase_lock_height = height;
+        self.consensus.coinbase_min_maturity = height;
         self
     }
 
@@ -722,25 +873,35 @@ impl ConsensusConstantsBuilder {
         self
     }
 
-    pub fn with_faucet_value(mut self, value: MicroTari) -> Self {
-        self.consensus.faucet_value = value;
+    pub fn with_pre_mine_value(mut self, value: MicroMinotari) -> Self {
+        self.consensus.pre_mine_value = value;
         self
     }
 
     pub fn with_emission_amounts(
         mut self,
-        intial_amount: MicroTari,
+        intial_amount: MicroMinotari,
         decay: &'static [u64],
-        tail_amount: MicroTari,
+        inflation_bips: u64,
+        epoch_length: u64,
     ) -> Self {
         self.consensus.emission_initial = intial_amount;
         self.consensus.emission_decay = decay;
-        self.consensus.emission_tail = tail_amount;
+        self.consensus.inflation_bips = inflation_bips;
+        self.consensus.tail_epoch_length = epoch_length;
         self
     }
 
     pub fn with_permitted_output_types(mut self, permitted_output_types: &'static [OutputType]) -> Self {
         self.consensus.permitted_output_types = permitted_output_types;
+        self
+    }
+
+    pub fn with_permitted_range_proof_types(
+        mut self,
+        permitted_range_proof_types: [(OutputType, &'static [RangeProofType]); 5],
+    ) -> Self {
+        self.consensus.permitted_range_proof_types = permitted_range_proof_types;
         self
     }
 
@@ -756,13 +917,28 @@ impl ConsensusConstantsBuilder {
 
 #[cfg(test)]
 mod test {
+    use std::convert::TryFrom;
+
     use crate::{
         consensus::{
             emission::{Emission, EmissionSchedule},
             ConsensusConstants,
         },
-        transactions::tari_amount::uT,
+        transactions::{
+            tari_amount::{uT, MicroMinotari},
+            transaction_components::{OutputType, RangeProofType},
+        },
     };
+
+    #[test]
+    fn hybrid_pow_constants_are_well_formed() {
+        ConsensusConstants::localnet();
+        ConsensusConstants::igor();
+        ConsensusConstants::esmeralda();
+        ConsensusConstants::stagenet();
+        ConsensusConstants::nextnet();
+        ConsensusConstants::mainnet();
+    }
 
     #[test]
     fn esmeralda_schedule() {
@@ -770,20 +946,205 @@ mod test {
         let schedule = EmissionSchedule::new(
             esmeralda[0].emission_initial,
             esmeralda[0].emission_decay,
-            esmeralda[0].emission_tail,
+            esmeralda[0].inflation_bips,
+            esmeralda[0].tail_epoch_length,
+            esmeralda[0].pre_mine_value(),
         );
-        let reward = schedule.block_reward(0);
-        assert_eq!(reward, 18_462_816_327 * uT);
-        assert_eq!(schedule.supply_at_block(0), reward);
-        let three_years = 365 * 24 * 30 * 3;
-        assert_eq!(schedule.supply_at_block(three_years), 10_500_682_498_903_652 * uT); // Around 10.5 billion
-        let mut rewards = schedule.iter().skip(3_574_174);
-        // Tail emission starts after block 3,574,175
+        // No genesis block coinbase
+        assert_eq!(schedule.block_reward(0), MicroMinotari(0));
+        // Coinbases starts at block 1
+        let coinbase_offset = 1;
+        let first_reward = schedule.block_reward(coinbase_offset);
+        assert_eq!(first_reward, esmeralda[0].emission_initial);
+        assert_eq!(
+            schedule.supply_at_block(coinbase_offset),
+            first_reward + esmeralda[0].pre_mine_value()
+        );
+        // 'half_life_block' at approximately '(total supply - pre-mine value) / 2'
+        #[allow(clippy::cast_possible_truncation)]
+        let half_life_block = 365 * 24 * 30 * 3;
+        assert_eq!(
+            schedule.supply_at_block(half_life_block + coinbase_offset),
+            7_935_818_494_624_306 * uT + esmeralda[0].pre_mine_value()
+        );
+        // 21 billion
+        let mut rewards = schedule
+            .iter()
+            .skip(3255552 + usize::try_from(coinbase_offset).unwrap());
         let (block_num, reward, supply) = rewards.next().unwrap();
-        assert_eq!(block_num, 3_574_175);
-        assert_eq!(reward, 800_000_598 * uT);
-        assert_eq!(supply, 20_100_525_123_936_707 * uT); // Still 900 mil tokens to go when tail emission kicks in
+        assert_eq!(block_num, 3255553 + coinbase_offset);
+        assert_eq!(reward, 806000000 * uT);
+        assert_eq!(supply, 21269867877433906 * uT);
         let (_, reward, _) = rewards.next().unwrap();
-        assert_eq!(reward, esmeralda[0].emission_tail);
+        assert_eq!(reward, 806000000 * uT);
+        // Inflating tail emission
+        let mut rewards = schedule.iter().skip(3259845);
+        let (block_num, reward, supply) = rewards.next().unwrap();
+        assert_eq!(block_num, 3259846);
+        assert_eq!(reward, 806000000.into());
+        assert_eq!(supply, 21273327229433906 * uT);
+    }
+
+    #[test]
+    fn nextnet_schedule() {
+        let nextnet = ConsensusConstants::nextnet();
+        let schedule = EmissionSchedule::new(
+            nextnet[0].emission_initial,
+            nextnet[0].emission_decay,
+            nextnet[0].inflation_bips,
+            nextnet[0].tail_epoch_length,
+            nextnet[0].pre_mine_value(),
+        );
+        // No genesis block coinbase
+        assert_eq!(schedule.block_reward(0), MicroMinotari(0));
+        // Coinbases starts at block 1
+        let coinbase_offset = 1;
+        let first_reward = schedule.block_reward(coinbase_offset);
+        assert_eq!(first_reward, nextnet[0].emission_initial * uT);
+        assert_eq!(
+            schedule.supply_at_block(coinbase_offset),
+            first_reward + nextnet[0].pre_mine_value()
+        );
+        // 'half_life_block' at approximately '(total supply - pre-mine value) / 2'
+        #[allow(clippy::cast_possible_truncation)]
+        let half_life_block = (365.0 * 24.0 * 30.0 * 2.76) as u64;
+        assert_eq!(
+            schedule.supply_at_block(half_life_block + coinbase_offset),
+            7_483_280_506_356_578 * uT + nextnet[0].pre_mine_value()
+        );
+        // Tail emission
+        let mut rewards = schedule.iter().skip(3259845);
+        let (block_num, reward, supply) = rewards.next().unwrap();
+        assert_eq!(block_num, 3259846);
+        assert_eq!(reward, 796_998_899.into());
+        assert_eq!(supply, 14_973_269_379_635_607 * uT);
+    }
+
+    #[test]
+    fn stagenet_schedule() {
+        let stagenet = ConsensusConstants::stagenet();
+        let schedule = EmissionSchedule::new(
+            stagenet[0].emission_initial,
+            stagenet[0].emission_decay,
+            stagenet[0].inflation_bips,
+            stagenet[0].tail_epoch_length,
+            stagenet[0].pre_mine_value(),
+        );
+        // No genesis block coinbase
+        assert_eq!(schedule.block_reward(0), MicroMinotari(0));
+        // Coinbases starts at block 1
+        let coinbase_offset = 1;
+        let first_reward = schedule.block_reward(coinbase_offset);
+        assert_eq!(first_reward, stagenet[0].emission_initial * uT);
+        assert_eq!(
+            schedule.supply_at_block(coinbase_offset),
+            first_reward + stagenet[0].pre_mine_value()
+        );
+        // 'half_life_block' at approximately '(total supply - pre-mine value) / 2'
+        #[allow(clippy::cast_possible_truncation)]
+        let half_life_block = (365.0 * 24.0 * 30.0 * 2.76) as u64;
+        assert_eq!(
+            schedule.supply_at_block(half_life_block + coinbase_offset),
+            7_483_280_506_356_578 * uT + stagenet[0].pre_mine_value()
+        );
+        // Tail emission
+        let mut rewards = schedule.iter().skip(3259845);
+        let (block_num, reward, supply) = rewards.next().unwrap();
+        assert_eq!(block_num, 3259846);
+        assert_eq!(reward, 796_998_899.into());
+        assert_eq!(supply, 14_973_269_379_635_607 * uT);
+    }
+
+    #[test]
+    fn igor_schedule() {
+        let igor = ConsensusConstants::igor();
+        let schedule = EmissionSchedule::new(
+            igor[0].emission_initial,
+            igor[0].emission_decay,
+            igor[0].inflation_bips,
+            igor[0].tail_epoch_length,
+            igor[0].pre_mine_value(),
+        );
+        // No genesis block coinbase
+        assert_eq!(schedule.block_reward(0), MicroMinotari(0));
+        // Coinbases starts at block 1
+        let coinbase_offset = 1;
+        let first_reward = schedule.block_reward(coinbase_offset);
+        assert_eq!(first_reward, igor[0].emission_initial * uT);
+        assert_eq!(schedule.supply_at_block(coinbase_offset), first_reward);
+        // Tail emission starts after block 11_084_819
+        let rewards = schedule.iter().skip(11_084_819 - 25);
+        let mut previous_reward = MicroMinotari(0);
+        for (block_num, reward, supply) in rewards {
+            if reward == previous_reward {
+                assert_eq!(block_num, 11_084_796);
+                assert_eq!(supply, MicroMinotari(8_010_884_615_082_026));
+                assert_eq!(reward, MicroMinotari(303_000_000));
+                break;
+            }
+            previous_reward = reward;
+        }
+    }
+
+    // This function is to ensure all OutputType variants are assessed in the tests
+    fn cycle_output_type_enum(output_type: OutputType) -> OutputType {
+        match output_type {
+            OutputType::Standard => OutputType::Coinbase,
+            OutputType::Coinbase => OutputType::Burn,
+            OutputType::Burn => OutputType::ValidatorNodeRegistration,
+            OutputType::ValidatorNodeRegistration => OutputType::CodeTemplateRegistration,
+            OutputType::CodeTemplateRegistration => OutputType::Standard,
+        }
+    }
+
+    // This function is to ensure all RangeProofType variants are assessed in the tests
+    fn cycle_range_proof_type_enum(range_proof_type: RangeProofType) -> RangeProofType {
+        match range_proof_type {
+            RangeProofType::BulletProofPlus => RangeProofType::RevealedValue,
+            RangeProofType::RevealedValue => RangeProofType::BulletProofPlus,
+        }
+    }
+
+    #[test]
+    fn range_proof_types_coverage() {
+        let mut output_type_enums = vec![OutputType::Standard];
+        loop {
+            let next_variant = cycle_output_type_enum(*output_type_enums.last().unwrap());
+            if output_type_enums.contains(&next_variant) {
+                break;
+            }
+            output_type_enums.push(next_variant);
+        }
+
+        let mut range_proof_type_enums = vec![RangeProofType::BulletProofPlus];
+        loop {
+            let next_variant = cycle_range_proof_type_enum(*range_proof_type_enums.last().unwrap());
+            if range_proof_type_enums.contains(&next_variant) {
+                break;
+            }
+            range_proof_type_enums.push(next_variant);
+        }
+
+        let permitted_range_proof_types = ConsensusConstants::current_permitted_range_proof_types().to_vec();
+        for item in &output_type_enums {
+            let entries = permitted_range_proof_types
+                .iter()
+                .filter(|&&x| x.0 == *item)
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1);
+            assert!(!entries[0].1.is_empty());
+        }
+
+        let permitted_range_proof_types = ConsensusConstants::all_range_proof_types().to_vec();
+        for output_type in &output_type_enums {
+            let entries = permitted_range_proof_types
+                .iter()
+                .filter(|&&x| x.0 == *output_type)
+                .collect::<Vec<_>>();
+            assert_eq!(entries.len(), 1);
+            for range_proof_type in &range_proof_type_enums {
+                assert!(entries[0].1.iter().any(|&x| x == *range_proof_type));
+            }
+        }
     }
 }

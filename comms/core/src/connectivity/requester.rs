@@ -31,7 +31,6 @@ use tokio::{
     sync::{broadcast, broadcast::error::RecvError, mpsc, oneshot},
     time,
 };
-use tracing;
 
 use super::{
     connection_pool::PeerConnectionState,
@@ -42,6 +41,8 @@ use super::{
 use crate::{
     connection_manager::ConnectionManagerError,
     peer_manager::{NodeId, Peer},
+    Minimized,
+    NodeIdentity,
     PeerConnection,
 };
 
@@ -55,12 +56,10 @@ pub type ConnectivityEventTx = broadcast::Sender<ConnectivityEvent>;
 /// Node connectivity events emitted by the ConnectivityManager.
 #[derive(Debug, Clone)]
 pub enum ConnectivityEvent {
-    PeerDisconnected(NodeId),
-    PeerConnected(PeerConnection),
+    PeerDisconnected(NodeId, Minimized),
+    PeerConnected(Box<PeerConnection>),
     PeerConnectFailed(NodeId),
     PeerBanned(NodeId),
-    PeerOffline(NodeId),
-
     ConnectivityStateInitialized,
     ConnectivityStateOnline(usize),
     ConnectivityStateDegraded(usize),
@@ -72,11 +71,10 @@ impl fmt::Display for ConnectivityEvent {
         #[allow(clippy::enum_glob_use)]
         use ConnectivityEvent::*;
         match self {
-            PeerDisconnected(node_id) => write!(f, "PeerDisconnected({})", node_id),
+            PeerDisconnected(node_id, minimized) => write!(f, "PeerDisconnected({}, {:?})", node_id, minimized),
             PeerConnected(node_id) => write!(f, "PeerConnected({})", node_id),
             PeerConnectFailed(node_id) => write!(f, "PeerConnectFailed({})", node_id),
             PeerBanned(node_id) => write!(f, "PeerBanned({})", node_id),
-            PeerOffline(node_id) => write!(f, "PeerOffline({})", node_id),
             ConnectivityStateInitialized => write!(f, "ConnectivityStateInitialized"),
             ConnectivityStateOnline(n) => write!(f, "ConnectivityStateOnline({})", n),
             ConnectivityStateDegraded(n) => write!(f, "ConnectivityStateDegraded({})", n),
@@ -100,11 +98,14 @@ pub enum ConnectivityRequest {
     ),
     GetConnection(NodeId, oneshot::Sender<Option<PeerConnection>>),
     GetAllConnectionStates(oneshot::Sender<Vec<PeerConnectionState>>),
+    GetMinimizeConnectionsThreshold(oneshot::Sender<Option<usize>>),
     GetActiveConnections(oneshot::Sender<Vec<PeerConnection>>),
     BanPeer(NodeId, Duration, String),
     AddPeerToAllowList(NodeId),
     RemovePeerFromAllowList(NodeId),
+    GetAllowList(oneshot::Sender<Vec<NodeId>>),
     GetPeerStats(NodeId, oneshot::Sender<Option<Peer>>),
+    GetNodeIdentity(oneshot::Sender<NodeIdentity>),
 }
 
 /// Handle to make requests and read events from the ConnectivityManager actor.
@@ -131,7 +132,6 @@ impl ConnectivityRequester {
     }
 
     /// Dial a single peer
-    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn dial_peer(&self, peer: NodeId) -> Result<PeerConnection, ConnectivityError> {
         let mut num_cancels = 0;
         loop {
@@ -161,7 +161,7 @@ impl ConnectivityRequester {
     }
 
     /// Dial many peers, returning a Stream that emits the dial Result as each dial completes.
-    #[tracing::instrument(level = "trace", skip(self, peers))]
+    #[allow(clippy::let_with_type_underscore)]
     pub fn dial_many_peers<I: IntoIterator<Item = NodeId>>(
         &self,
         peers: I,
@@ -173,7 +173,6 @@ impl ConnectivityRequester {
     }
 
     /// Send a request to dial many peers without waiting for the response.
-    #[tracing::instrument(level = "trace", skip(self, peers))]
     pub async fn request_many_dials<I: IntoIterator<Item = NodeId>>(&self, peers: I) -> Result<(), ConnectivityError> {
         future::join_all(peers.into_iter().map(|peer| {
             self.sender.send(ConnectivityRequest::DialPeer {
@@ -239,6 +238,16 @@ impl ConnectivityRequester {
         reply_rx.await.map_err(|_| ConnectivityError::ActorResponseCancelled)
     }
 
+    /// Get the optional minimize connections setting.
+    pub async fn get_minimize_connections_threshold(&mut self) -> Result<Option<usize>, ConnectivityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(ConnectivityRequest::GetMinimizeConnectionsThreshold(reply_tx))
+            .await
+            .map_err(|_| ConnectivityError::ActorDisconnected)?;
+        reply_rx.await.map_err(|_| ConnectivityError::ActorResponseCancelled)
+    }
+
     /// Get all currently connection [PeerConnection](crate::PeerConnection]s.
     pub async fn get_active_connections(&mut self) -> Result<Vec<PeerConnection>, ConnectivityError> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -250,14 +259,14 @@ impl ConnectivityRequester {
     }
 
     /// Ban peer for the given Duration. The ban `reason` is persisted in the peer database for reference.
-    pub async fn ban_peer_until(
+    pub async fn ban_peer_until<T: Into<String>>(
         &mut self,
         node_id: NodeId,
         duration: Duration,
-        reason: String,
+        reason: T,
     ) -> Result<(), ConnectivityError> {
         self.sender
-            .send(ConnectivityRequest::BanPeer(node_id, duration, reason))
+            .send(ConnectivityRequest::BanPeer(node_id, duration, reason.into()))
             .await
             .map_err(|_| ConnectivityError::ActorDisconnected)?;
         Ok(())
@@ -276,6 +285,26 @@ impl ConnectivityRequester {
             .await
             .map_err(|_| ConnectivityError::ActorDisconnected)?;
         Ok(())
+    }
+
+    /// Retrieve self's allow list.
+    pub async fn get_allow_list(&mut self) -> Result<Vec<NodeId>, ConnectivityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(ConnectivityRequest::GetAllowList(reply_tx))
+            .await
+            .map_err(|_| ConnectivityError::ActorDisconnected)?;
+        reply_rx.await.map_err(|_| ConnectivityError::ActorResponseCancelled)
+    }
+
+    /// Retrieve self's node identity.
+    pub async fn get_node_identity(&mut self) -> Result<NodeIdentity, ConnectivityError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(ConnectivityRequest::GetNodeIdentity(reply_tx))
+            .await
+            .map_err(|_| ConnectivityError::ActorDisconnected)?;
+        reply_rx.await.map_err(|_| ConnectivityError::ActorResponseCancelled)
     }
 
     /// Removes a peer from an allow list that prevents it from being banned.

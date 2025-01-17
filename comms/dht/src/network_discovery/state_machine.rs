@@ -22,7 +22,7 @@
 
 use std::{
     fmt,
-    fmt::Display,
+    fmt::{Display, Write},
     future::Future,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -134,17 +134,17 @@ pub(super) struct NetworkDiscoveryContext {
 impl NetworkDiscoveryContext {
     /// Increment the number of rounds by 1
     pub(super) fn increment_num_rounds(&self) -> usize {
-        self.num_rounds.fetch_add(1, Ordering::AcqRel)
+        self.num_rounds.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Get the number of rounds
     pub fn num_rounds(&self) -> usize {
-        self.num_rounds.load(Ordering::Relaxed)
+        self.num_rounds.load(Ordering::SeqCst)
     }
 
     /// Reset the number of rounds to 0
     pub(super) fn reset_num_rounds(&self) {
-        self.num_rounds.store(0, Ordering::Release);
+        self.num_rounds.store(0, Ordering::SeqCst);
     }
 
     pub(super) fn publish_event(&self, event: DhtEvent) {
@@ -295,7 +295,7 @@ where Fut: Future<Output = StateEvent> + Unpin {
 #[derive(Debug, Clone)]
 pub struct DiscoveryParams {
     pub peers: Vec<NodeId>,
-    pub num_peers_to_request: Option<usize>,
+    pub num_peers_to_request: u32,
 }
 
 impl Display for DiscoveryParams {
@@ -304,18 +304,17 @@ impl Display for DiscoveryParams {
             f,
             "DiscoveryParams({} peer(s) ({}), num_peers_to_request = {})",
             self.peers.len(),
-            self.peers.iter().map(|p| format!("{}, ", p)).collect::<String>(),
-            self.num_peers_to_request
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "∞".into()),
+            self.peers.iter().fold(String::new(), |mut peers, p| {
+                let _ = write!(peers, "{p}, ");
+                peers
+            }),
+            self.num_peers_to_request,
         )
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct DhtNetworkDiscoveryRoundInfo {
-    pub num_new_neighbours: usize,
     pub num_new_peers: usize,
     pub num_duplicate_peers: usize,
     pub num_succeeded: usize,
@@ -325,10 +324,6 @@ pub struct DhtNetworkDiscoveryRoundInfo {
 impl DhtNetworkDiscoveryRoundInfo {
     pub fn has_new_peers(&self) -> bool {
         self.num_new_peers > 0
-    }
-
-    pub fn has_new_neighbours(&self) -> bool {
-        self.num_new_neighbours > 0
     }
 
     /// Returns true if the round succeeded (i.e. at least one sync peer was contacted and succeeded in the protocol),
@@ -342,10 +337,9 @@ impl Display for DhtNetworkDiscoveryRoundInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Synced {}/{}, num_new_neighbours = {}, num_new_peers = {}, num_duplicate_peers = {}",
+            "Synced {}/{}, num_new_peers = {}, num_duplicate_peers = {}",
             self.num_succeeded,
             self.sync_peers.len(),
-            self.num_new_neighbours,
             self.num_new_peers,
             self.num_duplicate_peers,
         )

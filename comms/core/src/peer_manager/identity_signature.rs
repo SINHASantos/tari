@@ -22,7 +22,9 @@
 
 use std::convert::{TryFrom, TryInto};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use blake2::Blake2b;
+use chrono::{DateTime, Utc};
+use digest::consts::U64;
 use prost::Message;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -33,9 +35,9 @@ use super::hashing::{comms_core_peer_manager_domain, CommsCorePeerManagerDomain,
 use crate::{
     message::MessageExt,
     multiaddr::Multiaddr,
-    peer_manager::{Peer, PeerFeatures, PeerManagerError},
+    peer_manager::{PeerFeatures, PeerManagerError},
     proto,
-    types::{CommsChallenge, CommsPublicKey, CommsSecretKey, Signature},
+    types::{CommsPublicKey, CommsSecretKey, Signature},
 };
 
 /// Signature that secures the peer identity
@@ -75,7 +77,7 @@ impl IdentitySignature {
             updated_at,
         )
         .finalize();
-        let signature = Signature::sign_raw(secret_key, secret_nonce, challenge.as_ref())
+        let signature = Signature::sign_raw_uniform(secret_key, secret_nonce, challenge.as_ref())
             .expect("unreachable panic: challenge hash digest is the correct length");
         Self {
             version: Self::LATEST_VERSION,
@@ -94,14 +96,6 @@ impl IdentitySignature {
 
     pub fn version(&self) -> u8 {
         self.version
-    }
-
-    pub fn is_valid_for_peer(&self, peer: &Peer) -> bool {
-        self.is_valid(
-            &peer.public_key,
-            peer.features,
-            peer.addresses.to_lexicographically_sorted().iter(),
-        )
     }
 
     pub fn is_valid<'a, I: IntoIterator<Item = &'a Multiaddr>>(
@@ -128,7 +122,7 @@ impl IdentitySignature {
             self.updated_at,
         )
         .finalize();
-        self.signature.verify_challenge(public_key, challenge.as_ref())
+        self.signature.verify_raw_uniform(public_key, challenge.as_ref())
     }
 
     fn construct_challenge<'a, I: IntoIterator<Item = &'a Multiaddr>>(
@@ -138,9 +132,9 @@ impl IdentitySignature {
         features: PeerFeatures,
         addresses: I,
         updated_at: DateTime<Utc>,
-    ) -> DomainSeparatedHasher<CommsChallenge, CommsCorePeerManagerDomain> {
+    ) -> DomainSeparatedHasher<Blake2b<U64>, CommsCorePeerManagerDomain> {
         // e = H(P||R||m)
-        let challenge = comms_core_peer_manager_domain::<CommsChallenge>(IDENTITY_SIGNATURE)
+        let challenge = comms_core_peer_manager_domain::<Blake2b<U64>>(IDENTITY_SIGNATURE)
             .chain(public_key.as_bytes())
             .chain(public_nonce.as_bytes())
             .chain(version.to_le_bytes())
@@ -148,7 +142,7 @@ impl IdentitySignature {
             .chain(features.bits().to_le_bytes());
         addresses
             .into_iter()
-            .fold(challenge, |challenge, addr| challenge.chain(&addr))
+            .fold(challenge, |challenge, addr| challenge.chain(addr))
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -168,13 +162,12 @@ impl TryFrom<proto::identity::IdentitySignature> for IdentitySignature {
 
     fn try_from(value: proto::identity::IdentitySignature) -> Result<Self, Self::Error> {
         let version = u8::try_from(value.version).map_err(|_| PeerManagerError::InvalidIdentitySignature)?;
-        let public_nonce =
-            CommsPublicKey::from_bytes(&value.public_nonce).map_err(|_| PeerManagerError::InvalidIdentitySignature)?;
-        let signature =
-            CommsSecretKey::from_bytes(&value.signature).map_err(|_| PeerManagerError::InvalidIdentitySignature)?;
+        let public_nonce = CommsPublicKey::from_canonical_bytes(&value.public_nonce)
+            .map_err(|_| PeerManagerError::InvalidIdentitySignature)?;
+        let signature = CommsSecretKey::from_canonical_bytes(&value.signature)
+            .map_err(|_| PeerManagerError::InvalidIdentitySignature)?;
         let updated_at =
-            NaiveDateTime::from_timestamp_opt(value.updated_at, 0).ok_or(PeerManagerError::InvalidIdentitySignature)?;
-        let updated_at = DateTime::<Utc>::from_utc(updated_at, Utc);
+            DateTime::<Utc>::from_timestamp(value.updated_at, 0).ok_or(PeerManagerError::InvalidIdentitySignature)?;
 
         Ok(Self {
             version,
@@ -202,7 +195,6 @@ mod test {
     use tari_crypto::keys::{PublicKey, SecretKey};
 
     use super::*;
-    use crate::peer_manager::{NodeId, PeerFlags};
 
     mod is_valid_for_peer {
         use super::*;
@@ -215,18 +207,10 @@ mod test {
             let updated_at = Utc::now();
             let identity =
                 IdentitySignature::sign_new(&secret, PeerFeatures::COMMUNICATION_NODE, [&address], updated_at);
-            let node_id = NodeId::from_public_key(&public_key);
-
-            let peer = Peer::new(
-                public_key,
-                node_id,
-                vec![address].into(),
-                PeerFlags::empty(),
-                PeerFeatures::COMMUNICATION_NODE,
-                vec![],
-                String::new(),
+            assert!(
+                identity.is_valid(&public_key, PeerFeatures::COMMUNICATION_NODE, [&address]),
+                "Signature is not valid"
             );
-            assert!(identity.is_valid_for_peer(&peer));
         }
 
         #[test]
@@ -237,20 +221,12 @@ mod test {
             let updated_at = Utc::now();
             let identity =
                 IdentitySignature::sign_new(&secret, PeerFeatures::COMMUNICATION_NODE, [&address], updated_at);
-            let node_id = NodeId::from_public_key(&public_key);
 
             let tampered = Multiaddr::from_str("/ip4/127.0.0.1/tcp/4321").unwrap();
-
-            let peer = Peer::new(
-                public_key,
-                node_id,
-                vec![tampered].into(),
-                PeerFlags::empty(),
-                PeerFeatures::COMMUNICATION_NODE,
-                vec![],
-                String::new(),
+            assert!(
+                !identity.is_valid(&public_key, PeerFeatures::COMMUNICATION_NODE, [&tampered]),
+                "Signature is not valid"
             );
-            assert!(!identity.is_valid_for_peer(&peer));
         }
 
         #[test]
@@ -261,20 +237,13 @@ mod test {
             let updated_at = Utc::now();
             let identity =
                 IdentitySignature::sign_new(&secret, PeerFeatures::COMMUNICATION_NODE, [&address], updated_at);
-            let node_id = NodeId::from_public_key(&public_key);
 
             let tampered = PeerFeatures::COMMUNICATION_CLIENT;
 
-            let peer = Peer::new(
-                public_key,
-                node_id,
-                vec![address].into(),
-                PeerFlags::empty(),
-                tampered,
-                vec![],
-                String::new(),
+            assert!(
+                !identity.is_valid(&public_key, tampered, [&address]),
+                "Signature is not valid"
             );
-            assert!(!identity.is_valid_for_peer(&peer));
         }
     }
 }

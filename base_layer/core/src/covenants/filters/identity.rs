@@ -22,10 +22,12 @@
 
 use crate::covenants::{context::CovenantContext, error::CovenantError, filters::Filter, output_set::OutputSet};
 
+/// Holding struct for the "identity" filter
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityFilter;
 
 impl Filter for IdentityFilter {
+    /// The identity filter does not filter the output set.
     fn filter(&self, _: &mut CovenantContext<'_>, _: &mut OutputSet<'_>) -> Result<(), CovenantError> {
         Ok(())
     }
@@ -37,13 +39,15 @@ mod tests {
     use crate::{
         covenant,
         covenants::{filters::test::setup_filter_test, test::create_input},
+        transactions::key_manager::create_memory_db_key_manager,
     };
 
-    #[test]
-    fn it_returns_the_outputset_unchanged() {
-        let covenant = covenant!(identity());
-        let input = create_input();
-        let (mut context, outputs) = setup_filter_test(&covenant, &input, 0, |_| {});
+    #[tokio::test]
+    async fn it_returns_the_outputset_unchanged() {
+        let key_manager = create_memory_db_key_manager().unwrap();
+        let covenant = covenant!(identity()).unwrap();
+        let input = create_input(&key_manager).await;
+        let (mut context, outputs) = setup_filter_test(&covenant, &input, 0, |_| {}, &key_manager).await;
         let mut output_set = OutputSet::new(&outputs);
         let previous_len = output_set.len();
         IdentityFilter.filter(&mut context, &mut output_set).unwrap();

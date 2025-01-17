@@ -20,7 +20,7 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{fmt, io, iter::repeat_with, sync::Arc};
+use std::{fmt, io, sync::Arc};
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use tari_common::configuration::Network;
@@ -51,27 +51,35 @@ use crate::{
         sync_protocol::{MempoolPeerProtocol, MempoolSyncProtocol, MAX_FRAME_SIZE, MEMPOOL_SYNC_PROTOCOL},
         Mempool,
     },
-    transactions::{tari_amount::uT, test_helpers::create_tx, transaction_components::Transaction},
+    transactions::{
+        key_manager::create_memory_db_key_manager,
+        tari_amount::uT,
+        test_helpers::create_tx,
+        transaction_components::Transaction,
+    },
     validation::mocks::MockValidator,
 };
 
-pub fn create_transactions(n: usize) -> Vec<Transaction> {
-    repeat_with(|| {
-        let (transaction, _, _) = create_tx(5000 * uT, 3 * uT, 1, 2, 1, 3, Default::default());
-        transaction
-    })
-    .take(n)
-    .collect()
+pub async fn create_transactions(n: usize) -> Vec<Transaction> {
+    let key_manager = create_memory_db_key_manager().unwrap();
+    let mut transactions = Vec::new();
+    for _i in 0..n {
+        let (transaction, _, _) = create_tx(5000 * uT, 3 * uT, 1, 2, 1, 3, Default::default(), &key_manager)
+            .await
+            .expect("Failed to get transaction");
+        transactions.push(transaction);
+    }
+    transactions
 }
 
 async fn new_mempool_with_transactions(n: usize) -> (Mempool, Vec<Transaction>) {
     let mempool = Mempool::new(
         Default::default(),
-        ConsensusManager::builder(Network::LocalNet).build(),
+        ConsensusManager::builder(Network::LocalNet).build().unwrap(),
         Box::new(MockValidator::new(true)),
     );
 
-    let transactions = create_transactions(n);
+    let transactions = create_transactions(n).await;
     for txn in &transactions {
         mempool.insert(Arc::new(txn.clone())).await.unwrap();
     }
@@ -121,7 +129,7 @@ async fn empty_set() {
         create_peer_connection_mock_pair(node1.to_peer(), node2.to_peer()).await;
 
     // This node connected to a peer, so it should open the substream
-    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn));
+    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn.into()));
 
     let substream = node1_mock.next_incoming_substream().await.unwrap();
     let framed = framing::canonical(substream, MAX_FRAME_SIZE);
@@ -149,7 +157,7 @@ async fn synchronise() {
         create_peer_connection_mock_pair(node1.to_peer(), node2.to_peer()).await;
 
     // This node connected to a peer, so it should open the substream
-    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn));
+    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn.into()));
 
     let substream = node1_mock.next_incoming_substream().await.unwrap();
     let framed = framing::canonical(substream, MAX_FRAME_SIZE);
@@ -180,7 +188,7 @@ async fn duplicate_set() {
         create_peer_connection_mock_pair(node1.to_peer(), node2.to_peer()).await;
 
     // This node connected to a peer, so it should open the substream
-    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn));
+    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn.into()));
 
     let substream = node1_mock.next_incoming_substream().await.unwrap();
     let framed = framing::canonical(substream, MAX_FRAME_SIZE);
@@ -252,7 +260,7 @@ async fn initiator_messages() {
         .await
         .unwrap();
 
-    let mut transactions = create_transactions(2);
+    let mut transactions = create_transactions(2).await;
     transactions.push(transactions1[0].clone());
     let mut framed = framing::canonical(sock_out, MAX_FRAME_SIZE);
     // As the initiator, send an inventory
@@ -282,7 +290,7 @@ async fn responder_messages() {
         create_peer_connection_mock_pair(node1.to_peer(), node2.to_peer()).await;
 
     // This node connected to a peer, so it should open the substream
-    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn));
+    connectivity_manager_state.publish_event(ConnectivityEvent::PeerConnected(node2_conn.into()));
 
     let substream = node1_mock.next_incoming_substream().await.unwrap();
     let mut framed = framing::canonical(substream, MAX_FRAME_SIZE);

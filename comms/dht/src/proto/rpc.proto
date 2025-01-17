@@ -14,6 +14,8 @@ message GetCloserPeersRequest {
   repeated bytes excluded = 2;
   bytes closer_to = 3;
   bool include_clients = 4;
+  uint32 max_claims = 5;
+  uint32 max_addresses_per_claim = 6;
 }
 
 // `get_peers` request
@@ -21,17 +23,23 @@ message GetPeersRequest {
   // The number of peers to return, 0 for all peers
   uint32 n = 1;
   bool include_clients = 2;
+  uint32 max_claims = 3;
+  uint32 max_addresses_per_claim = 4;
 }
 
 // GET peers response
 message GetPeersResponse {
-  Peer peer = 1;
+  PeerInfo peer = 1;
 }
 
 // Minimal peer information
-message Peer {
+message PeerInfo {
   bytes public_key = 1;
-  repeated string addresses = 2;
-  uint64 peer_features = 3;
-  tari.dht.common.IdentitySignature identity_signature = 4;
+  repeated PeerIdentityClaim claims = 2;
+}
+
+message PeerIdentityClaim {
+  repeated bytes addresses = 1;
+  uint32 peer_features = 2;
+  tari.dht.common.IdentitySignature identity_signature = 3;
 }

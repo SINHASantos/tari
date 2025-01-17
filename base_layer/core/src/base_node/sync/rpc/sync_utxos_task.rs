@@ -32,15 +32,16 @@ use tari_comms::{
     protocol::rpc::{Request, RpcStatus, RpcStatusResultExt},
     utils,
 };
-use tari_utilities::hex::Hex;
+use tari_utilities::{hex::Hex, ByteArray};
 use tokio::{sync::mpsc, task};
 
+#[cfg(feature = "metrics")]
+use crate::base_node::metrics;
 use crate::{
-    base_node::metrics,
     blocks::BlockHeader,
     chain_storage::{async_db::AsyncBlockchainDb, BlockchainBackend},
     proto,
-    proto::base_node::{SyncUtxo, SyncUtxosRequest, SyncUtxosResponse},
+    proto::base_node::{sync_utxos_response::Txo, SyncUtxosRequest, SyncUtxosResponse},
 };
 
 const LOG_TARGET: &str = "c::base_node::sync_rpc::sync_utxo_task";
@@ -63,19 +64,20 @@ where B: BlockchainBackend + 'static
         mut tx: mpsc::Sender<Result<SyncUtxosResponse, RpcStatus>>,
     ) -> Result<(), RpcStatus> {
         let msg = request.into_message();
+        let start_hash = msg
+            .start_header_hash
+            .clone()
+            .try_into()
+            .rpc_status_bad_request("Invalid header hash")?;
+
         let start_header = self
             .db
-            .fetch_header_containing_utxo_mmr(msg.start)
+            .fetch_header_by_block_hash(start_hash)
             .await
-            .map_err(|err| {
-                error!(target: LOG_TARGET, "{}", err);
-                if err.is_value_not_found() {
-                    RpcStatus::not_found("start index not found")
-                } else {
-                    RpcStatus::general("DB failure when fetching header containing start index")
-                }
-            })?;
-        let hash = msg
+            .rpc_status_internal_error(LOG_TARGET)?
+            .ok_or_else(|| RpcStatus::not_found("Start header hash was not found"))?;
+
+        let end_hash = msg
             .end_header_hash
             .clone()
             .try_into()
@@ -83,54 +85,23 @@ where B: BlockchainBackend + 'static
 
         let end_header = self
             .db
-            .fetch_header_by_block_hash(hash)
+            .fetch_header_by_block_hash(end_hash)
             .await
             .rpc_status_internal_error(LOG_TARGET)?
-            .ok_or_else(|| RpcStatus::not_found("End header hash is was not found"))?;
-
-        if start_header.height() > end_header.height {
+            .ok_or_else(|| RpcStatus::not_found("End header hash was not found"))?;
+        if start_header.height > end_header.height {
             return Err(RpcStatus::bad_request(&format!(
-                "start header height {} cannot be greater than the end header height ({})",
-                start_header.height(),
-                end_header.height
+                "Start header height({}) cannot be greater than the end header height({})",
+                start_header.height, end_header.height
             )));
         }
 
-        let (skip_outputs, prev_utxo_mmr_size) = if start_header.height() == 0 {
-            (msg.start, 0)
-        } else {
-            let prev_header = self
-                .db
-                .fetch_header_by_block_hash(start_header.header().prev_hash)
-                .await
-                .rpc_status_internal_error(LOG_TARGET)?
-                .ok_or_else(|| RpcStatus::not_found("Previous start header hash is was not found"))?;
-
-            let skip = msg.start.checked_sub(prev_header.output_mmr_size)
-                // This is a data inconsistency because fetch_header_containing_utxo_mmr returned the header we are basing this on
-                .ok_or_else(|| RpcStatus::general(&format!("Data inconsistency: output mmr size of header at {} was more than the start index {}", prev_header.height, msg.start)))?;
-            (skip, prev_header.output_mmr_size)
-        };
-
-        let include_pruned_utxos = msg.include_pruned_utxos;
-        let include_deleted_bitmaps = msg.include_deleted_bitmaps;
         task::spawn(async move {
             debug!(
                 target: LOG_TARGET,
                 "Starting UTXO stream for peer '{}'", self.peer_node_id
             );
-            if let Err(err) = self
-                .start_streaming(
-                    &mut tx,
-                    start_header.into_header(),
-                    skip_outputs,
-                    prev_utxo_mmr_size,
-                    end_header,
-                    include_pruned_utxos,
-                    include_deleted_bitmaps,
-                )
-                .await
-            {
+            if let Err(err) = self.start_streaming(&mut tx, start_header, end_header).await {
                 debug!(
                     target: LOG_TARGET,
                     "UTXO stream errored for peer '{}': {}", self.peer_node_id, err
@@ -141,143 +112,202 @@ where B: BlockchainBackend + 'static
                 target: LOG_TARGET,
                 "UTXO stream completed for peer '{}'", self.peer_node_id
             );
+            #[cfg(feature = "metrics")]
             metrics::active_sync_peers().dec();
         });
 
         Ok(())
     }
 
-    // TODO: Split into smaller functions
     #[allow(clippy::too_many_lines)]
     async fn start_streaming(
         &self,
         tx: &mut mpsc::Sender<Result<SyncUtxosResponse, RpcStatus>>,
         mut current_header: BlockHeader,
-        mut skip_outputs: u64,
-        mut prev_utxo_mmr_size: u64,
         end_header: BlockHeader,
-        include_pruned_utxos: bool,
-        include_deleted_bitmaps: bool,
     ) -> Result<(), RpcStatus> {
-        // we need to fetch the spent bitmap for the height the client requested
-        let bitmap = self
-            .db
-            .fetch_complete_deleted_bitmap_at(end_header.hash())
-            .await
-            .map_err(|err| {
-                error!(target: LOG_TARGET, "Failed to get deleted bitmap: {}", err);
-                RpcStatus::general(&format!(
-                    "Could not get deleted bitmap at hash {}",
-                    end_header.hash().to_hex()
-                ))
-            })?
-            .into_bitmap();
-        let bitmap = Arc::new(bitmap);
         debug!(
             target: LOG_TARGET,
-            "Starting stream task with current_header: {}, skip_outputs: {}, prev_utxo_mmr_size: {}, end_header: {}, \
-             include_pruned_utxos: {:?}, include_deleted_bitmaps: {:?}",
+            "Starting stream task with current_header: {}, end_header: {}",
             current_header.hash().to_hex(),
-            skip_outputs,
-            prev_utxo_mmr_size,
             end_header.hash().to_hex(),
-            include_pruned_utxos,
-            include_deleted_bitmaps
         );
+
+        // If this is a pruned node and outputs have been requested for an initial sync, we need to discover and send
+        // the outputs from the genesis block that have been pruned as well
+        let mut pruned_genesis_block_outputs = Vec::new();
+        let metadata = self
+            .db
+            .get_chain_metadata()
+            .await
+            .rpc_status_internal_error(LOG_TARGET)?;
+        if current_header.height == 1 && metadata.is_pruned_node() {
+            let genesis_block = self.db.fetch_genesis_block();
+            for output in genesis_block.block().body.outputs() {
+                let output_hash = output.hash();
+                if self
+                    .db
+                    .fetch_output(output_hash)
+                    .await
+                    .rpc_status_internal_error(LOG_TARGET)?
+                    .is_none()
+                {
+                    trace!(
+                        target: LOG_TARGET,
+                        "Spent genesis TXO (commitment '{}') to peer",
+                        output.commitment.to_hex()
+                    );
+                    pruned_genesis_block_outputs.push(Ok(SyncUtxosResponse {
+                        txo: Some(Txo::Commitment(output.commitment.as_bytes().to_vec())),
+                        mined_header: current_header.hash().to_vec(),
+                    }));
+                }
+            }
+        }
+
+        let start_header = current_header.clone();
         loop {
             let timer = Instant::now();
             let current_header_hash = current_header.hash();
-
             debug!(
                 target: LOG_TARGET,
-                "current header = {} ({})",
+                "Streaming TXO(s) for block #{} ({})",
                 current_header.height,
                 current_header_hash.to_hex()
             );
-
-            let start = prev_utxo_mmr_size + skip_outputs;
-            let end = current_header.output_mmr_size;
-
             if tx.is_closed() {
-                debug!(
-                    target: LOG_TARGET,
-                    "Peer '{}' exited UTXO sync session early", self.peer_node_id
-                );
+                debug!(target: LOG_TARGET, "Peer '{}' exited TXO sync session early", self.peer_node_id);
                 break;
             }
 
-            let (utxos, deleted_diff) = self
+            let outputs_with_statuses = self
                 .db
-                .fetch_utxos_in_block(current_header.hash(), Some(bitmap.clone()))
+                .fetch_outputs_in_block_with_spend_state(current_header_hash, Some(end_header.hash()))
                 .await
                 .rpc_status_internal_error(LOG_TARGET)?;
-            debug!(
-                target: LOG_TARGET,
-                "Streaming UTXO(s) {}-{} ({}) for block #{}. Deleted diff len = {}",
-                start,
-                end,
-                utxos.len(),
-                current_header.height,
-                deleted_diff.cardinality(),
-            );
             if tx.is_closed() {
-                debug!(
-                    target: LOG_TARGET,
-                    "Peer '{}' exited UTXO sync session early", self.peer_node_id
-                );
+                debug!(target: LOG_TARGET, "Peer '{}' exited TXO sync session early", self.peer_node_id);
                 break;
             }
 
-            let skip = usize::try_from(skip_outputs)
-                .map_err(|_| RpcStatus::bad_request("skip_outputs exceeds a 32-bit unsigned integer"))?;
-
-            let utxos = utxos
-                .into_iter()
-                .skip(skip)
-                // Only enumerate after skip, because `start` already has the offset in it so `i` can begin from 0
-                .enumerate()
-                .filter_map(|(i, utxo)| {
-                    // Only include pruned UTXOs if include_pruned_utxos is true
-                    // We use filter_map because we still want the pruned utxos to count towards the index
-                    if include_pruned_utxos || !utxo.is_pruned() {
-                        match SyncUtxo::try_from(utxo) {
-                            Ok(utxo) => Some(Ok(SyncUtxosResponse {utxo_or_deleted: Some(proto::base_node::sync_utxos_response::UtxoOrDeleted::Utxo(utxo)),mmr_index: start + i as u64})),
-                            Err(err) => Some(Err(err)),
-                          }
-                    } else {
-                        None
+            let mut outputs = Vec::with_capacity(outputs_with_statuses.len());
+            for (output, spent) in outputs_with_statuses {
+                if output.is_burned() {
+                    continue;
+                }
+                if !spent {
+                    match proto::types::TransactionOutput::try_from(output.clone()) {
+                        Ok(tx_ouput) => {
+                            trace!(
+                                target: LOG_TARGET,
+                                "Unspent TXO (commitment '{}') to peer",
+                                output.commitment.to_hex()
+                            );
+                            outputs.push(Ok(SyncUtxosResponse {
+                                txo: Some(Txo::Output(tx_ouput)),
+                                mined_header: current_header_hash.to_vec(),
+                            }));
+                        },
+                        Err(e) => {
+                            return Err(RpcStatus::general(&format!(
+                                "Output '{}' RPC conversion error ({})",
+                                output.hash().to_hex(),
+                                e
+                            )))
+                        },
                     }
-                }).collect::<Result<Vec<SyncUtxosResponse>,String>>().map_err(|err| RpcStatus::bad_request(&err))?.into_iter().map(Ok);
-
-            // Ensure task stops if the peer prematurely stops their RPC session
-            if utils::mpsc::send_all(tx, utxos).await.is_err() {
-                break;
-            }
-
-            // We only want to skip the first block UTXOs
-            skip_outputs = 0;
-
-            if include_deleted_bitmaps {
-                let bitmaps = SyncUtxosResponse {
-                    utxo_or_deleted: Some(proto::base_node::sync_utxos_response::UtxoOrDeleted::DeletedDiff(
-                        deleted_diff.serialize(),
-                    )),
-                    mmr_index: 0,
-                };
-
-                if tx.send(Ok(bitmaps)).await.is_err() {
-                    break;
                 }
             }
             debug!(
                 target: LOG_TARGET,
-                "Streamed utxos {} to {} in {:.2?} (including stream backpressure)",
-                start,
-                end,
+                "Adding {} outputs in response for block #{} '{}'", outputs.len(),
+                current_header.height,
+                current_header_hash
+            );
+
+            let inputs_in_block = self
+                .db
+                .fetch_inputs_in_block(current_header_hash)
+                .await
+                .rpc_status_internal_error(LOG_TARGET)?;
+            if tx.is_closed() {
+                debug!(target: LOG_TARGET, "Peer '{}' exited TXO sync session early", self.peer_node_id);
+                break;
+            }
+
+            let mut inputs = Vec::with_capacity(inputs_in_block.len());
+            for input in inputs_in_block {
+                let output_from_current_tranche = if let Some(mined_info) = self
+                    .db
+                    .fetch_output(input.output_hash())
+                    .await
+                    .rpc_status_internal_error(LOG_TARGET)?
+                {
+                    mined_info.mined_height >= start_header.height
+                } else {
+                    false
+                };
+
+                if output_from_current_tranche {
+                    trace!(target: LOG_TARGET, "Spent TXO (hash '{}') not sent to peer", input.output_hash().to_hex());
+                } else {
+                    let input_commitment = match self.db.fetch_output(input.output_hash()).await {
+                        Ok(Some(o)) => o.output.commitment,
+                        Ok(None) => {
+                            return Err(RpcStatus::general(&format!(
+                                "Mined info for input '{}' not found",
+                                input.output_hash().to_hex()
+                            )))
+                        },
+                        Err(e) => {
+                            return Err(RpcStatus::general(&format!(
+                                "Input '{}' not found ({})",
+                                input.output_hash().to_hex(),
+                                e
+                            )))
+                        },
+                    };
+                    trace!(target: LOG_TARGET, "Spent TXO (commitment '{}') to peer", input_commitment.to_hex());
+                    inputs.push(Ok(SyncUtxosResponse {
+                        txo: Some(Txo::Commitment(input_commitment.as_bytes().to_vec())),
+                        mined_header: current_header_hash.to_vec(),
+                    }));
+                }
+            }
+            debug!(
+                target: LOG_TARGET,
+                "Adding {} inputs in response for block #{} '{}'", inputs.len(),
+                current_header.height,
+                current_header_hash
+            );
+
+            let mut txos = Vec::with_capacity(outputs.len() + inputs.len());
+            txos.append(&mut outputs);
+            txos.append(&mut inputs);
+            if start_header == current_header {
+                debug!(
+                    target: LOG_TARGET,
+                    "Adding {} genesis block pruned inputs in response for block #{} '{}'", pruned_genesis_block_outputs.len(),
+                    current_header.height,
+                    current_header_hash
+                );
+                txos.append(&mut pruned_genesis_block_outputs);
+            }
+            let txos = txos.into_iter();
+
+            // Ensure task stops if the peer prematurely stops their RPC session
+            let txos_len = txos.len();
+            if utils::mpsc::send_all(tx, txos).await.is_err() {
+                break;
+            }
+
+            debug!(
+                target: LOG_TARGET,
+                "Streamed {} TXOs in {:.2?} (including stream backpressure)",
+                txos_len,
                 timer.elapsed()
             );
 
-            prev_utxo_mmr_size = current_header.output_mmr_size;
             if current_header.height + 1 > end_header.height {
                 break;
             }
@@ -297,8 +327,7 @@ where B: BlockchainBackend + 'static
 
         debug!(
             target: LOG_TARGET,
-            "UTXO sync completed to UTXO {} (Header hash = {})",
-            current_header.output_mmr_size,
+            "TXO sync completed to Header hash = {}",
             current_header.hash().to_hex()
         );
 

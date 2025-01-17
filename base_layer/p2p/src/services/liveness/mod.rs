@@ -52,6 +52,7 @@ pub use handle::{
 
 mod message;
 mod service;
+pub use service::MAX_INFLIGHT_TTL;
 
 mod state;
 pub use state::Metadata;
@@ -63,7 +64,7 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
 use log::*;
-use tari_comms::connectivity::ConnectivityRequester;
+use tari_comms::{connectivity::ConnectivityRequester, PeerManager};
 use tari_comms_dht::Dht;
 use tari_service_framework::{
     async_trait,
@@ -79,10 +80,7 @@ pub use crate::proto::liveness::MetadataKey;
 use crate::{
     comms_connector::{PeerMessage, TopicSubscriptionFactory},
     domain_message::DomainMessage,
-    services::{
-        liveness::state::LivenessState,
-        utils::{map_decode, ok_or_skip_result},
-    },
+    services::{liveness::state::LivenessState, utils::map_decode},
     tari_message::TariMessageType,
 };
 
@@ -90,7 +88,7 @@ const LOG_TARGET: &str = "p2p::services::liveness";
 
 /// Initializer for the Liveness service handle and service future.
 pub struct LivenessInitializer {
-    config: Option<LivenessConfig>,
+    pub(crate) config: Option<LivenessConfig>,
     inbound_message_subscription_factory: Arc<TopicSubscriptionFactory<TariMessageType, Arc<PeerMessage>>>,
 }
 
@@ -107,11 +105,10 @@ impl LivenessInitializer {
     }
 
     /// Get a stream of inbound PingPong messages
-    fn ping_stream(&self) -> impl Stream<Item = DomainMessage<PingPongMessage>> {
+    fn ping_stream(&self) -> impl Stream<Item = DomainMessage<Result<PingPongMessage, prost::DecodeError>>> {
         self.inbound_message_subscription_factory
             .get_subscription(TariMessageType::PingPong, "Liveness")
             .map(map_decode::<PingPongMessage>)
-            .filter_map(ok_or_skip_result)
     }
 }
 
@@ -140,6 +137,7 @@ impl ServiceInitializer for LivenessInitializer {
             let dht = handles.expect_handle::<Dht>();
             let connectivity = handles.expect_handle::<ConnectivityRequester>();
             let outbound_messages = dht.outbound_requester();
+            let peer_manager = handles.expect_handle::<Arc<PeerManager>>();
 
             let service = LivenessService::new(
                 config,
@@ -150,6 +148,7 @@ impl ServiceInitializer for LivenessInitializer {
                 outbound_messages,
                 publisher,
                 handles.get_shutdown_signal(),
+                peer_manager,
             );
             service.run().await;
             debug!(target: LOG_TARGET, "Liveness service has shut down");

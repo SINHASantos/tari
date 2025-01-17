@@ -83,14 +83,14 @@ use crate::{
 #[allow(clippy::same_item_push)]
 #[allow(clippy::too_many_lines)]
 async fn main() {
-    let _ = env_logger::from_env(Env::default())
+    let _ = env_logger::Builder::from_env(Env::default())
         .format_timestamp_millis()
         .try_init();
     let matches = App::new("MemoryNet")
         .version("0.1.0")
         .arg(
             Arg::with_name("output_dir")
-                .short("o")
+                .short('o')
                 .long("output")
                 .takes_value(true)
                 .value_name("PATH")

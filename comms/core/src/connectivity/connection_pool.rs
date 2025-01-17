@@ -24,7 +24,7 @@ use std::{collections::HashMap, fmt, time::Duration};
 
 use nom::lib::std::collections::hash_map::Entry;
 
-use crate::{peer_manager::NodeId, PeerConnection};
+use crate::{peer_manager::NodeId, Minimized, PeerConnection};
 
 /// Status type for connections
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,13 @@ pub enum ConnectionStatus {
     Connected,
     Retrying,
     Failed,
-    Disconnected,
+    Disconnected(Minimized),
+}
+
+impl ConnectionStatus {
+    pub fn is_connected(self) -> bool {
+        matches!(self, ConnectionStatus::Connected)
+    }
 }
 
 impl fmt::Display for ConnectionStatus {
@@ -58,7 +64,7 @@ impl PeerConnectionState {
 
     /// Return true if the underlying connection exists and is connected, otherwise false
     pub fn is_connected(&self) -> bool {
-        self.connection().filter(|c| c.is_connected()).is_some()
+        self.status.is_connected() && self.connection().map_or(false, |c| c.is_connected())
     }
 
     pub fn connection_mut(&mut self) -> Option<&mut PeerConnection> {
@@ -124,7 +130,7 @@ impl ConnectionPool {
                 entry_mut.status = if conn.is_connected() {
                     ConnectionStatus::Connected
                 } else {
-                    ConnectionStatus::Disconnected
+                    ConnectionStatus::Disconnected(Minimized::No)
                 };
                 entry_mut.set_connection(conn);
                 entry_mut.status
@@ -181,7 +187,7 @@ impl ConnectionPool {
     where P: FnMut(&PeerConnectionState) -> bool {
         self.connections
             .values()
-            .filter(|c| (predicate)(*c))
+            .filter(|c| (predicate)(c))
             .filter_map(|c| c.connection())
             .collect()
     }
@@ -191,7 +197,7 @@ impl ConnectionPool {
         self.connections
             .values_mut()
             .filter_map(|c| c.connection_mut())
-            .filter(|c| (predicate)(*c))
+            .filter(|c| (predicate)(c))
             .collect()
     }
 
@@ -237,7 +243,7 @@ impl ConnectionPool {
     }
 
     pub fn count_disconnected(&self) -> usize {
-        self.count_filtered(|c| c.status() == ConnectionStatus::Disconnected)
+        self.count_filtered(|c| matches!(c.status(), ConnectionStatus::Disconnected(_)))
     }
 
     pub fn count_entries(&self) -> usize {
@@ -246,6 +252,6 @@ impl ConnectionPool {
 
     pub(in crate::connectivity) fn count_filtered<P>(&self, mut predicate: P) -> usize
     where P: FnMut(&PeerConnectionState) -> bool {
-        self.connections.values().filter(|c| (predicate)(*c)).count()
+        self.connections.values().filter(|c| (predicate)(c)).count()
     }
 }

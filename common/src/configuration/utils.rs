@@ -4,7 +4,7 @@
 use std::{fmt, fmt::Display, fs, fs::File, io::Write, marker::PhantomData, path::Path, str::FromStr};
 
 use config::Config;
-use log::{debug, info};
+use log::{debug, info, trace};
 use serde::{
     de::{self, MapAccess, Visitor},
     Deserialize,
@@ -13,27 +13,55 @@ use serde::{
 };
 
 use crate::{
-    configuration::{ConfigOverrideProvider, Network},
+    configuration::{bootstrap::prompt, ConfigOverrideProvider, Network},
+    network_check::set_network_if_choice_valid,
     ConfigError,
     LOG_TARGET,
 };
 
 //-------------------------------------           Main API functions         --------------------------------------//
 
+/// Loads the configuration file from the specified path, or creates a new one with the embedded default presets if it
+/// does not. This also prompts the user.
 pub fn load_configuration<P: AsRef<Path>, TOverride: ConfigOverrideProvider>(
     config_path: P,
     create_if_not_exists: bool,
+    non_interactive: bool,
     overrides: &TOverride,
+    cli_network: Option<Network>,
 ) -> Result<Config, ConfigError> {
-    debug!(
-        target: LOG_TARGET,
-        "Loading configuration file from  {}",
-        config_path.as_ref().to_str().unwrap_or("[??]")
-    );
-    if !config_path.as_ref().exists() && create_if_not_exists {
-        write_default_config_to(&config_path)
+    if config_path.as_ref().exists() {
+        debug!(
+            target: LOG_TARGET,
+            "Using existing configuration file  {}",
+            config_path.as_ref().display()
+        );
+    } else if create_if_not_exists {
+        let sources = if non_interactive {
+            get_default_config(false)
+        } else {
+            prompt_default_config()
+        };
+        debug!(
+            target: LOG_TARGET,
+            "Created new configuration file {}",
+            config_path.as_ref().display()
+        );
+        write_config_to(&config_path, &sources)
             .map_err(|io| ConfigError::new("Could not create default config", Some(io.to_string())))?;
+    } else {
+        // Nothing here
     }
+
+    load_configuration_with_overrides(config_path, overrides, cli_network)
+}
+
+/// Loads the config at the given path applying all overrides.
+pub fn load_configuration_with_overrides<P: AsRef<Path>, TOverride: ConfigOverrideProvider>(
+    config_path: P,
+    overrides: &TOverride,
+    cli_network: Option<Network>,
+) -> Result<Config, ConfigError> {
     let filename = config_path
         .as_ref()
         .to_str()
@@ -48,30 +76,40 @@ pub fn load_configuration<P: AsRef<Path>, TOverride: ConfigOverrideProvider>(
         .build()
         .map_err(|ce| ConfigError::new("Could not build config", Some(ce.to_string())))?;
 
-    let network = match cfg.get_string("network") {
-        Ok(network) => {
-            Network::from_str(&network).map_err(|e| ConfigError::new("Invalid network", Some(e.to_string())))?
-        },
-        Err(config::ConfigError::NotFound(_)) => {
-            debug!(target: LOG_TARGET, "No network configuration found. Using default.");
-            Network::default()
-        },
-        Err(e) => {
-            return Err(ConfigError::new(
-                "Could not get network configuration",
-                Some(e.to_string()),
-            ));
+    let network = match cli_network {
+        Some(val) => val,
+        None => match cfg.get_string("network") {
+            Ok(network) => {
+                Network::from_str(&network).map_err(|e| ConfigError::new("Invalid network", Some(e.to_string())))?
+            },
+            Err(config::ConfigError::NotFound(_)) => {
+                debug!(target: LOG_TARGET, "No network configuration found. Using default.");
+                Network::default()
+            },
+            Err(e) => {
+                return Err(ConfigError::new(
+                    "Could not get network configuration",
+                    Some(e.to_string()),
+                ));
+            },
         },
     };
 
     info!(target: LOG_TARGET, "Configuration file loaded.");
-    let overrides = overrides.get_config_property_overrides(network);
+    let overrides = overrides.get_config_property_overrides(&network);
+    trace!(target: LOG_TARGET, "Config property overrides: {:?}", overrides);
+
+    // Set the static network variable according to the user chosen network (for use with
+    // `get_current_or_user_setting_or_default()`) -
+    set_network_if_choice_valid(network)?;
+
     if overrides.is_empty() {
         return Ok(cfg);
     }
 
     let mut cfg = Config::builder().add_source(cfg);
     for (key, value) in overrides {
+        trace!(target: LOG_TARGET, "Set override: ({}, {})", key, value);
         cfg = cfg
             .set_override(key.as_str(), value.as_str())
             .map_err(|ce| ConfigError::new("Could not override config property", Some(ce.to_string())))?;
@@ -83,29 +121,55 @@ pub fn load_configuration<P: AsRef<Path>, TOverride: ConfigOverrideProvider>(
     Ok(cfg)
 }
 
-/// Installs a new configuration file template, copied from the application type's preset and written to the given path.
+/// Returns a new configuration file template in parts from the embedded presets. If non_interactive is false, the user
+/// is prompted to select if they would like to select a base node configuration that enables mining or not.
 /// Also includes the common configuration defined in `config/presets/common.toml`.
-pub fn write_default_config_to<P: AsRef<Path>>(path: P) -> Result<(), std::io::Error> {
-    // Use the same config file so that all the settings are easier to find, and easier to
-    // support users over chat channels
+pub fn prompt_default_config() -> [&'static str; 12] {
+    let mine = prompt(
+        "Node config does not exist.\nWould you like to mine (Y/n)?\nNOTE: this will enable additional gRPC methods \
+         that could be used to monitor and submit blocks from this node.",
+    );
+    get_default_config(mine)
+}
+
+/// Returns the default configuration file template in parts from the embedded presets. If use_mining_config is true,
+/// the base node configuration that enables mining is returned, otherwise the non-mining configuration is returned.
+pub fn get_default_config(use_mining_config: bool) -> [&'static str; 12] {
+    let base_node_allow_methods = if use_mining_config {
+        include_str!("../../config/presets/c_base_node_b_mining_allow_methods.toml")
+    } else {
+        include_str!("../../config/presets/c_base_node_b_non_mining_allow_methods.toml")
+    };
+
     let common = include_str!("../../config/presets/a_common.toml");
-    let source = [
+    [
         common,
         include_str!("../../config/presets/b_peer_seeds.toml"),
-        include_str!("../../config/presets/c_base_node.toml"),
+        include_str!("../../config/presets/c_base_node_a.toml"),
+        base_node_allow_methods,
+        include_str!("../../config/presets/c_base_node_c.toml"),
         include_str!("../../config/presets/d_console_wallet.toml"),
         include_str!("../../config/presets/g_miner.toml"),
         include_str!("../../config/presets/f_merge_mining_proxy.toml"),
         include_str!("../../config/presets/e_validator_node.toml"),
         include_str!("../../config/presets/h_collectibles.toml"),
+        include_str!("../../config/presets/i_indexer.toml"),
+        include_str!("../../config/presets/j_dan_wallet_daemon.toml"),
     ]
-    .join("\n");
+}
 
+/// Writes a single file concatenating all the provided sources to the specified path. If the parent directory does not
+/// exist, it is created. If the file already exists, it is overwritten.
+pub fn write_config_to<P: AsRef<Path>>(path: P, sources: &[&str]) -> Result<(), std::io::Error> {
     if let Some(d) = path.as_ref().parent() {
         fs::create_dir_all(d)?
     };
     let mut file = File::create(path)?;
-    file.write_all(source.as_ref())
+    for source in sources {
+        file.write_all(source.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 pub fn serialize_string<S, T>(source: &T, ser: S) -> Result<S::Ok, S::Error>
@@ -134,7 +198,10 @@ where
 
         fn visit_str<E>(self, value: &str) -> Result<T, E>
         where E: de::Error {
-            Ok(FromStr::from_str(value).unwrap())
+            match FromStr::from_str(value) {
+                Ok(val) => Ok(val),
+                Err(e) => Err(de::Error::custom(e)),
+            }
         }
 
         fn visit_map<M>(self, map: M) -> Result<T, M::Error>

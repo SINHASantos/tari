@@ -20,27 +20,36 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::convert::{TryFrom, TryInto};
+use std::{
+    convert::{TryFrom, TryInto},
+    str::FromStr,
+};
 
 use borsh::BorshDeserialize;
-use chacha20poly1305::XChaCha20Poly1305;
 use chrono::NaiveDateTime;
 use derivative::Derivative;
-use diesel::{prelude::*, sql_query, SqliteConnection};
+use diesel::{prelude::*, sql_query};
 use log::*;
+use tari_common_sqlite::util::diesel_ext::ExpectedRowsExtension;
 use tari_common_types::{
     transaction::TxId,
-    types::{ComAndPubSignature, Commitment, PrivateKey, PublicKey},
+    types::{ComAndPubSignature, Commitment, FixedHash, PrivateKey, PublicKey, RangeProof},
 };
 use tari_core::transactions::{
-    tari_amount::MicroTari,
-    transaction_components::{EncryptedValue, OutputFeatures, OutputType, UnblindedOutput},
-    CryptoFactories,
+    tari_amount::MicroMinotari,
+    transaction_components::{
+        encrypted_data::PaymentId,
+        EncryptedData,
+        OutputFeatures,
+        OutputType,
+        TransactionOutputVersion,
+        WalletOutput,
+    },
 };
-use tari_crypto::{commitment::HomomorphicCommitmentFactory, tari_utilities::ByteArray};
+use tari_crypto::tari_utilities::ByteArray;
+use tari_key_manager::key_manager_service::KeyId;
 use tari_script::{ExecutionStack, TariScript};
-use tari_utilities::Hidden;
-use zeroize::Zeroize;
+use tari_utilities::hex::Hex;
 
 use crate::{
     output_manager_service::{
@@ -49,40 +58,35 @@ use crate::{
         service::Balance,
         storage::{
             database::{OutputBackendQuery, SortDirection},
-            models::DbUnblindedOutput,
+            models::{DbWalletOutput, SpendingPriority},
             sqlite_db::{UpdateOutput, UpdateOutputSql},
             OutputSource,
             OutputStatus,
         },
         UtxoSelectionFilter,
         UtxoSelectionOrdering,
+        TRANSACTION_INPUTS_LIMIT,
     },
     schema::outputs,
-    util::{
-        diesel_ext::ExpectedRowsExtension,
-        encryption::{decrypt_bytes_integral_nonce, encrypt_bytes_integral_nonce, Encryptable},
-    },
 };
 
 const LOG_TARGET: &str = "wallet::output_manager_service::database::wallet";
 
-#[derive(Clone, Derivative, Queryable, Identifiable, PartialEq, QueryableByName)]
-#[derivative(Debug)]
-#[table_name = "outputs"]
+#[derive(Clone, Derivative, Debug, Queryable, Identifiable, PartialEq, QueryableByName)]
+#[diesel(table_name = outputs)]
 pub struct OutputSql {
     pub id: i32, // Auto inc primary key
-    pub commitment: Option<Vec<u8>>,
-    #[derivative(Debug = "ignore")]
-    pub spending_key: Vec<u8>,
+    pub commitment: Vec<u8>,
+    pub rangeproof: Option<Vec<u8>>,
+    pub spending_key: String,
     pub value: i64,
     pub output_type: i32,
     pub maturity: i64,
     pub status: i32,
-    pub hash: Option<Vec<u8>>,
+    pub hash: Vec<u8>,
     pub script: Vec<u8>,
     pub input_data: Vec<u8>,
-    #[derivative(Debug = "ignore")]
-    pub script_private_key: Vec<u8>,
+    pub script_private_key: String,
     pub script_lock_height: i64,
     pub sender_offset_public_key: Vec<u8>,
     pub metadata_signature_ephemeral_commitment: Vec<u8>,
@@ -92,33 +96,32 @@ pub struct OutputSql {
     pub metadata_signature_u_y: Vec<u8>,
     pub mined_height: Option<i64>,
     pub mined_in_block: Option<Vec<u8>>,
-    pub mined_mmr_position: Option<i64>,
     pub marked_deleted_at_height: Option<i64>,
     pub marked_deleted_in_block: Option<Vec<u8>>,
     pub received_in_tx_id: Option<i64>,
     pub spent_in_tx_id: Option<i64>,
-    pub coinbase_block_height: Option<i64>,
-    pub metadata: Option<Vec<u8>>,
+    pub coinbase_extra: Option<Vec<u8>>,
     pub features_json: String,
     pub spending_priority: i32,
     pub covenant: Vec<u8>,
     pub mined_timestamp: Option<NaiveDateTime>,
-    pub encrypted_value: Vec<u8>,
+    pub encrypted_data: Vec<u8>,
     pub minimum_value_promise: i64,
     pub source: i32,
     pub last_validation_timestamp: Option<NaiveDateTime>,
+    pub payment_id: Option<Vec<u8>>,
 }
 
 impl OutputSql {
     /// Return all outputs
-    pub fn index(conn: &SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
+    pub fn index(conn: &mut SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table.load::<OutputSql>(conn)?)
     }
 
     /// Return all outputs with a given status
     pub fn index_status(
         statuses: Vec<OutputStatus>,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::status.eq_any::<Vec<i32>>(statuses.into_iter().map(|s| s as i32).collect()))
@@ -126,11 +129,10 @@ impl OutputSql {
     }
 
     /// Retrieves UTXOs by a set of given rules
-    // TODO: maybe use a shorthand macros
     #[allow(clippy::cast_sign_loss)]
-    pub fn fetch_outputs_by(
+    pub fn fetch_outputs_by_query(
         q: OutputBackendQuery,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         let mut query = outputs::table
             .into_boxed()
@@ -200,13 +202,15 @@ impl OutputSql {
         selection_criteria: &UtxoSelectionCriteria,
         amount: u64,
         tip_height: Option<u64>,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         let i64_tip_height = tip_height.and_then(|h| i64::try_from(h).ok()).unwrap_or(i64::MAX);
+        let i64_value = i64::try_from(selection_criteria.min_dust).unwrap_or(i64::MAX);
 
         let mut query = outputs::table
             .into_boxed()
             .filter(outputs::status.eq(OutputStatus::Unspent as i32))
+            .filter(outputs::value.gt(i64_value))
             .order_by(outputs::spending_priority.desc());
 
         // NOTE: Safe mode presets `script_lock_height` and `maturity` filters for all queries
@@ -269,25 +273,22 @@ impl OutputSql {
             },
         };
 
-        // debug!(
-        //     target: LOG_TARGET,
-        //     "Executing UTXO select query: {}",
-        //     diesel::debug_query(&query)
-        // );
-
-        Ok(query.load(conn)?)
+        Ok(query.limit(i64::from(TRANSACTION_INPUTS_LIMIT)).load(conn)?)
     }
 
     /// Return all unspent outputs that have a maturity above the provided chain tip
     #[allow(clippy::cast_possible_wrap)]
-    pub fn index_time_locked(tip: u64, conn: &SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
+    pub fn index_time_locked(
+        tip: u64,
+        conn: &mut SqliteConnection,
+    ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::status.eq(OutputStatus::Unspent as i32))
             .filter(outputs::maturity.gt(tip as i64))
             .load(conn)?)
     }
 
-    pub fn index_unconfirmed(conn: &SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
+    pub fn index_unconfirmed(conn: &mut SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(
                 outputs::status
@@ -301,7 +302,7 @@ impl OutputSql {
 
     pub fn index_by_output_type(
         output_type: OutputType,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         let res = diesel::sql_query("SELECT * FROM outputs where output_type & $1 = $1 ORDER BY id;")
             .bind::<diesel::sql_types::Integer, _>(i32::from(output_type.as_byte()))
@@ -309,7 +310,7 @@ impl OutputSql {
         Ok(res)
     }
 
-    pub fn index_unspent(conn: &SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
+    pub fn index_unspent(conn: &mut SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::status.eq(OutputStatus::Unspent as i32))
             .order(outputs::id.asc())
@@ -317,7 +318,7 @@ impl OutputSql {
     }
 
     pub fn index_marked_deleted_in_block_is_null(
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             // Return outputs not marked as deleted or confirmed
@@ -330,7 +331,7 @@ impl OutputSql {
 
     pub fn index_invalid(
         timestamp: &NaiveDateTime,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(
@@ -347,7 +348,9 @@ impl OutputSql {
             .load(conn)?)
     }
 
-    pub fn first_by_mined_height_desc(conn: &SqliteConnection) -> Result<Option<OutputSql>, OutputManagerStorageError> {
+    pub fn first_by_mined_height_desc(
+        conn: &mut SqliteConnection,
+    ) -> Result<Option<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::mined_height.is_not_null())
             .order(outputs::mined_height.desc())
@@ -356,7 +359,7 @@ impl OutputSql {
     }
 
     pub fn first_by_marked_deleted_height_desc(
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Option<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::marked_deleted_at_height.is_not_null())
@@ -366,13 +369,16 @@ impl OutputSql {
     }
 
     /// Find a particular Output, if it exists
-    pub fn find(spending_key: &[u8], conn: &SqliteConnection) -> Result<OutputSql, OutputManagerStorageError> {
+    pub fn find(spending_key: &str, conn: &mut SqliteConnection) -> Result<OutputSql, OutputManagerStorageError> {
         Ok(outputs::table
-            .filter(outputs::spending_key.eq(spending_key))
+            .filter(outputs::spending_key.eq(spending_key.to_string()))
             .first::<OutputSql>(conn)?)
     }
 
-    pub fn find_by_tx_id(tx_id: TxId, conn: &SqliteConnection) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
+    pub fn find_by_tx_id(
+        tx_id: TxId,
+        conn: &mut SqliteConnection,
+    ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(
                 outputs::received_in_tx_id
@@ -382,23 +388,48 @@ impl OutputSql {
             .load(conn)?)
     }
 
+    /// Verify that outputs with specified commitments exist in the database
+    pub fn verify_outputs_exist(
+        commitments: &[Commitment],
+        conn: &mut SqliteConnection,
+    ) -> Result<bool, OutputManagerStorageError> {
+        #[derive(QueryableByName, Clone)]
+        struct CountQueryResult {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        let placeholders = commitments
+            .iter()
+            .map(|v| format!("x'{}'", v.to_hex()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = sql_query(format!(
+            "SELECT COUNT(*) as count FROM outputs WHERE commitment IN ({})",
+            placeholders
+        ));
+        let query_result = query.load::<CountQueryResult>(conn)?;
+        let commitments_len = i64::try_from(commitments.len())
+            .map_err(|e| OutputManagerStorageError::ConversionError { reason: e.to_string() })?;
+        Ok(query_result[0].count == commitments_len)
+    }
+
     /// Return the available, time locked, pending incoming and pending outgoing balance
     #[allow(clippy::cast_possible_wrap)]
     pub fn get_balance(
         current_tip_for_time_lock_calculation: Option<u64>,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Balance, OutputManagerStorageError> {
         #[derive(QueryableByName, Clone)]
         struct BalanceQueryResult {
-            #[sql_type = "diesel::sql_types::BigInt"]
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
             amount: i64,
-            #[sql_type = "diesel::sql_types::Text"]
+            #[diesel(sql_type = diesel::sql_types::Text)]
             category: String,
         }
         let balance_query_result = if let Some(current_tip) = current_tip_for_time_lock_calculation {
             let balance_query = sql_query(
                 "SELECT coalesce(sum(value), 0) as amount, 'available_balance' as category \
-                 FROM outputs WHERE status = ? \
+                 FROM outputs WHERE status = ? AND maturity <= ? AND script_lock_height <= ? \
                  UNION ALL \
                  SELECT coalesce(sum(value), 0) as amount, 'time_locked_balance' as category \
                  FROM outputs WHERE status = ? AND maturity > ? OR script_lock_height > ? \
@@ -411,6 +442,8 @@ impl OutputSql {
             )
                 // available_balance
                 .bind::<diesel::sql_types::Integer, _>(OutputStatus::Unspent as i32)
+                .bind::<diesel::sql_types::BigInt, _>(current_tip as i64)
+                .bind::<diesel::sql_types::BigInt, _>(current_tip as i64)
                 // time_locked_balance
                 .bind::<diesel::sql_types::Integer, _>(OutputStatus::Unspent as i32)
                 .bind::<diesel::sql_types::BigInt, _>(current_tip as i64)
@@ -455,10 +488,14 @@ impl OutputSql {
         let mut pending_outgoing_balance = None;
         for balance in balance_query_result {
             match balance.category.as_str() {
-                "available_balance" => available_balance = Some(MicroTari::from(balance.amount as u64)),
-                "time_locked_balance" => time_locked_balance = Some(Some(MicroTari::from(balance.amount as u64))),
-                "pending_incoming_balance" => pending_incoming_balance = Some(MicroTari::from(balance.amount as u64)),
-                "pending_outgoing_balance" => pending_outgoing_balance = Some(MicroTari::from(balance.amount as u64)),
+                "available_balance" => available_balance = Some(MicroMinotari::from(balance.amount as u64)),
+                "time_locked_balance" => time_locked_balance = Some(Some(MicroMinotari::from(balance.amount as u64))),
+                "pending_incoming_balance" => {
+                    pending_incoming_balance = Some(MicroMinotari::from(balance.amount as u64))
+                },
+                "pending_outgoing_balance" => {
+                    pending_outgoing_balance = Some(MicroMinotari::from(balance.amount as u64))
+                },
                 _ => {
                     return Err(OutputManagerStorageError::UnexpectedResult(
                         "Unexpected category in balance query".to_string(),
@@ -489,7 +526,7 @@ impl OutputSql {
 
     pub fn find_by_commitment(
         commitment: &[u8],
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<OutputSql, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::commitment.eq(commitment))
@@ -499,7 +536,7 @@ impl OutputSql {
     pub fn find_by_commitments_excluding_status(
         commitments: Vec<&[u8]>,
         status: OutputStatus,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::commitment.eq_any(commitments))
@@ -510,7 +547,7 @@ impl OutputSql {
     pub fn update_by_commitments(
         commitments: Vec<&[u8]>,
         updated_output: UpdateOutput,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<usize, OutputManagerStorageError> {
         Ok(
             diesel::update(outputs::table.filter(outputs::commitment.eq_any(commitments)))
@@ -522,7 +559,7 @@ impl OutputSql {
     pub fn find_by_commitment_and_cancelled(
         commitment: &[u8],
         cancelled: bool,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<OutputSql, OutputManagerStorageError> {
         let cancelled_flag = OutputStatus::CancelledInbound as i32;
 
@@ -539,7 +576,7 @@ impl OutputSql {
     pub fn find_by_tx_id_and_status(
         tx_id: TxId,
         status: OutputStatus,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(
@@ -554,7 +591,7 @@ impl OutputSql {
     /// Find outputs via tx_id that are encumbered. Any outputs that are encumbered cannot be marked as spent.
     pub fn find_by_tx_id_and_encumbered(
         tx_id: TxId,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<Vec<OutputSql>, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(
@@ -574,13 +611,13 @@ impl OutputSql {
 
     /// Find a particular Output, if it exists and is in the specified Spent state
     pub fn find_status(
-        spending_key: &[u8],
+        spending_key: &str,
         status: OutputStatus,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<OutputSql, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::status.eq(status as i32))
-            .filter(outputs::spending_key.eq(spending_key))
+            .filter(outputs::spending_key.eq(spending_key.to_string()))
             .first::<OutputSql>(conn)?)
     }
 
@@ -588,26 +625,15 @@ impl OutputSql {
     pub fn find_by_hash(
         hash: &[u8],
         status: OutputStatus,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<OutputSql, OutputManagerStorageError> {
         Ok(outputs::table
             .filter(outputs::status.eq(status as i32))
-            .filter(outputs::hash.eq(Some(hash)))
+            .filter(outputs::hash.eq(hash))
             .first::<OutputSql>(conn)?)
     }
 
-    /// Find a particular Output, if it exists and is in the specified Spent state
-    pub fn find_pending_coinbase_at_block_height(
-        block_height: u64,
-        conn: &SqliteConnection,
-    ) -> Result<OutputSql, OutputManagerStorageError> {
-        Ok(outputs::table
-            .filter(outputs::status.ne(OutputStatus::Unspent as i32))
-            .filter(outputs::coinbase_block_height.eq(block_height as i64))
-            .first::<OutputSql>(conn)?)
-    }
-
-    pub fn delete(&self, conn: &SqliteConnection) -> Result<(), OutputManagerStorageError> {
+    pub fn delete(&self, conn: &mut SqliteConnection) -> Result<(), OutputManagerStorageError> {
         let num_deleted =
             diesel::delete(outputs::table.filter(outputs::spending_key.eq(&self.spending_key))).execute(conn)?;
 
@@ -621,7 +647,7 @@ impl OutputSql {
     pub fn update(
         &self,
         updated_output: UpdateOutput,
-        conn: &SqliteConnection,
+        conn: &mut SqliteConnection,
     ) -> Result<OutputSql, OutputManagerStorageError> {
         diesel::update(outputs::table.filter(outputs::id.eq(&self.id)))
             .set(UpdateOutputSql::from(updated_output))
@@ -632,12 +658,7 @@ impl OutputSql {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub fn to_db_unblinded_output(
-        mut self,
-        cipher: &XChaCha20Poly1305,
-    ) -> Result<DbUnblindedOutput, OutputManagerStorageError> {
-        self.decrypt(cipher).map_err(OutputManagerStorageError::AeadError)?;
-
+    pub fn to_db_wallet_output(self) -> Result<DbWalletOutput, OutputManagerStorageError> {
         let features: OutputFeatures =
             serde_json::from_str(&self.features_json).map_err(|s| OutputManagerStorageError::ConversionError {
                 reason: format!("Could not convert json into OutputFeatures:{}", s),
@@ -653,28 +674,34 @@ impl OutputSql {
             }
         })?;
 
-        let encrypted_value = EncryptedValue::from_bytes(&self.encrypted_value)?;
-        let unblinded_output = UnblindedOutput::new_current_version(
-            MicroTari::from(self.value as u64),
-            PrivateKey::from_vec(&self.spending_key).map_err(|_| {
+        let encrypted_data = EncryptedData::from_bytes(&self.encrypted_data)?;
+        let payment_id = match self.payment_id {
+            Some(bytes) => PaymentId::from_bytes(&bytes),
+            None => PaymentId::Empty,
+        };
+
+        let wallet_output = WalletOutput::new_with_rangeproof(
+            TransactionOutputVersion::get_current_version(),
+            MicroMinotari::from(self.value as u64),
+            KeyId::from_str(&self.spending_key).map_err(|e| {
                 error!(
                     target: LOG_TARGET,
-                    "Could not create PrivateKey from stored bytes, They might be encrypted"
+                    "Could not create spending key id from stored string ({})", e
                 );
                 OutputManagerStorageError::ConversionError {
-                    reason: "PrivateKey could not be converted from bytes".to_string(),
+                    reason: format!("Spending key id could not be converted from string ({})", e),
                 }
             })?,
             features,
             TariScript::from_bytes(self.script.as_slice())?,
             ExecutionStack::from_bytes(self.input_data.as_slice())?,
-            PrivateKey::from_vec(&self.script_private_key).map_err(|_| {
+            KeyId::from_str(&self.script_private_key).map_err(|e| {
                 error!(
                     target: LOG_TARGET,
-                    "Could not create PrivateKey from stored bytes, They might be encrypted"
+                    "Could not create script private key id from stored string ({})", e
                 );
                 OutputManagerStorageError::ConversionError {
-                    reason: "PrivateKey could not be converted from bytes".to_string(),
+                    reason: format!("Script private key id could not be converted from string ({})", e),
                 }
             })?,
             PublicKey::from_vec(&self.sender_offset_public_key).map_err(|_| {
@@ -735,39 +762,30 @@ impl OutputSql {
             ),
             self.script_lock_height as u64,
             covenant,
-            encrypted_value,
-            MicroTari::from(self.minimum_value_promise as u64),
+            encrypted_data,
+            MicroMinotari::from(self.minimum_value_promise as u64),
+            match self.rangeproof {
+                Some(bytes) => Some(RangeProof::from_canonical_bytes(&bytes)?),
+                None => None,
+            },
+            payment_id.clone(),
         );
 
-        // we manually zeroize the sensitive data associated with OuptputSql, to avoid any leaks
-        self.spending_key.zeroize();
-        self.script_private_key.zeroize();
-
-        let hash = match self.hash {
-            None => {
-                let factories = CryptoFactories::default();
-                unblinded_output.as_transaction_output(&factories)?.hash()
-            },
-            Some(v) => match v.try_into() {
-                Ok(v) => v,
-                Err(e) => {
-                    error!(target: LOG_TARGET, "Malformed transaction hash: {}", e);
-                    return Err(OutputManagerStorageError::ConversionError {
-                        reason: "Malformed transaction hash".to_string(),
-                    });
-                },
+        let commitment = Commitment::from_vec(&self.commitment)?;
+        let hash = match <Vec<u8> as TryInto<FixedHash>>::try_into(self.hash) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(target: LOG_TARGET, "Malformed output hash: {}", e);
+                return Err(OutputManagerStorageError::ConversionError {
+                    reason: "Malformed output hash".to_string(),
+                });
             },
         };
-        let commitment = match self.commitment {
-            None => {
-                let factories = CryptoFactories::default();
-                factories
-                    .commitment
-                    .commit(&unblinded_output.spending_key, &unblinded_output.value.into())
-            },
-            Some(c) => Commitment::from_vec(&c)?,
-        };
-        let spending_priority = (self.spending_priority as u32).into();
+        let spending_priority = SpendingPriority::try_from(self.spending_priority as u32).map_err(|e| {
+            OutputManagerStorageError::ConversionError {
+                reason: format!("Could not convert spending priority from i32: {}", e),
+            }
+        })?;
         let mined_in_block = match self.mined_in_block {
             Some(v) => match v.try_into() {
                 Ok(v) => Some(v),
@@ -782,53 +800,21 @@ impl OutputSql {
             },
             None => None,
         };
-        Ok(DbUnblindedOutput {
+        Ok(DbWalletOutput {
             commitment,
-            unblinded_output,
+            wallet_output,
             hash,
             status: self.status.try_into()?,
             mined_height: self.mined_height.map(|mh| mh as u64),
             mined_in_block,
-            mined_mmr_position: self.mined_mmr_position.map(|mp| mp as u64),
-            mined_timestamp: self.mined_timestamp,
+            mined_timestamp: self.mined_timestamp.map(|mt| mt.and_utc()),
             marked_deleted_at_height: self.marked_deleted_at_height.map(|d| d as u64),
             marked_deleted_in_block,
             spending_priority,
             source: self.source.try_into()?,
+            received_in_tx_id: self.received_in_tx_id.map(|d| (d as u64).into()),
+            spent_in_tx_id: self.spent_in_tx_id.map(|d| (d as u64).into()),
+            payment_id,
         })
-    }
-}
-
-impl Encryptable<XChaCha20Poly1305> for OutputSql {
-    fn domain(&self, field_name: &'static str) -> Vec<u8> {
-        // WARNING: using `OUTPUT` for both NewOutputSql and OutputSql due to later transition without re-encryption
-        [Self::OUTPUT, self.script.as_slice(), field_name.as_bytes()]
-            .concat()
-            .to_vec()
-    }
-
-    fn encrypt(&mut self, cipher: &XChaCha20Poly1305) -> Result<(), String> {
-        self.spending_key = encrypt_bytes_integral_nonce(
-            cipher,
-            self.domain("spending_key"),
-            Hidden::hide(self.spending_key.clone()),
-        )?;
-
-        self.script_private_key = encrypt_bytes_integral_nonce(
-            cipher,
-            self.domain("script_private_key"),
-            Hidden::hide(self.script_private_key.clone()),
-        )?;
-
-        Ok(())
-    }
-
-    fn decrypt(&mut self, cipher: &XChaCha20Poly1305) -> Result<(), String> {
-        self.spending_key = decrypt_bytes_integral_nonce(cipher, self.domain("spending_key"), &self.spending_key)?;
-
-        self.script_private_key =
-            decrypt_bytes_integral_nonce(cipher, self.domain("script_private_key"), &self.script_private_key)?;
-
-        Ok(())
     }
 }

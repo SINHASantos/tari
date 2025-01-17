@@ -28,9 +28,9 @@ use log::*;
 use tari_common_types::{
     tari_address::TariAddress,
     transaction::{TransactionDirection, TransactionStatus, TxId},
-    types::HashOutput,
 };
 use tari_core::transactions::{
+    key_manager::TransactionKeyManagerInterface,
     transaction_components::Transaction,
     transaction_protocol::{recipient::RecipientState, sender::TransactionSenderMessage},
 };
@@ -44,6 +44,7 @@ use crate::{
     transaction_service::{
         error::{TransactionServiceError, TransactionServiceProtocolError},
         handle::TransactionEvent,
+        protocols::check_transaction_size,
         service::TransactionServiceResources,
         storage::{
             database::TransactionBackend,
@@ -53,7 +54,6 @@ use crate::{
         utc::utc_duration_since,
     },
 };
-
 const LOG_TARGET: &str = "wallet::transaction_service::protocols::receive_protocol";
 
 #[derive(Debug, PartialEq)]
@@ -62,33 +62,31 @@ pub enum TransactionReceiveProtocolStage {
     WaitForFinalize,
 }
 
-pub struct TransactionReceiveProtocol<TBackend, TWalletConnectivity> {
+pub struct TransactionReceiveProtocol<TBackend, TWalletConnectivity, TKeyManagerInterface> {
     id: TxId,
     source_address: TariAddress,
     sender_message: TransactionSenderMessage,
     stage: TransactionReceiveProtocolStage,
-    resources: TransactionServiceResources<TBackend, TWalletConnectivity>,
+    resources: TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
     transaction_finalize_receiver: Option<mpsc::Receiver<(TariAddress, TxId, Transaction)>>,
     cancellation_receiver: Option<oneshot::Receiver<()>>,
-    prev_header: Option<HashOutput>,
-    height: Option<u64>,
 }
 
-impl<TBackend, TWalletConnectivity> TransactionReceiveProtocol<TBackend, TWalletConnectivity>
+impl<TBackend, TWalletConnectivity, TKeyManagerInterface>
+    TransactionReceiveProtocol<TBackend, TWalletConnectivity, TKeyManagerInterface>
 where
     TBackend: TransactionBackend + 'static,
     TWalletConnectivity: WalletConnectivityInterface,
+    TKeyManagerInterface: TransactionKeyManagerInterface,
 {
     pub fn new(
         id: TxId,
         source_address: TariAddress,
         sender_message: TransactionSenderMessage,
         stage: TransactionReceiveProtocolStage,
-        resources: TransactionServiceResources<TBackend, TWalletConnectivity>,
+        resources: TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
         transaction_finalize_receiver: mpsc::Receiver<(TariAddress, TxId, Transaction)>,
         cancellation_receiver: oneshot::Receiver<()>,
-        prev_header: Option<HashOutput>,
-        height: Option<u64>,
     ) -> Self {
         Self {
             id,
@@ -98,8 +96,6 @@ where
             resources,
             transaction_finalize_receiver: Some(transaction_finalize_receiver),
             cancellation_receiver: Some(cancellation_receiver),
-            prev_header,
-            height,
         }
     }
 
@@ -159,9 +155,15 @@ where
                 amount,
                 rtp,
                 TransactionStatus::Pending,
-                data.message.clone(),
-                Utc::now().naive_utc(),
+                data.payment_id.clone(),
+                Utc::now(),
             );
+
+            // Verify that the negotiated transaction is not too large to be broadcast
+            if let Err(e) = check_transaction_size(&inbound_transaction, self.id) {
+                self.cancel_oversized_transaction().await?;
+                return Err(e);
+            }
 
             self.resources
                 .db
@@ -198,10 +200,10 @@ where
 
             trace!(
                 target: LOG_TARGET,
-                "Transaction (TX_ID: {}) - Amount: {} - Message: {}",
+                "Transaction (TX_ID: {}) - Amount: {} - Payment ID: {}",
                 data.tx_id,
                 amount,
-                data.message,
+                data.payment_id,
             );
 
             let _size = self
@@ -245,6 +247,12 @@ where
                 return Ok(());
             },
         };
+
+        // Verify that the negotiated transaction is not too large to be broadcast
+        if let Err(e) = check_transaction_size(&inbound_tx, self.id) {
+            self.cancel_oversized_transaction().await?;
+            return Err(e);
+        }
 
         // Determine the time remaining before this transaction times out
         let elapsed_time = utc_duration_since(&inbound_tx.timestamp)
@@ -306,7 +314,7 @@ where
                 tokio::select! {
                     Some((address, tx_id, tx)) = receiver.recv() => {
                         incoming_finalized_transaction = Some(tx);
-                        if inbound_tx.source_address != address {
+                        if inbound_tx.source_address.comms_public_key() != address.public_spend_key()  {
                             warn!(
                                 target: LOG_TARGET,
                                 "Finalized Transaction did not come from the expected Public Key"
@@ -363,16 +371,6 @@ where
                 self.source_address.clone()
             );
 
-            finalized_transaction
-                .validate_internal_consistency(
-                    true,
-                    &self.resources.factories,
-                    None,
-                    self.prev_header,
-                    self.height.unwrap_or(u64::MAX),
-                )
-                .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
-
             // Find your own output in the transaction
             let rtp_output = match inbound_tx.receiver_protocol.state.clone() {
                 RecipientState::Finalized(s) => s.output,
@@ -393,7 +391,7 @@ where
             // Update output metadata signature if not valid (typically the receiver after the sender finalized)
             match finalized_outputs
                 .iter()
-                .find(|output| output.hash() == rtp_output.hash())
+                .find(|output| output.commitment() == rtp_output.commitment())
             {
                 Some(v) => {
                     if rtp_output.verify_metadata_signature().is_err() {
@@ -436,18 +434,21 @@ where
             let completed_transaction = CompletedTransaction::new(
                 self.id,
                 self.source_address.clone(),
-                self.resources.wallet_identity.address.clone(),
+                self.resources.interactive_tari_address.clone(),
                 inbound_tx.amount,
-                finalized_transaction.body.get_total_fee(),
+                finalized_transaction
+                    .body
+                    .get_total_fee()
+                    .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?,
                 finalized_transaction.clone(),
                 TransactionStatus::Completed,
-                inbound_tx.message.clone(),
                 inbound_tx.timestamp,
                 TransactionDirection::Inbound,
                 None,
                 None,
-                None,
-            );
+                inbound_tx.payment_id.clone(),
+            )
+            .map_err(|e| TransactionServiceProtocolError::new(self.id, TransactionServiceError::from(e)))?;
 
             self.resources
                 .db
@@ -480,6 +481,32 @@ where
             "Cancelling Transaction Receive Protocol (TxId: {}) due to timeout after no counterparty response", self.id
         );
 
+        self.cancel_transaction(TxCancellationReason::Timeout).await?;
+
+        info!(
+            target: LOG_TARGET,
+            "Pending Transaction (TxId: {}) timed out after no response from counterparty", self.id
+        );
+
+        Err(TransactionServiceProtocolError::new(
+            self.id,
+            TransactionServiceError::Timeout,
+        ))
+    }
+
+    async fn cancel_oversized_transaction(&mut self) -> Result<(), TransactionServiceProtocolError<TxId>> {
+        info!(
+            target: LOG_TARGET,
+            "Cancelling Transaction Receive Protocol (TxId: {}) due to transaction being oversized", self.id
+        );
+
+        self.cancel_transaction(TxCancellationReason::Oversized).await
+    }
+
+    async fn cancel_transaction(
+        &mut self,
+        cancel_reason: TxCancellationReason,
+    ) -> Result<(), TransactionServiceProtocolError<TxId>> {
         self.resources.db.cancel_pending_transaction(self.id).map_err(|e| {
             warn!(
                 target: LOG_TARGET,
@@ -497,10 +524,7 @@ where
         let _size = self
             .resources
             .event_publisher
-            .send(Arc::new(TransactionEvent::TransactionCancelled(
-                self.id,
-                TxCancellationReason::Timeout,
-            )))
+            .send(Arc::new(TransactionEvent::TransactionCancelled(self.id, cancel_reason)))
             .map_err(|e| {
                 trace!(
                     target: LOG_TARGET,
@@ -513,14 +537,6 @@ where
                 )
             });
 
-        info!(
-            target: LOG_TARGET,
-            "Pending Transaction (TxId: {}) timed out after no response from counterparty", self.id
-        );
-
-        Err(TransactionServiceProtocolError::new(
-            self.id,
-            TransactionServiceError::Timeout,
-        ))
+        Ok(())
     }
 }

@@ -21,15 +21,13 @@
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use std::{
-    cmp,
     convert::{TryFrom, TryInto},
     fmt,
     fmt::Display,
 };
 
 use bitflags::bitflags;
-use chrono::{DateTime, NaiveDateTime, Utc};
-use prost_types::Timestamp;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tari_comms::{message::MessageTag, peer_manager::NodeId, types::CommsPublicKey, NodeIdentity};
 use tari_utilities::{epoch_time::EpochTime, ByteArray, ByteArrayError};
@@ -39,21 +37,6 @@ use thiserror::Error;
 pub use crate::proto::envelope::{dht_header::Destination, DhtEnvelope, DhtHeader, DhtMessageType};
 use crate::version::DhtProtocolVersion;
 
-/// Utility function that converts a `chrono::DateTime<Utc>` to a `prost_type::Timestamp`
-pub(crate) fn datetime_to_timestamp(datetime: DateTime<Utc>) -> Timestamp {
-    Timestamp {
-        seconds: datetime.timestamp(),
-        nanos: datetime.timestamp_subsec_nanos().try_into().unwrap_or(i32::MAX),
-    }
-}
-
-/// Utility function that converts a `prost::Timestamp` to a `chrono::DateTime<Utc>`
-pub(crate) fn timestamp_to_datetime(timestamp: Timestamp) -> Option<DateTime<Utc>> {
-    let naive =
-        NaiveDateTime::from_timestamp_opt(timestamp.seconds, u32::try_from(cmp::max(0, timestamp.nanos)).unwrap())?;
-    Some(DateTime::from_utc(naive, Utc))
-}
-
 /// Utility function that converts a `chrono::DateTime` to a `EpochTime`
 pub(crate) fn datetime_to_epochtime(datetime: DateTime<Utc>) -> EpochTime {
     #[allow(clippy::cast_sign_loss)]
@@ -62,11 +45,11 @@ pub(crate) fn datetime_to_epochtime(datetime: DateTime<Utc>) -> EpochTime {
 
 /// Utility function that converts a `EpochTime` to a `chrono::DateTime`
 pub(crate) fn epochtime_to_datetime(datetime: EpochTime) -> DateTime<Utc> {
-    let dt = NaiveDateTime::from_timestamp_opt(i64::try_from(datetime.as_u64()).unwrap_or(i64::MAX), 0)
-        .unwrap_or(NaiveDateTime::MAX);
-    DateTime::from_utc(dt, Utc)
+    DateTime::from_timestamp(i64::try_from(datetime.as_u64()).unwrap_or(i64::MAX), 0)
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
+/// Message errors that should be verified by every node
 #[derive(Debug, Error)]
 pub enum DhtMessageError {
     #[error("Invalid node destination")]
@@ -83,8 +66,10 @@ pub enum DhtMessageError {
     InvalidMessageFlags,
     #[error("Invalid ephemeral public key")]
     InvalidEphemeralPublicKey,
-    #[error("Header was omitted from the message")]
+    #[error("Header is omitted from the message")]
     HeaderOmitted,
+    #[error("Message Body is empty")]
+    BodyEmpty,
 }
 
 impl fmt::Display for DhtMessageType {
@@ -97,7 +82,7 @@ impl fmt::Display for DhtMessageType {
 bitflags! {
     /// Used to indicate characteristics of the incoming or outgoing message, such
     /// as whether the message is encrypted.
-    #[derive(Deserialize, Serialize, Default)]
+    #[derive(Deserialize, Serialize, Default, Copy, Clone, Debug, Eq, PartialEq)]
     pub struct DhtMessageFlags: u32 {
         const NONE = 0x00;
         /// Set if the message is encrypted
@@ -117,11 +102,19 @@ impl DhtMessageType {
     }
 
     pub fn is_dht_message(self) -> bool {
-        self.is_dht_discovery() || matches!(self, DhtMessageType::DiscoveryResponse) || self.is_dht_join()
+        self.is_dht_discovery() || self.is_dht_discovery_response() || self.is_dht_join()
+    }
+
+    pub fn is_forwardable(self) -> bool {
+        self.is_domain_message() || self.is_dht_discovery() || self.is_dht_join()
     }
 
     pub fn is_dht_discovery(self) -> bool {
         matches!(self, DhtMessageType::Discovery)
+    }
+
+    pub fn is_dht_discovery_response(self) -> bool {
+        matches!(self, DhtMessageType::DiscoveryResponse)
     }
 
     pub fn is_dht_join(self) -> bool {
@@ -140,8 +133,6 @@ impl DhtMessageType {
 pub struct DhtMessageHeader {
     pub version: DhtProtocolVersion,
     pub destination: NodeDestination,
-    /// Encoded MessageSignature. Depending on message flags, this may be encrypted. This can refer to the same peer
-    /// that sent the message or another peer if the message is being propagated.
     pub message_signature: Vec<u8>,
     pub ephemeral_public_key: Option<CommsPublicKey>,
     pub message_type: DhtMessageType,
@@ -151,12 +142,31 @@ pub struct DhtMessageHeader {
 }
 
 impl DhtMessageHeader {
-    pub fn is_valid(&self) -> bool {
+    /// Checks if the DHT header is semantically valid. For example, if the message is flagged as encrypted, but sets a
+    /// empty signature or provides no ephemeral public key, this returns false.
+    pub fn is_semantically_valid(&self) -> bool {
+        // If the message is encrypted:
+        // - it needs a destination
+        // - it needs an ephemeral public key
+        // - it needs a signature
         if self.flags.is_encrypted() {
-            !self.message_signature.is_empty() && self.ephemeral_public_key.is_some()
-        } else {
-            true
+            // Must have a destination
+            if self.destination.is_unknown() {
+                return false;
+            }
+
+            // Must have an ephemeral public key
+            if self.ephemeral_public_key.is_none() {
+                return false;
+            }
+
+            // Must have a signature
+            if self.message_signature.is_empty() {
+                return false;
+            }
         }
+
+        true
     }
 }
 
@@ -196,12 +206,16 @@ impl TryFrom<DhtHeader> for DhtMessageHeader {
             None
         } else {
             Some(
-                CommsPublicKey::from_bytes(&header.ephemeral_public_key)
+                CommsPublicKey::from_canonical_bytes(&header.ephemeral_public_key)
                     .map_err(|_| DhtMessageError::InvalidEphemeralPublicKey)?,
             )
         };
 
-        let expires = header.expires.and_then(timestamp_to_datetime);
+        let expires = match header.expires {
+            0 => None,
+            t => Some(EpochTime::from_secs_since_epoch(t)),
+        };
+
         let version = DhtProtocolVersion::try_from(header.major)?;
 
         Ok(Self {
@@ -209,10 +223,11 @@ impl TryFrom<DhtHeader> for DhtMessageHeader {
             destination,
             message_signature: header.message_signature,
             ephemeral_public_key,
-            message_type: DhtMessageType::from_i32(header.message_type).ok_or(DhtMessageError::InvalidMessageType)?,
+            message_type: DhtMessageType::try_from(header.message_type)
+                .map_err(|_| DhtMessageError::InvalidMessageType)?,
             flags: DhtMessageFlags::from_bits(header.flags).ok_or(DhtMessageError::InvalidMessageFlags)?,
             message_tag: MessageTag::from(header.message_tag),
-            expires: expires.map(datetime_to_epochtime),
+            expires,
         })
     }
 }
@@ -230,20 +245,19 @@ impl TryFrom<Option<DhtHeader>> for DhtMessageHeader {
 
 impl From<DhtMessageHeader> for DhtHeader {
     fn from(header: DhtMessageHeader) -> Self {
-        let expires = header.expires.map(epochtime_to_datetime);
         Self {
             major: header.version.as_major(),
             ephemeral_public_key: header
                 .ephemeral_public_key
                 .as_ref()
                 .map(ByteArray::to_vec)
-                .unwrap_or_else(Vec::new),
+                .unwrap_or_default(),
             message_signature: header.message_signature,
             destination: Some(header.destination.into()),
             message_type: header.message_type as i32,
             flags: header.flags.bits(),
             message_tag: header.message_tag.as_value(),
-            expires: expires.map(datetime_to_timestamp),
+            expires: header.expires.map(EpochTime::as_u64).unwrap_or_default(),
         }
     }
 }
@@ -258,10 +272,11 @@ impl DhtEnvelope {
 }
 
 /// Represents the ways a destination node can be represented.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub enum NodeDestination {
     /// The sender has chosen not to disclose the message destination, or the destination is
     /// the peer being sent to.
+    #[default]
     Unknown,
     /// Destined for a particular public key
     PublicKey(Box<CommsPublicKey>),
@@ -332,12 +347,6 @@ impl Display for NodeDestination {
     }
 }
 
-impl Default for NodeDestination {
-    fn default() -> Self {
-        NodeDestination::Unknown
-    }
-}
-
 impl TryFrom<Destination> for NodeDestination {
     type Error = ByteArrayError;
 
@@ -345,7 +354,7 @@ impl TryFrom<Destination> for NodeDestination {
         match destination {
             Destination::Unknown(_) => Ok(NodeDestination::Unknown),
             Destination::PublicKey(pk) => {
-                CommsPublicKey::from_bytes(&pk).map(|pk| NodeDestination::PublicKey(Box::new(pk)))
+                CommsPublicKey::from_canonical_bytes(&pk).map(|pk| NodeDestination::PublicKey(Box::new(pk)))
             },
         }
     }

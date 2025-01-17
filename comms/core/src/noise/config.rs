@@ -22,10 +22,10 @@
 
 // This file is heavily influenced by the Libra Noise protocol implementation.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use log::*;
-use snow::{self, params::NoiseParams};
+use snow::params::NoiseParams;
 use tari_utilities::ByteArray;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -40,7 +40,7 @@ use crate::{
 };
 
 const LOG_TARGET: &str = "comms::noise";
-pub(super) const NOISE_IX_PARAMETER: &str = "Noise_IX_25519_ChaChaPoly_BLAKE2b";
+pub(super) const NOISE_PARAMETERS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2b";
 
 /// The Noise protocol configuration to be used to perform a protocol upgrade on an underlying
 /// socket.
@@ -48,21 +48,28 @@ pub(super) const NOISE_IX_PARAMETER: &str = "Noise_IX_25519_ChaChaPoly_BLAKE2b";
 pub struct NoiseConfig {
     node_identity: Arc<NodeIdentity>,
     parameters: NoiseParams,
+    recv_timeout: Duration,
 }
 
 impl NoiseConfig {
     /// Create a new NoiseConfig with the provided keypair
     pub fn new(node_identity: Arc<NodeIdentity>) -> Self {
-        let parameters: NoiseParams = NOISE_IX_PARAMETER.parse().expect("Invalid noise parameters");
+        let parameters: NoiseParams = NOISE_PARAMETERS.parse().expect("Invalid noise parameters");
         Self {
             node_identity,
             parameters,
+            recv_timeout: Duration::from_secs(3),
         }
+    }
+
+    /// Sets a custom receive timeout when waiting for handshake responses.
+    pub fn with_recv_timeout(mut self, recv_timeout: Duration) -> Self {
+        self.recv_timeout = recv_timeout;
+        self
     }
 
     /// Upgrades the given socket to using the noise protocol. The upgraded socket and the peer's static key
     /// is returned.
-    #[tracing::instrument(name = "noise::upgrade_socket", skip(self, socket))]
     pub async fn upgrade_socket<TSocket>(
         &self,
         socket: TSocket,
@@ -71,25 +78,30 @@ impl NoiseConfig {
     where
         TSocket: AsyncWrite + AsyncRead + Unpin,
     {
+        const TARI_PROLOGUE: &[u8] = b"com.tari.comms.noise.prologue";
+
         let handshake_state = {
-            let builder =
-                snow::Builder::with_resolver(self.parameters.clone(), Box::new(TariCryptoResolver::default()))
-                    .local_private_key(self.node_identity.secret_key().as_bytes());
+            let builder = snow::Builder::with_resolver(self.parameters.clone(), Box::<TariCryptoResolver>::default())
+                .prologue(TARI_PROLOGUE)
+                .local_private_key(self.node_identity.secret_key().as_bytes());
 
             match direction {
                 ConnectionDirection::Outbound => {
-                    debug!(target: LOG_TARGET, "Starting noise initiator handshake ");
+                    trace!(target: LOG_TARGET, "Starting noise initiator handshake ");
                     builder.build_initiator()?
                 },
                 ConnectionDirection::Inbound => {
-                    debug!(target: LOG_TARGET, "Starting noise responder handshake");
+                    trace!(target: LOG_TARGET, "Starting noise responder handshake");
                     builder.build_responder()?
                 },
             }
         };
 
-        let handshake = Handshake::new(socket, handshake_state);
-        let socket = handshake.handshake_1rt().await.map_err(NoiseError::HandshakeFailed)?;
+        let handshake = Handshake::new(socket, handshake_state, self.recv_timeout);
+        let socket = handshake
+            .perform_handshake()
+            .await
+            .map_err(NoiseError::HandshakeFailed)?;
 
         Ok(socket)
     }
@@ -102,20 +114,15 @@ mod test {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::{
-        memsocket::MemorySocket,
-        peer_manager::PeerFeatures,
-        runtime,
-        test_utils::node_identity::build_node_identity,
-    };
+    use crate::{memsocket::MemorySocket, peer_manager::PeerFeatures, test_utils::node_identity::build_node_identity};
 
     fn check_noise_params(config: &NoiseConfig) {
         assert_eq!(config.parameters.hash, HashChoice::Blake2b);
-        assert_eq!(config.parameters.name, NOISE_IX_PARAMETER);
+        assert_eq!(config.parameters.name, NOISE_PARAMETERS);
         assert_eq!(config.parameters.cipher, CipherChoice::ChaChaPoly);
         assert_eq!(config.parameters.base, BaseChoice::Noise);
         assert_eq!(config.parameters.dh, DHChoice::Curve25519);
-        assert_eq!(config.parameters.handshake.pattern, HandshakePattern::IX);
+        assert_eq!(config.parameters.handshake.pattern, HandshakePattern::XX);
     }
 
     #[test]
@@ -126,7 +133,7 @@ mod test {
         assert_eq!(config.node_identity.public_key(), node_identity.public_key());
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn upgrade_socket() {
         let node_identity1 = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
         let config1 = NoiseConfig::new(node_identity1.clone());

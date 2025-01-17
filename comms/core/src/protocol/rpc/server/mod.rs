@@ -20,8 +20,7 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-mod chunking;
-use chunking::ChunkedResponseIter;
+// mod chunking;
 
 mod error;
 pub use error::RpcServerError;
@@ -30,6 +29,7 @@ mod handle;
 pub use handle::RpcServerHandle;
 use handle::RpcServerRequest;
 
+#[cfg(feature = "metrics")]
 mod metrics;
 
 pub mod mock;
@@ -51,7 +51,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures::{future, stream, stream::FuturesUnordered, SinkExt, StreamExt};
+use futures::{future, stream::FuturesUnordered, SinkExt, StreamExt};
 use log::*;
 use prost::Message;
 use router::Router;
@@ -78,6 +78,7 @@ use crate::{
     peer_manager::NodeId,
     proto,
     protocol::{
+        rpc,
         rpc::{
             body::BodyBytes,
             message::{RpcMethod, RpcResponse},
@@ -88,7 +89,7 @@ use crate::{
         ProtocolNotification,
         ProtocolNotificationRx,
     },
-    stream_id::StreamId,
+    stream_id::{Id, StreamId},
     Bytes,
     Substream,
 };
@@ -178,6 +179,7 @@ pub struct RpcServerBuilder {
     maximum_sessions_per_client: Option<usize>,
     minimum_client_deadline: Duration,
     handshake_timeout: Duration,
+    cull_oldest_peer_rpc_connection_on_full: bool,
 }
 
 impl RpcServerBuilder {
@@ -197,6 +199,11 @@ impl RpcServerBuilder {
 
     pub fn with_maximum_sessions_per_client(mut self, limit: usize) -> Self {
         self.maximum_sessions_per_client = Some(cmp::min(limit, BoundedExecutor::max_theoretical_tasks()));
+        self
+    }
+
+    pub fn with_cull_oldest_peer_rpc_connection_on_full(mut self, cull: bool) -> Self {
+        self.cull_oldest_peer_rpc_connection_on_full = cull;
         self
     }
 
@@ -227,6 +234,7 @@ impl Default for RpcServerBuilder {
             maximum_sessions_per_client: None,
             minimum_client_deadline: Duration::from_secs(1),
             handshake_timeout: Duration::from_secs(15),
+            cull_oldest_peer_rpc_connection_on_full: false,
         }
     }
 }
@@ -238,8 +246,13 @@ pub(super) struct PeerRpcServer<TSvc, TCommsProvider> {
     protocol_notifications: Option<ProtocolNotificationRx<Substream>>,
     comms_provider: TCommsProvider,
     request_rx: mpsc::Receiver<RpcServerRequest>,
-    sessions: HashMap<NodeId, usize>,
-    tasks: FuturesUnordered<JoinHandle<NodeId>>,
+    sessions: HashMap<NodeId, Vec<SessionInfo>>,
+    tasks: FuturesUnordered<JoinHandle<(NodeId, Id)>>,
+}
+
+struct SessionInfo {
+    pub(crate) peer_watch: tokio::sync::watch::Sender<()>,
+    pub(crate) stream_id: Id,
 }
 
 impl<TSvc, TCommsProvider> PeerRpcServer<TSvc, TCommsProvider>
@@ -267,7 +280,7 @@ where
         Self {
             executor: match config.maximum_simultaneous_sessions {
                 Some(usize::MAX) => BoundedExecutor::allow_maximum(),
-                Some(num) => BoundedExecutor::from_current(num),
+                Some(num) => BoundedExecutor::new(num),
                 None => BoundedExecutor::allow_maximum(),
             },
             config,
@@ -296,8 +309,8 @@ where
                     }
                 }
 
-                Some(Ok(node_id)) = self.tasks.next() => {
-                    self.on_session_complete(&node_id);
+                Some(Ok((node_id, stream_id))) = self.tasks.next() => {
+                    self.on_session_complete(&node_id, stream_id);
                 },
 
                 Some(req) = self.request_rx.recv() => {
@@ -314,7 +327,7 @@ where
         Ok(())
     }
 
-    async fn handle_request(&self, req: RpcServerRequest) {
+    async fn handle_request(&mut self, req: RpcServerRequest) {
         #[allow(clippy::enum_glob_use)]
         use RpcServerRequest::*;
         match req {
@@ -327,13 +340,16 @@ where
                 let _ = reply.send(num_active);
             },
             GetNumActiveSessionsForPeer(node_id, reply) => {
-                let num_active = self.sessions.get(&node_id).copied().unwrap_or(0);
+                let num_active = self.sessions.get(&node_id).map(|v| v.len()).unwrap_or(0);
                 let _ = reply.send(num_active);
+            },
+            CloseAllSessionsForPeer(node_id, reply) => {
+                let num_closed = self.close_all_sessions(&node_id);
+                let _ = reply.send(num_closed);
             },
         }
     }
 
-    #[tracing::instrument(name = "rpc::server::new_client_connection", skip(self, notification), err)]
     async fn handle_protocol_notification(
         &mut self,
         notification: ProtocolNotification<Substream>,
@@ -355,6 +371,7 @@ where
                     Ok(_) => {},
                     Err(err @ RpcServerError::HandshakeError(_)) => {
                         debug!(target: LOG_TARGET, "Handshake error: {}", err);
+                        #[cfg(feature = "metrics")]
                         metrics::handshake_error_counter(&node_id, &notification.protocol).inc();
                     },
                     Err(err) => {
@@ -367,33 +384,67 @@ where
         Ok(())
     }
 
-    fn new_session_for(&mut self, node_id: NodeId) -> Result<usize, RpcServerError> {
-        let count = self.sessions.entry(node_id.clone()).or_insert(0);
+    fn new_session_possible_for(&mut self, node_id: &NodeId) -> Result<usize, RpcServerError> {
         match self.config.maximum_sessions_per_client {
             Some(max) if max > 0 => {
-                debug_assert!(*count <= max);
-                if *count >= max {
-                    return Err(RpcServerError::MaxSessionsPerClientReached { node_id });
+                if let Some(session_info) = self.sessions.get_mut(node_id) {
+                    if max > session_info.len() {
+                        Ok(session_info.len())
+                    } else if self.config.cull_oldest_peer_rpc_connection_on_full {
+                        // Remove the oldest session(s) until we have space for a new one
+                        let num_to_remove = session_info.len() - max + 1;
+                        for _ in 0..num_to_remove {
+                            let info = session_info.remove(0);
+                            info!(target: LOG_TARGET, "Culling oldest RPC session for peer `{}`", node_id);
+                            let _ = info.peer_watch.send(());
+                        }
+                        Ok(session_info.len())
+                    } else {
+                        warn!(
+                            target: LOG_TARGET,
+                            "Maximum RPC sessions for peer {} met or exceeded. Max: {}, Current: {}",
+                            node_id, max, session_info.len()
+                        );
+                        Err(RpcServerError::MaxSessionsPerClientReached {
+                            node_id: node_id.clone(),
+                            max_sessions: max,
+                        })
+                    }
+                } else {
+                    Ok(0)
                 }
             },
-            Some(_) | None => {},
+            Some(_) | None => Ok(0),
         }
-
-        *count += 1;
-        Ok(*count)
     }
 
-    fn on_session_complete(&mut self, node_id: &NodeId) {
-        info!(target: LOG_TARGET, "Session complete for {}", node_id);
-        if let Some(v) = self.sessions.get_mut(node_id) {
-            *v -= 1;
-            if *v == 0 {
+    fn close_all_sessions(&mut self, node_id: &NodeId) -> usize {
+        let mut count = 0;
+        if let Some(session_info) = self.sessions.get_mut(node_id) {
+            for info in session_info.iter_mut() {
+                count += 1;
+                info!(target: LOG_TARGET, "Closing RPC session {} for peer `{}`", info.stream_id, node_id);
+                let _ = info.peer_watch.send(());
+            }
+            self.sessions.remove(node_id);
+        }
+        count
+    }
+
+    fn on_session_complete(&mut self, node_id: &NodeId, stream_id: Id) {
+        if let Some(session_info) = self.sessions.get_mut(node_id) {
+            if let Some(info) = session_info.iter_mut().find(|info| info.stream_id == stream_id) {
+                info!(target: LOG_TARGET, "Session complete for {} (stream id {})", node_id, stream_id);
+                let _ = info.peer_watch.send(());
+            };
+            session_info.retain(|info| info.stream_id != stream_id);
+            if session_info.is_empty() {
                 self.sessions.remove(node_id);
             }
         }
     }
 
-    #[tracing::instrument(name = "rpc::server::try_initiate_service", skip(self, framed), err)]
+    #[allow(clippy::too_many_lines)]
     async fn try_initiate_service(
         &mut self,
         protocol: ProtocolId,
@@ -403,16 +454,19 @@ where
         let mut handshake = Handshake::new(&mut framed).with_timeout(self.config.handshake_timeout);
 
         if !self.executor.can_spawn() {
+            let msg = format!("Used all {} sessions", self.executor.max_available());
             debug!(
                 target: LOG_TARGET,
                 "Rejecting RPC session request for peer `{}` because {}",
                 node_id,
-                HandshakeRejectReason::NoSessionsAvailable
+                HandshakeRejectReason::NoServerSessionsAvailable("Cannot spawn more sessions")
             );
             handshake
-                .reject_with_reason(HandshakeRejectReason::NoSessionsAvailable)
+                .reject_with_reason(HandshakeRejectReason::NoServerSessionsAvailable(
+                    "Cannot spawn more sessions",
+                ))
                 .await?;
-            return Err(RpcServerError::MaximumSessionsReached);
+            return Err(RpcServerError::MaximumSessionsReached(msg));
         }
 
         let service = match self.service.make_service(protocol.clone()).await {
@@ -431,17 +485,19 @@ where
             },
         };
 
-        match self.new_session_for(node_id.clone()) {
+        match self.new_session_possible_for(node_id) {
             Ok(num_sessions) => {
                 info!(
                     target: LOG_TARGET,
-                    "NEW SESSION for {} ({} active) ", node_id, num_sessions
+                    "NEW SESSION for {} ({} currently active) ", node_id, num_sessions
                 );
             },
 
             Err(err) => {
                 handshake
-                    .reject_with_reason(HandshakeRejectReason::NoSessionsAvailable)
+                    .reject_with_reason(HandshakeRejectReason::NoServerSessionsAvailable(
+                        "Maximum sessions for client",
+                    ))
                     .await?;
                 return Err(err);
             },
@@ -452,7 +508,8 @@ where
             target: LOG_TARGET,
             "Server negotiated RPC v{} with client node `{}`", version, node_id
         );
-
+        let stream_id = framed.stream_id();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
         let service = ActivePeerRpcService::new(
             self.config.clone(),
             protocol,
@@ -460,23 +517,48 @@ where
             service,
             framed,
             self.comms_provider.clone(),
+            stop_rx,
         );
 
-        let node_id = node_id.clone();
+        let node_id_clone = node_id.clone();
         let handle = self
             .executor
             .try_spawn(async move {
-                let num_sessions = metrics::num_sessions(&node_id, &service.protocol);
+                #[cfg(feature = "metrics")]
+                let num_sessions = metrics::num_sessions(&node_id_clone, &service.protocol);
+                #[cfg(feature = "metrics")]
                 num_sessions.inc();
                 service.start().await;
-                info!(target: LOG_TARGET, "END OF SESSION for {} ", node_id,);
+                info!(target: LOG_TARGET, "END OF SESSION for {} ", node_id_clone,);
+                #[cfg(feature = "metrics")]
                 num_sessions.dec();
 
-                node_id
+                (node_id_clone, stream_id)
             })
-            .map_err(|_| RpcServerError::MaximumSessionsReached)?;
+            .map_err(|e| RpcServerError::MaximumSessionsReached(format!("{:?}", e)))?;
 
         self.tasks.push(handle);
+        let mut peer_stop = vec![SessionInfo {
+            peer_watch: stop_tx,
+            stream_id,
+        }];
+        self.sessions
+            .entry(node_id.clone())
+            .and_modify(|entry| entry.append(&mut peer_stop))
+            .or_insert(peer_stop);
+        if let Some(info) = self.sessions.get(&node_id.clone()) {
+            info!(
+                target: LOG_TARGET,
+                "NEW SESSION created for {} ({} active) ", node_id.clone(), info.len()
+            );
+            // Warn if `stream_id` is already in use
+            if info.iter().filter(|session| session.stream_id == stream_id).count() > 1 {
+                warn!(
+                    target: LOG_TARGET,
+                    "Stream ID {} already in use for peer {}. This should not happen.", stream_id, node_id
+                );
+            }
+        }
 
         Ok(())
     }
@@ -490,6 +572,7 @@ struct ActivePeerRpcService<TSvc, TCommsProvider> {
     framed: EarlyClose<CanonicalFraming<Substream>>,
     comms_provider: TCommsProvider,
     logging_context_string: Arc<String>,
+    stop_rx: tokio::sync::watch::Receiver<()>,
 }
 
 impl<TSvc, TCommsProvider> ActivePeerRpcService<TSvc, TCommsProvider>
@@ -504,12 +587,14 @@ where
         service: TSvc,
         framed: CanonicalFraming<Substream>,
         comms_provider: TCommsProvider,
+        stop_rx: tokio::sync::watch::Receiver<()>,
     ) -> Self {
         Self {
             logging_context_string: Arc::new(format!(
-                "stream_id: {}, peer: {}, protocol: {}",
+                "stream_id: {}, peer: {}, protocol: {}, stream_id: {}",
                 framed.stream_id(),
                 node_id,
+                framed.stream_id(),
                 String::from_utf8_lossy(&protocol)
             )),
 
@@ -519,6 +604,7 @@ where
             service,
             framed: EarlyClose::new(framed),
             comms_provider,
+            stop_rx,
         }
     }
 
@@ -528,6 +614,7 @@ where
             "({}) Rpc server started.", self.logging_context_string,
         );
         if let Err(err) = self.run().await {
+            #[cfg(feature = "metrics")]
             metrics::error_counter(&self.node_id, &self.protocol, &err).inc();
             let level = match &err {
                 RpcServerError::Io(e) => err_to_log_level(e),
@@ -545,53 +632,64 @@ where
     }
 
     async fn run(&mut self) -> Result<(), RpcServerError> {
-        let request_bytes = metrics::inbound_requests_bytes(&self.node_id, &self.protocol);
-        while let Some(result) = self.framed.next().await {
-            match result {
-                Ok(frame) => {
-                    let start = Instant::now();
-                    request_bytes.observe(frame.len() as f64);
-                    if let Err(err) = self.handle_request(frame.freeze()).await {
-                        if let Err(err) = self.framed.close().await {
-                            let level = err.io().map(err_to_log_level).unwrap_or(log::Level::Error);
+        loop {
+            tokio::select! {
+                _ = self.stop_rx.changed() => {
+                    debug!(target: LOG_TARGET, "({}) Stop signal received, closing substream.", self.logging_context_string);
+                    break;
+                }
+                result = self.framed.next() => {
+                    match result {
+                        Some(Ok(frame)) => {
+                            #[cfg(feature = "metrics")]
+                            metrics::inbound_requests_bytes(&self.node_id, &self.protocol).observe(frame.len() as f64);
 
-                            log!(
+                            let start = Instant::now();
+
+                            if let Err(err) = self.handle_request(frame.freeze()).await {
+                                if let Err(err) = self.framed.close().await {
+                                    let level = err.io().map(err_to_log_level).unwrap_or(log::Level::Error);
+
+                                    log!(
+                                        target: LOG_TARGET,
+                                        level,
+                                        "({}) Failed to close substream after socket error: {}",
+                                        self.logging_context_string,
+                                        err,
+                                    );
+                                }
+                                let level = err.early_close_io().map(err_to_log_level).unwrap_or(log::Level::Error);
+                                log!(
+                                    target: LOG_TARGET,
+                                    level,
+                                    "(peer: {}, protocol: {}) Failed to handle request: {}",
+                                    self.node_id,
+                                    self.protocol_name(),
+                                    err
+                                );
+                                return Err(err);
+                            }
+                            let elapsed = start.elapsed();
+                            trace!(
                                 target: LOG_TARGET,
-                                level,
-                                "({}) Failed to close substream after socket error: {}",
+                                "({}) RPC request completed in {:.0?}{}",
                                 self.logging_context_string,
-                                err,
+                                elapsed,
+                                if elapsed.as_secs() > 5 { " (LONG REQUEST)" } else { "" }
                             );
-                        }
-                        let level = err.early_close_io().map(err_to_log_level).unwrap_or(log::Level::Error);
-                        log!(
-                            target: LOG_TARGET,
-                            level,
-                            "(peer: {}, protocol: {}) Failed to handle request: {}",
-                            self.node_id,
-                            self.protocol_name(),
-                            err
-                        );
-                        return Err(err);
+                        },
+                        Some(Err(err)) => {
+                            if let Err(err) = self.framed.close().await {
+                                error!(
+                                    target: LOG_TARGET,
+                                    "({}) Failed to close substream after socket error: {}", self.logging_context_string, err
+                                );
+                            }
+                            return Err(err.into());
+                        },
+                        None => break,
                     }
-                    let elapsed = start.elapsed();
-                    debug!(
-                        target: LOG_TARGET,
-                        "({}) RPC request completed in {:.0?}{}",
-                        self.logging_context_string,
-                        elapsed,
-                        if elapsed.as_secs() > 5 { " (LONG REQUEST)" } else { "" }
-                    );
-                },
-                Err(err) => {
-                    if let Err(err) = self.framed.close().await {
-                        error!(
-                            target: LOG_TARGET,
-                            "({}) Failed to close substream after socket error: {}", self.logging_context_string, err
-                        );
-                    }
-                    return Err(err.into());
-                },
+                }
             }
         }
 
@@ -599,7 +697,7 @@ where
         Ok(())
     }
 
-    #[instrument(name = "rpc::server::handle_req", skip(self, request), err, fields(request_size = request.len()))]
+    #[instrument(name = "rpc::server::handle_req", level="trace", skip(self, request), err, fields(request_size = request.len ()))]
     async fn handle_request(&mut self, mut request: Bytes) -> Result<(), RpcServerError> {
         let decoded_msg = proto::rpc::RpcRequest::decode(&mut request)?;
 
@@ -624,12 +722,19 @@ where
                 flags: RpcMessageFlags::FIN.bits().into(),
                 payload: status.to_details_bytes(),
             };
+            #[cfg(feature = "metrics")]
             metrics::status_error_counter(&self.node_id, &self.protocol, status.as_status_code()).inc();
             self.framed.send(bad_request.to_encoded_bytes().into()).await?;
             return Ok(());
         }
 
-        let msg_flags = RpcMessageFlags::from_bits_truncate(u8::try_from(decoded_msg.flags).unwrap());
+        let msg_flags = RpcMessageFlags::from_bits(u8::try_from(decoded_msg.flags).map_err(|_| {
+            RpcServerError::ProtocolError(format!("invalid message flag: must be less than {}", u8::MAX))
+        })?)
+        .ok_or(RpcServerError::ProtocolError(format!(
+            "invalid message flag, does not match any flags ({})",
+            decoded_msg.flags
+        )))?;
 
         if msg_flags.contains(RpcMessageFlags::FIN) {
             debug!(target: LOG_TARGET, "({}) Client sent FIN.", self.logging_context_string);
@@ -650,7 +755,7 @@ where
             return Ok(());
         }
 
-        debug!(
+        trace!(
             target: LOG_TARGET,
             "({}) Request: {}, Method: {}",
             self.logging_context_string,
@@ -681,6 +786,7 @@ where
                     deadline,
                 );
 
+                #[cfg(feature = "metrics")]
                 metrics::error_counter(
                     &self.node_id,
                     &self.protocol,
@@ -707,6 +813,7 @@ where
                     payload: err.to_details_bytes(),
                 };
 
+                #[cfg(feature = "metrics")]
                 metrics::status_error_counter(&self.node_id, &self.protocol, err.as_status_code()).inc();
                 self.framed.send(resp.to_encoded_bytes().into()).await?;
             },
@@ -725,19 +832,24 @@ where
         deadline: Duration,
         body: Response<Body>,
     ) -> Result<(), RpcServerError> {
-        let response_bytes = metrics::outbound_response_bytes(&self.node_id, &self.protocol);
         trace!(target: LOG_TARGET, "Service call succeeded");
 
+        #[cfg(feature = "metrics")]
         let node_id = self.node_id.clone();
+        #[cfg(feature = "metrics")]
         let protocol = self.protocol.clone();
         let mut stream = body
             .into_message()
             .map(|result| into_response(request_id, result))
-            .flat_map(move |message| {
+            .map(move |mut message| {
+                if message.payload.len() > rpc::max_response_payload_size() {
+                    message = message.exceeded_message_size();
+                }
+                #[cfg(feature = "metrics")]
                 if !message.status.is_ok() {
                     metrics::status_error_counter(&node_id, &protocol, message.status).inc();
                 }
-                stream::iter(ChunkedResponseIter::new(message))
+                message.to_proto()
             })
             .map(|resp| Bytes::from(resp.to_encoded_bytes()));
 
@@ -767,8 +879,9 @@ where
                 msg = next_item => {
                      match msg {
                          Some(msg) => {
-                            response_bytes.observe(msg.len() as f64);
-                            debug!(
+                            #[cfg(feature = "metrics")]
+                            metrics::outbound_response_bytes(&self.node_id, &self.protocol).observe(msg.len() as f64);
+                            trace!(
                                 target: LOG_TARGET,
                                 "({}) Sending body len = {}",
                                 self.logging_context_string,
@@ -778,7 +891,7 @@ where
                             self.framed.send(msg).await?;
                         },
                         None => {
-                            debug!(target: LOG_TARGET, "{} Request complete", self.logging_context_string,);
+                            trace!(target: LOG_TARGET, "{} Request complete", self.logging_context_string,);
                             break;
                         },
                     }
@@ -792,6 +905,7 @@ where
                         deadline
                     );
 
+                    #[cfg(feature = "metrics")]
                     metrics::error_counter(
                         &self.node_id,
                         &self.protocol,
@@ -815,7 +929,27 @@ where
                         return Poll::Ready(Some(RpcServerError::UnexpectedIncomingMessageMalformed));
                     },
                 };
-                let msg_flags = RpcMessageFlags::from_bits_truncate(u8::try_from(decoded_msg.flags).unwrap());
+                let u8_bits = match u8::try_from(decoded_msg.flags) {
+                    Ok(bits) => bits,
+                    Err(err) => {
+                        error!(target: LOG_TARGET, "Client send MALFORMED flags: {}", err);
+                        return Poll::Ready(Some(RpcServerError::ProtocolError(format!(
+                            "invalid message flag: must be less than {}",
+                            u8::MAX
+                        ))));
+                    },
+                };
+
+                let msg_flags = match RpcMessageFlags::from_bits(u8_bits) {
+                    Some(flags) => flags,
+                    None => {
+                        error!(target: LOG_TARGET, "Client send MALFORMED flags: {}", u8_bits);
+                        return Poll::Ready(Some(RpcServerError::ProtocolError(format!(
+                            "invalid message flag, does not match any flags ({})",
+                            u8_bits
+                        ))));
+                    },
+                };
                 if msg_flags.is_fin() {
                     Poll::Ready(Some(RpcServerError::ClientInterruptedStream))
                 } else {

@@ -23,13 +23,31 @@ mod serde;
 mod stack;
 
 pub use error::ScriptError;
-pub use op_codes::{slice_to_boxed_hash, slice_to_hash, HashValue, Message, Opcode, OpcodeVersion, ScalarValue};
-pub use script::TariScript;
+pub use op_codes::{
+    slice_to_boxed_hash,
+    slice_to_boxed_message,
+    slice_to_hash,
+    HashValue,
+    Message,
+    Opcode,
+    OpcodeVersion,
+    ScalarValue,
+};
+pub use script::{ScriptOpcodes, TariScript};
 pub use script_context::ScriptContext;
 pub use stack::{ExecutionStack, StackItem};
+use tari_crypto::{
+    hash_domain,
+    ristretto::{RistrettoPublicKey, RistrettoSecretKey},
+    signatures::SchnorrSignature,
+};
 
-// As hex: c5a1ea6d3e0a6a0d650c99489bcd563e37a06221fd04b8f3a842a982b2813907
-pub const DEFAULT_SCRIPT_HASH: HashValue = [
-    0xc5, 0xa1, 0xea, 0x6d, 0x3e, 0x0a, 0x6a, 0x0d, 0x65, 0x0c, 0x99, 0x48, 0x9b, 0xcd, 0x56, 0x3e, 0x37, 0xa0, 0x62,
-    0x21, 0xfd, 0x04, 0xb8, 0xf3, 0xa8, 0x42, 0xa9, 0x82, 0xb2, 0x81, 0x39, 0x07,
-];
+hash_domain!(CheckSigHashDomain, "com.tari.script.check_sig", 1);
+
+/// The type used for `CheckSig`, `CheckMultiSig`, and related opcodes' signatures
+pub type CheckSigSchnorrSignature = SchnorrSignature<RistrettoPublicKey, RistrettoSecretKey, CheckSigHashDomain>;
+
+/// The standard payment script to be used for one-sided payment to public addresses
+pub fn push_pubkey_script(destination_public_key: &RistrettoPublicKey) -> TariScript {
+    script!(PushPubKey(Box::new(destination_public_key.clone()))).expect("single opcode will not fail")
+}

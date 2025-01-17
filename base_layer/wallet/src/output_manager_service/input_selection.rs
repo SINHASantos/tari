@@ -40,22 +40,25 @@ pub struct UtxoSelectionCriteria {
     pub filter: UtxoSelectionFilter,
     pub ordering: UtxoSelectionOrdering,
     pub excluding: Vec<Commitment>,
+    pub min_dust: u64,
     pub excluding_onesided: bool,
 }
 
 impl UtxoSelectionCriteria {
-    pub fn smallest_first() -> Self {
+    pub fn smallest_first(min_dust: u64) -> Self {
         Self {
             filter: UtxoSelectionFilter::Standard,
             ordering: UtxoSelectionOrdering::SmallestFirst,
+            min_dust,
             ..Default::default()
         }
     }
 
-    pub fn largest_first() -> Self {
+    pub fn largest_first(min_dust: u64) -> Self {
         Self {
             filter: UtxoSelectionFilter::Standard,
             ordering: UtxoSelectionOrdering::LargestFirst,
+            min_dust,
             ..Default::default()
         }
     }
@@ -64,6 +67,7 @@ impl UtxoSelectionCriteria {
         Self {
             filter: UtxoSelectionFilter::SpecificOutputs { commitments },
             ordering: UtxoSelectionOrdering::Default,
+            min_dust: 0,
             ..Default::default()
         }
     }
@@ -76,23 +80,18 @@ impl Display for UtxoSelectionCriteria {
 }
 
 /// UTXO selection ordering
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UtxoSelectionOrdering {
     /// The Default ordering is heuristic and depends on the requested value and the value of the available UTXOs.
     /// If the requested value is larger than the largest available UTXO, we select LargerFirst as inputs, otherwise
     /// SmallestFirst.
+    #[default]
     Default,
     /// Start from the smallest UTXOs and work your way up until the amount is covered. Main benefit
     /// is removing small UTXOs from the blockchain, con is that it costs more in fees
     SmallestFirst,
     /// A strategy that selects the largest UTXOs first. Preferred when the amount is large
     LargestFirst,
-}
-
-impl Default for UtxoSelectionOrdering {
-    fn default() -> Self {
-        UtxoSelectionOrdering::Default
-    }
 }
 
 impl Display for UtxoSelectionOrdering {
@@ -105,9 +104,10 @@ impl Display for UtxoSelectionOrdering {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub enum UtxoSelectionFilter {
-    /// Select OutputType::Standard or OutputType::Coinbase outputs only
+    /// Select OutputType::Standard outputs only
+    #[default]
     Standard,
     /// Selects specific outputs. All outputs must be exist and be spendable.
     SpecificOutputs { commitments: Vec<Commitment> },
@@ -115,12 +115,6 @@ pub enum UtxoSelectionFilter {
 impl UtxoSelectionFilter {
     pub fn is_standard(&self) -> bool {
         matches!(self, UtxoSelectionFilter::Standard)
-    }
-}
-
-impl Default for UtxoSelectionFilter {
-    fn default() -> Self {
-        UtxoSelectionFilter::Standard
     }
 }
 

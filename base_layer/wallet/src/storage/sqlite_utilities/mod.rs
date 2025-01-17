@@ -20,20 +20,24 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{fs::File, path::Path, time::Duration};
+use std::{fs::File, ops::DerefMut, path::Path, time::Duration};
 
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness};
 use fs2::FileExt;
 use log::*;
 use tari_common_sqlite::sqlite_connection_pool::SqliteConnectionPool;
+use tari_contacts::contacts_service::storage::sqlite_db::ContactsServiceSqliteDatabase;
+use tari_key_manager::key_manager_service::storage::sqlite_db::KeyManagerSqliteDatabase;
 use tari_utilities::SafePassword;
 pub use wallet_db_connection::WalletDbConnection;
 
 use crate::{
-    contacts_service::storage::sqlite_db::ContactsServiceSqliteDatabase,
     error::WalletStorageError,
-    key_manager_service::storage::sqlite_db::KeyManagerSqliteDatabase,
     output_manager_service::storage::sqlite_db::OutputManagerSqliteDatabase,
-    storage::sqlite_db::wallet::WalletSqliteDatabase,
+    storage::{
+        database::DbKey,
+        sqlite_db::wallet::{WalletSettingSql, WalletSqliteDatabase},
+    },
     transaction_service::storage::sqlite_db::TransactionServiceSqliteDatabase,
 };
 
@@ -60,13 +64,35 @@ pub fn run_migration_and_create_sqlite_connection<P: AsRef<Path>>(
         Duration::from_secs(60),
     );
     pool.create_pool()?;
-    let connection = pool.get_pooled_connection()?;
+    let mut connection = pool.get_pooled_connection()?;
 
-    embed_migrations!("./migrations");
-    embedded_migrations::run(&connection)
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
+    connection
+        .run_pending_migrations(MIGRATIONS)
         .map_err(|err| WalletStorageError::DatabaseMigrationError(format!("Database migration failed {}", err)))?;
 
     Ok(WalletDbConnection::new(pool, Some(file_lock)))
+}
+
+pub fn run_migration_and_create_sqlite_memory_connection(
+    sqlite_pool_size: usize,
+) -> Result<WalletDbConnection, WalletStorageError> {
+    let mut pool = SqliteConnectionPool::new(
+        String::from(":memory:"),
+        sqlite_pool_size,
+        true,
+        true,
+        Duration::from_secs(60),
+    );
+    pool.create_pool()?;
+    let mut connection = pool.get_pooled_connection()?;
+
+    const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
+    connection
+        .run_pending_migrations(MIGRATIONS)
+        .map_err(|err| WalletStorageError::DatabaseMigrationError(format!("Database migration failed {}", err)))?;
+
+    Ok(WalletDbConnection::new(pool, None))
 }
 
 pub fn acquire_exclusive_file_lock(db_path: &Path) -> Result<File, WalletStorageError> {
@@ -101,6 +127,7 @@ pub fn acquire_exclusive_file_lock(db_path: &Path) -> Result<File, WalletStorage
     Ok(file)
 }
 
+#[allow(clippy::type_complexity)]
 pub fn initialize_sqlite_database_backends<P: AsRef<Path>>(
     db_path: P,
     passphrase: SafePassword,
@@ -110,8 +137,8 @@ pub fn initialize_sqlite_database_backends<P: AsRef<Path>>(
         WalletSqliteDatabase,
         TransactionServiceSqliteDatabase,
         OutputManagerSqliteDatabase,
-        ContactsServiceSqliteDatabase,
-        KeyManagerSqliteDatabase,
+        ContactsServiceSqliteDatabase<WalletDbConnection>,
+        KeyManagerSqliteDatabase<WalletDbConnection>,
     ),
     WalletStorageError,
 > {
@@ -125,13 +152,9 @@ pub fn initialize_sqlite_database_backends<P: AsRef<Path>>(
 
     let wallet_backend = WalletSqliteDatabase::new(connection.clone(), passphrase)?;
     let transaction_backend = TransactionServiceSqliteDatabase::new(connection.clone(), wallet_backend.cipher());
-    let output_manager_backend = OutputManagerSqliteDatabase::new(connection.clone(), wallet_backend.cipher());
-    let contacts_backend = ContactsServiceSqliteDatabase::new(connection.clone());
-    let key_manager_backend = KeyManagerSqliteDatabase::new(connection, wallet_backend.cipher()).map_err(|e| {
-        error!(target: LOG_TARGET, "Error migrating key manager database: {:?}", e);
-        WalletStorageError::DatabaseMigrationError(e.to_string())
-    })?;
-
+    let output_manager_backend = OutputManagerSqliteDatabase::new(connection.clone());
+    let contacts_backend = ContactsServiceSqliteDatabase::init(connection.clone());
+    let key_manager_backend = KeyManagerSqliteDatabase::init(connection, wallet_backend.cipher());
     Ok((
         wallet_backend,
         transaction_backend,
@@ -139,4 +162,28 @@ pub fn initialize_sqlite_database_backends<P: AsRef<Path>>(
         contacts_backend,
         key_manager_backend,
     ))
+}
+
+pub fn get_last_version<P: AsRef<Path>>(db_path: P) -> Result<Option<String>, WalletStorageError> {
+    let path_str = db_path
+        .as_ref()
+        .to_str()
+        .ok_or(WalletStorageError::InvalidUnicodePath)?;
+
+    let mut pool = SqliteConnectionPool::new(String::from(path_str), 1, true, true, Duration::from_secs(60));
+    pool.create_pool()?;
+
+    WalletSettingSql::get(&DbKey::LastAccessedVersion, pool.get_pooled_connection()?.deref_mut())
+}
+
+pub fn get_last_network<P: AsRef<Path>>(db_path: P) -> Result<Option<String>, WalletStorageError> {
+    let path_str = db_path
+        .as_ref()
+        .to_str()
+        .ok_or(WalletStorageError::InvalidUnicodePath)?;
+
+    let mut pool = SqliteConnectionPool::new(String::from(path_str), 1, true, true, Duration::from_secs(60));
+    pool.create_pool()?;
+
+    WalletSettingSql::get(&DbKey::LastAccessedNetwork, pool.get_pooled_connection()?.deref_mut())
 }

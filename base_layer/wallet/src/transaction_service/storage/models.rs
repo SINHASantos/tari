@@ -25,7 +25,7 @@ use std::{
     fmt::{Display, Error, Formatter},
 };
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tari_common_types::{
     tari_address::TariAddress,
@@ -33,36 +33,38 @@ use tari_common_types::{
     types::{BlockHash, PrivateKey, Signature},
 };
 use tari_core::transactions::{
-    tari_amount::MicroTari,
-    transaction_components::Transaction,
+    tari_amount::MicroMinotari,
+    transaction_components::{encrypted_data::PaymentId, Transaction},
     ReceiverTransactionProtocol,
     SenderTransactionProtocol,
 };
+
+use crate::transaction_service::error::TransactionStorageError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InboundTransaction {
     pub tx_id: TxId,
     pub source_address: TariAddress,
-    pub amount: MicroTari,
+    pub amount: MicroMinotari,
     pub receiver_protocol: ReceiverTransactionProtocol,
     pub status: TransactionStatus,
-    pub message: String,
-    pub timestamp: NaiveDateTime,
+    pub payment_id: PaymentId,
+    pub timestamp: DateTime<Utc>,
     pub cancelled: bool,
     pub direct_send_success: bool,
     pub send_count: u32,
-    pub last_send_timestamp: Option<NaiveDateTime>,
+    pub last_send_timestamp: Option<DateTime<Utc>>,
 }
 
 impl InboundTransaction {
     pub fn new(
         tx_id: TxId,
         source_address: TariAddress,
-        amount: MicroTari,
+        amount: MicroMinotari,
         receiver_protocol: ReceiverTransactionProtocol,
         status: TransactionStatus,
-        message: String,
-        timestamp: NaiveDateTime,
+        payment_id: PaymentId,
+        timestamp: DateTime<Utc>,
     ) -> Self {
         Self {
             tx_id,
@@ -70,7 +72,7 @@ impl InboundTransaction {
             amount,
             receiver_protocol,
             status,
-            message,
+            payment_id,
             timestamp,
             cancelled: false,
             direct_send_success: false,
@@ -84,28 +86,28 @@ impl InboundTransaction {
 pub struct OutboundTransaction {
     pub tx_id: TxId,
     pub destination_address: TariAddress,
-    pub amount: MicroTari,
-    pub fee: MicroTari,
+    pub amount: MicroMinotari,
+    pub fee: MicroMinotari,
     pub sender_protocol: SenderTransactionProtocol,
     pub status: TransactionStatus,
-    pub message: String,
-    pub timestamp: NaiveDateTime,
+    pub payment_id: PaymentId,
+    pub timestamp: DateTime<Utc>,
     pub cancelled: bool,
     pub direct_send_success: bool,
     pub send_count: u32,
-    pub last_send_timestamp: Option<NaiveDateTime>,
+    pub last_send_timestamp: Option<DateTime<Utc>>,
 }
 
 impl OutboundTransaction {
     pub fn new(
         tx_id: TxId,
         destination_address: TariAddress,
-        amount: MicroTari,
-        fee: MicroTari,
+        amount: MicroMinotari,
+        fee: MicroMinotari,
         sender_protocol: SenderTransactionProtocol,
         status: TransactionStatus,
-        message: String,
-        timestamp: NaiveDateTime,
+        payment_id: PaymentId,
+        timestamp: DateTime<Utc>,
         direct_send_success: bool,
     ) -> Self {
         Self {
@@ -115,7 +117,7 @@ impl OutboundTransaction {
             fee,
             sender_protocol,
             status,
-            message,
+            payment_id,
             timestamp,
             cancelled: false,
             direct_send_success,
@@ -130,22 +132,21 @@ pub struct CompletedTransaction {
     pub tx_id: TxId,
     pub source_address: TariAddress,
     pub destination_address: TariAddress,
-    pub amount: MicroTari,
-    pub fee: MicroTari,
+    pub amount: MicroMinotari,
+    pub fee: MicroMinotari,
     pub transaction: Transaction,
     pub status: TransactionStatus,
-    pub message: String,
-    pub timestamp: NaiveDateTime,
+    pub timestamp: DateTime<Utc>,
     pub cancelled: Option<TxCancellationReason>,
     pub direction: TransactionDirection,
-    pub coinbase_block_height: Option<u64>,
     pub send_count: u32,
-    pub last_send_timestamp: Option<NaiveDateTime>,
+    pub last_send_timestamp: Option<DateTime<Utc>>,
     pub transaction_signature: Signature,
     pub confirmations: Option<u64>,
     pub mined_height: Option<u64>,
     pub mined_in_block: Option<BlockHash>,
-    pub mined_timestamp: Option<NaiveDateTime>,
+    pub mined_timestamp: Option<DateTime<Utc>>,
+    pub payment_id: PaymentId,
 }
 
 impl CompletedTransaction {
@@ -153,23 +154,25 @@ impl CompletedTransaction {
         tx_id: TxId,
         source_address: TariAddress,
         destination_address: TariAddress,
-        amount: MicroTari,
-        fee: MicroTari,
+        amount: MicroMinotari,
+        fee: MicroMinotari,
         transaction: Transaction,
         status: TransactionStatus,
-        message: String,
-        timestamp: NaiveDateTime,
+        timestamp: DateTime<Utc>,
         direction: TransactionDirection,
-        coinbase_block_height: Option<u64>,
         mined_height: Option<u64>,
-        mined_timestamp: Option<NaiveDateTime>,
-    ) -> Self {
+        mined_timestamp: Option<DateTime<Utc>>,
+        payment_id: PaymentId,
+    ) -> Result<Self, TransactionStorageError> {
+        if status == TransactionStatus::Coinbase {
+            return Err(TransactionStorageError::CoinbaseNotSupported);
+        }
         let transaction_signature = if let Some(excess_sig) = transaction.first_kernel_excess_sig() {
             excess_sig.clone()
         } else {
             Signature::default()
         };
-        Self {
+        Ok(Self {
             tx_id,
             source_address,
             destination_address,
@@ -177,11 +180,9 @@ impl CompletedTransaction {
             fee,
             transaction,
             status,
-            message,
             timestamp,
             cancelled: None,
             direction,
-            coinbase_block_height,
             send_count: 0,
             last_send_timestamp: None,
             transaction_signature,
@@ -189,15 +190,8 @@ impl CompletedTransaction {
             mined_height,
             mined_in_block: None,
             mined_timestamp,
-        }
-    }
-
-    pub fn is_coinbase(&self) -> bool {
-        if let Some(height) = self.coinbase_block_height {
-            height > 0
-        } else {
-            false
-        }
+            payment_id,
+        })
     }
 }
 
@@ -209,7 +203,7 @@ impl From<CompletedTransaction> for InboundTransaction {
             amount: ct.amount,
             receiver_protocol: ReceiverTransactionProtocol::new_placeholder(),
             status: ct.status,
-            message: ct.message,
+            payment_id: ct.payment_id,
             timestamp: ct.timestamp,
             cancelled: ct.cancelled.is_some(),
             direct_send_success: false,
@@ -228,7 +222,7 @@ impl From<CompletedTransaction> for OutboundTransaction {
             fee: ct.fee,
             sender_protocol: SenderTransactionProtocol::new_placeholder(),
             status: ct.status,
-            message: ct.message,
+            payment_id: ct.payment_id,
             timestamp: ct.timestamp,
             cancelled: ct.cancelled.is_some(),
             direct_send_success: false,
@@ -260,7 +254,6 @@ impl From<OutboundTransaction> for CompletedTransaction {
             amount: tx.amount,
             fee: tx.fee,
             status: tx.status,
-            message: tx.message,
             timestamp: tx.timestamp,
             cancelled: if tx.cancelled {
                 Some(TxCancellationReason::UserCancelled)
@@ -269,7 +262,6 @@ impl From<OutboundTransaction> for CompletedTransaction {
             },
             transaction,
             direction: TransactionDirection::Outbound,
-            coinbase_block_height: None,
             send_count: 0,
             last_send_timestamp: None,
             transaction_signature,
@@ -277,6 +269,7 @@ impl From<OutboundTransaction> for CompletedTransaction {
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
+            payment_id: tx.payment_id,
         }
     }
 }
@@ -288,9 +281,8 @@ impl From<InboundTransaction> for CompletedTransaction {
             source_address: tx.source_address,
             destination_address: Default::default(),
             amount: tx.amount,
-            fee: MicroTari::from(0),
+            fee: MicroMinotari::from(0),
             status: tx.status,
-            message: tx.message,
             timestamp: tx.timestamp,
             cancelled: if tx.cancelled {
                 Some(TxCancellationReason::UserCancelled)
@@ -299,7 +291,6 @@ impl From<InboundTransaction> for CompletedTransaction {
             },
             transaction: Transaction::new(vec![], vec![], vec![], PrivateKey::default(), PrivateKey::default()),
             direction: TransactionDirection::Inbound,
-            coinbase_block_height: None,
             send_count: 0,
             last_send_timestamp: None,
             transaction_signature: Signature::default(),
@@ -307,11 +298,12 @@ impl From<InboundTransaction> for CompletedTransaction {
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
+            payment_id: tx.payment_id,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum WalletTransaction {
     PendingInbound(InboundTransaction),
@@ -338,7 +330,7 @@ pub enum TxCancellationReason {
     Orphan,             // 4
     TimeLocked,         // 5
     InvalidTransaction, // 6
-    AbandonedCoinbase,  // 7
+    Oversized,          // 7
 }
 
 impl TryFrom<u32> for TxCancellationReason {
@@ -353,7 +345,7 @@ impl TryFrom<u32> for TxCancellationReason {
             4 => Ok(TxCancellationReason::Orphan),
             5 => Ok(TxCancellationReason::TimeLocked),
             6 => Ok(TxCancellationReason::InvalidTransaction),
-            7 => Ok(TxCancellationReason::AbandonedCoinbase),
+            7 => Ok(TxCancellationReason::Oversized),
             code => Err(TransactionConversionError { code: code as i32 }),
         }
     }
@@ -371,7 +363,7 @@ impl Display for TxCancellationReason {
             Orphan => "Orphan",
             TimeLocked => "TimeLocked",
             InvalidTransaction => "Invalid Transaction",
-            AbandonedCoinbase => "Abandoned Coinbase",
+            Oversized => "Oversized",
         };
         fmt.write_str(response)
     }

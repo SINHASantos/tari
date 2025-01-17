@@ -24,12 +24,20 @@ use thiserror::Error;
 
 #[cfg(feature = "base_node")]
 use crate::proof_of_work::monero_rx::MergeMineError;
-use crate::proof_of_work::Difficulty;
+use crate::{
+    common::{BanPeriod, BanReason},
+    proof_of_work::Difficulty,
+};
 
+/// Errors that can occur when validating a proof of work
 #[derive(Debug, Error)]
 pub enum PowError {
     #[error("ProofOfWorkFailed")]
     InvalidProofOfWork,
+    #[error("Achieved difficulty is below the minimum")]
+    AchievedDifficultyBelowMin,
+    #[error("Proof of work data must be empty for Sha3 blocks")]
+    Sha3HeaderNonEmptyPowBytes,
     #[error("Target difficulty {target} not achieved. Achieved difficulty: {achieved}")]
     AchievedDifficultyTooLow { target: Difficulty, achieved: Difficulty },
     #[error("Invalid target difficulty (expected: {expected}, got: {got})")]
@@ -39,10 +47,41 @@ pub enum PowError {
     MergeMineError(#[from] MergeMineError),
 }
 
+impl PowError {
+    pub fn get_ban_reason(&self) -> Option<BanReason> {
+        match self {
+            err @ PowError::InvalidProofOfWork |
+            err @ PowError::AchievedDifficultyBelowMin |
+            err @ PowError::Sha3HeaderNonEmptyPowBytes |
+            err @ PowError::AchievedDifficultyTooLow { .. } |
+            err @ PowError::InvalidTargetDifficulty { .. } => Some(BanReason {
+                reason: err.to_string(),
+                ban_duration: BanPeriod::Long,
+            }),
+            #[cfg(feature = "base_node")]
+            PowError::MergeMineError(e) => e.get_ban_reason(),
+        }
+    }
+}
+
+/// Errors that can occur when adjusting the difficulty
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DifficultyAdjustmentError {
     #[error("Accumulated difficulty values can only strictly increase")]
     DecreasingAccumulatedDifficulty,
     #[error("Other difficulty algorithm error")]
     Other,
+}
+
+/// Errors that can occur when converting a difficulty
+#[derive(Debug, Error)]
+pub enum DifficultyError {
+    #[error("Difficulty conversion less than the minimum difficulty")]
+    InvalidDifficulty,
+    #[error("Maximum block time overflowed u64")]
+    MaxBlockTimeOverflow,
+    #[error("Divide by zero")]
+    DivideByZero,
+    #[error("Overflow")]
+    Overflow,
 }

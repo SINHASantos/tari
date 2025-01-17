@@ -45,7 +45,9 @@ use crate::{
     connection_manager::{ConnectionManagerConfig, ConnectionManagerRequester},
     connectivity::{ConnectivityConfig, ConnectivityRequester},
     multiaddr::Multiaddr,
+    net_address::MultiaddrRange,
     peer_manager::{NodeIdentity, PeerManager},
+    peer_validator::PeerValidatorConfig,
     protocol::{NodeNetworkInfo, ProtocolExtensions},
     tor,
     types::CommsDatabase,
@@ -69,6 +71,7 @@ use crate::{
 /// # #[tokio::main]
 /// # async fn main() {
 /// use std::env::temp_dir;
+/// use tari_comms::connectivity::ConnectivityConfig;
 ///
 /// use tari_storage::{
 ///     lmdb_store::{LMDBBuilder, LMDBConfig},
@@ -124,8 +127,8 @@ pub struct CommsBuilder {
     hidden_service_ctl: Option<tor::HiddenServiceController>,
     connection_manager_config: ConnectionManagerConfig,
     connectivity_config: ConnectivityConfig,
-
     shutdown_signal: Option<ShutdownSignal>,
+    maintain_n_closest_connections_only: Option<usize>,
 }
 
 impl Default for CommsBuilder {
@@ -139,6 +142,7 @@ impl Default for CommsBuilder {
             connection_manager_config: ConnectionManagerConfig::default(),
             connectivity_config: ConnectivityConfig::default(),
             shutdown_signal: None,
+            maintain_n_closest_connections_only: None,
         }
     }
 }
@@ -171,7 +175,7 @@ impl CommsBuilder {
 
     /// Set a network byte as per [RFC-173 Versioning](https://rfc.tari.com/RFC-0173_Versioning.html)
     pub fn with_network_byte(mut self, network_byte: u8) -> Self {
-        self.connection_manager_config.network_info.network_byte = network_byte;
+        self.connection_manager_config.network_info.network_wire_byte = network_byte;
         self
     }
 
@@ -195,8 +199,29 @@ impl CommsBuilder {
             target: "comms::builder",
             "Test addresses are enabled! This is invalid and potentially insecure when running a production node."
         );
-        self.connection_manager_config.allow_test_addresses = true;
+        self.connection_manager_config
+            .peer_validation_config
+            .allow_test_addresses = true;
         self
+    }
+
+    /// Sets the PeerValidatorConfig - this will override previous calls to allow_test_addresses() with the value in
+    /// peer_validator_config.allow_test_addresses
+    pub fn with_peer_validator_config(mut self, config: PeerValidatorConfig) -> Self {
+        #[cfg(not(debug_assertions))]
+        if config.allow_test_addresses {
+            log::warn!(
+                target: "comms::builder",
+                "Test addresses are enabled! This is invalid and potentially insecure when running a production node."
+            );
+        }
+        self.connection_manager_config.peer_validation_config = config;
+        self
+    }
+
+    /// Returns the PeerValidatorConfig set in this builder
+    pub fn peer_validator_config(&self) -> &PeerValidatorConfig {
+        &self.connection_manager_config.peer_validation_config
     }
 
     /// Sets the address that the transport will listen on. The address must be compatible with the transport.
@@ -215,6 +240,11 @@ impl CommsBuilder {
     /// detect that the node is live. Defaults to 0 (disabled)
     pub fn with_listener_liveness_max_sessions(mut self, max_sessions: usize) -> Self {
         self.connection_manager_config.liveness_max_sessions = max_sessions;
+        self
+    }
+
+    pub fn with_excluded_dial_addresses(mut self, excluded_addresses: Vec<MultiaddrRange>) -> Self {
+        self.connection_manager_config.excluded_dial_addresses = excluded_addresses;
         self
     }
 
@@ -266,8 +296,19 @@ impl CommsBuilder {
     }
 
     /// Enable and set interval for self-liveness checks, or None to disable it (default)
-    pub fn set_liveness_check(mut self, check_interval: Option<Duration>) -> Self {
-        self.connection_manager_config.liveness_self_check_interval = check_interval;
+    pub fn set_self_liveness_check(mut self, check_interval: Option<Duration>) -> Self {
+        self.connection_manager_config.self_liveness_self_check_interval = check_interval;
+        self
+    }
+
+    /// The closest number of peer connections to maintain; connections above the threshold will be removed
+    pub fn with_minimize_connections(mut self, connections: Option<usize>) -> Self {
+        self.maintain_n_closest_connections_only = connections;
+        self.connectivity_config.maintain_n_closest_connections_only = connections;
+        if let Some(val) = connections {
+            self.connectivity_config.reaper_min_connection_threshold = val;
+        }
+        self.connectivity_config.connection_pool_refresh_interval = Duration::from_secs(180);
         self
     }
 

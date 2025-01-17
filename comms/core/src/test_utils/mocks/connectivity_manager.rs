@@ -38,7 +38,6 @@ use crate::{
         ConnectivityStatus,
     },
     peer_manager::NodeId,
-    runtime::task,
 };
 
 pub fn create_connectivity_mock() -> (ConnectivityRequester, ConnectivityManagerMock) {
@@ -149,6 +148,10 @@ impl ConnectivityManagerMockState {
         assert!(is_found, "expected call to dial peer {} but no dial was found", peer);
     }
 
+    pub async fn is_peer_dialed(&self, peer: &NodeId) -> bool {
+        self.with_state(|state| state.dialed_peers.contains(peer)).await
+    }
+
     pub async fn await_call_count(&self, count: usize) {
         let mut attempts = 0;
         while self.call_count().await < count {
@@ -194,7 +197,7 @@ impl ConnectivityManagerMockState {
     pub(self) async fn with_state<F, R>(&self, f: F) -> R
     where F: FnOnce(&mut State) -> R {
         let mut lock = self.inner.lock().await;
-        (f)(&mut *lock)
+        (f)(&mut lock)
     }
 }
 
@@ -217,7 +220,7 @@ impl ConnectivityManagerMock {
 
     pub fn spawn(self) -> ConnectivityManagerMockState {
         let state = self.get_shared_state();
-        task::spawn(Self::run(self));
+        tokio::spawn(Self::run(self));
         state
     }
 
@@ -239,7 +242,7 @@ impl ConnectivityManagerMock {
                     return;
                 }
                 let reply_tx = reply_tx.unwrap();
-                // Send Ok(conn) if we have an active connection, otherwise Err(DialConnectFailedAllAddresses)
+                // Send Ok(&mut conn) if we have an active connection, otherwise Err(DialConnectFailedAllAddresses)
                 self.state
                     .with_state(|state| match state.pending_conns.get_mut(&node_id) {
                         Some(replies) => {
@@ -294,6 +297,11 @@ impl ConnectivityManagerMock {
                     .await;
             },
             WaitStarted(reply) => reply.send(()).unwrap(),
+            GetNodeIdentity(_) => unimplemented!(),
+            GetAllowList(reply) => {
+                let _result = reply.send(vec![]);
+            },
+            GetMinimizeConnectionsThreshold(_) => unimplemented!(),
         }
     }
 }

@@ -6,7 +6,7 @@ repository = "https://github.com/tari-project/tari"
 homepage = "https://tari.com"
 readme = "README.md"
 license = "BSD-3-Clause"
-version = "0.43.0"
+version = "1.10.0-pre.1"
 edition = "2018"
 
 [dependencies]
@@ -14,9 +14,8 @@ bincode = "1.1"
 log = "0.4.0"
 lmdb-zero = "0.4.4"
 thiserror = "1.0.26"
-serde = "1.0.80"
-serde_derive = "1.0.80"
+serde = { version = "1.0.80", features = ["derive"] }
 
 [dev-dependencies]
-rand = "0.7.3"
-tari_utilities = { git = "https://github.com/tari-project/tari_utilities.git", tag = "v0.4.10", features = ["borsh"] }
+rand = "0.8"
+tari_utilities = { version = "0.8", features = ["borsh"] }

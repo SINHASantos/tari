@@ -22,16 +22,14 @@
 
 use std::convert::TryFrom;
 
-use tari_common_types::types::{BlindingFactor, FixedHash};
-use tari_utilities::ByteArray;
+use tari_common_types::types::{FixedHash, PrivateKey};
+use tari_utilities::{epoch_time::EpochTime, ByteArray};
 
 use super::core as proto;
 use crate::{
     blocks::BlockHeader,
-    proof_of_work::{PowAlgorithm, ProofOfWork},
-    proto::utils::{datetime_to_timestamp, timestamp_to_datetime},
+    proof_of_work::{PowAlgorithm, PowData, ProofOfWork},
 };
-
 //---------------------------------- BlockHeader --------------------------------------------//
 
 impl TryFrom<proto::BlockHeader> for BlockHeader {
@@ -39,15 +37,10 @@ impl TryFrom<proto::BlockHeader> for BlockHeader {
 
     fn try_from(header: proto::BlockHeader) -> Result<Self, Self::Error> {
         let total_kernel_offset =
-            BlindingFactor::from_bytes(&header.total_kernel_offset).map_err(|err| err.to_string())?;
+            PrivateKey::from_canonical_bytes(&header.total_kernel_offset).map_err(|err| err.to_string())?;
 
         let total_script_offset =
-            BlindingFactor::from_bytes(&header.total_script_offset).map_err(|err| err.to_string())?;
-
-        let timestamp = header
-            .timestamp
-            .and_then(timestamp_to_datetime)
-            .ok_or_else(|| "timestamp not provided or is negative".to_string())?;
+            PrivateKey::from_canonical_bytes(&header.total_script_offset).map_err(|err| err.to_string())?;
 
         let pow = match header.pow {
             Some(p) => ProofOfWork::try_from(p)?,
@@ -57,10 +50,10 @@ impl TryFrom<proto::BlockHeader> for BlockHeader {
             version: u16::try_from(header.version).map_err(|err| err.to_string())?,
             height: header.height,
             prev_hash: FixedHash::try_from(header.prev_hash).map_err(|err| err.to_string())?,
-            timestamp,
+            timestamp: EpochTime::from(header.timestamp),
             output_mr: FixedHash::try_from(header.output_mr).map_err(|err| err.to_string())?,
-            witness_mr: FixedHash::try_from(header.witness_mr).map_err(|err| err.to_string())?,
-            output_mmr_size: header.output_mmr_size,
+            block_output_mr: FixedHash::try_from(header.block_output_mr).unwrap_or_default(),
+            output_smt_size: header.output_mmr_size,
             kernel_mr: FixedHash::try_from(header.kernel_mr).map_err(|err| err.to_string())?,
             kernel_mmr_size: header.kernel_mmr_size,
             input_mr: FixedHash::try_from(header.input_mr).map_err(|err| err.to_string())?,
@@ -69,20 +62,20 @@ impl TryFrom<proto::BlockHeader> for BlockHeader {
             nonce: header.nonce,
             pow,
             validator_node_mr: FixedHash::try_from(header.validator_node_merkle_root).map_err(|err| err.to_string())?,
+            validator_node_size: header.validator_node_size,
         })
     }
 }
 
 impl From<BlockHeader> for proto::BlockHeader {
     fn from(header: BlockHeader) -> Self {
-        let timestamp = datetime_to_timestamp(header.timestamp).unwrap();
         Self {
-            version: u32::try_from(header.version).unwrap(),
+            version: u32::from(header.version),
             height: header.height,
             prev_hash: header.prev_hash.to_vec(),
-            timestamp: Some(timestamp),
+            timestamp: header.timestamp.as_u64(),
             output_mr: header.output_mr.to_vec(),
-            witness_mr: header.witness_mr.to_vec(),
+            block_output_mr: header.block_output_mr.to_vec(),
             kernel_mr: header.kernel_mr.to_vec(),
             input_mr: header.input_mr.to_vec(),
             total_kernel_offset: header.total_kernel_offset.to_vec(),
@@ -90,8 +83,9 @@ impl From<BlockHeader> for proto::BlockHeader {
             nonce: header.nonce,
             pow: Some(proto::ProofOfWork::from(header.pow)),
             kernel_mmr_size: header.kernel_mmr_size,
-            output_mmr_size: header.output_mmr_size,
+            output_mmr_size: header.output_smt_size,
             validator_node_merkle_root: header.validator_node_mr.to_vec(),
+            validator_node_size: header.validator_node_size,
         }
     }
 }
@@ -104,7 +98,7 @@ impl TryFrom<proto::ProofOfWork> for ProofOfWork {
     fn try_from(pow: proto::ProofOfWork) -> Result<Self, Self::Error> {
         Ok(Self {
             pow_algo: PowAlgorithm::try_from(pow.pow_algo)?,
-            pow_data: pow.pow_data,
+            pow_data: PowData::try_from(pow.pow_data).map_err(|e| e.to_string())?,
         })
     }
 }
@@ -114,7 +108,7 @@ impl From<ProofOfWork> for proto::ProofOfWork {
     fn from(pow: ProofOfWork) -> Self {
         Self {
             pow_algo: pow.pow_algo as u64,
-            pow_data: pow.pow_data,
+            pow_data: pow.pow_data.to_vec(),
         }
     }
 }

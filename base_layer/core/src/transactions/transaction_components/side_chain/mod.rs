@@ -23,27 +23,31 @@
 mod sidechain_feature;
 pub use sidechain_feature::SideChainFeature;
 
+mod confidential_output;
 mod template_registration;
 mod validator_node_registration;
 mod validator_node_signature;
 
-use tari_crypto::{hash::blake2::Blake256, hash_domain, hashing::DomainSeparatedHasher};
+use blake2::Blake2b;
+pub use confidential_output::ConfidentialOutputData;
+use digest::consts::U32;
+use tari_crypto::{hash_domain, hashing::DomainSeparatedHasher};
 pub use template_registration::{BuildInfo, CodeTemplateRegistration, TemplateType};
 pub use validator_node_registration::ValidatorNodeRegistration;
 pub use validator_node_signature::{ValidatorNodeHashDomain, ValidatorNodeSignature};
 
 hash_domain!(
     ContractAcceptanceHashDomain,
-    "com.tari.tari-project.base_layer.core.transactions.side_chain.contract_acceptance_challenge",
+    "com.tari.base_layer.core.transactions.side_chain.contract_acceptance_challenge",
     1
 );
 
-pub type ContractAcceptanceHasherBlake256 = DomainSeparatedHasher<Blake256, ContractAcceptanceHashDomain>;
+pub type ContractAcceptanceHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, ContractAcceptanceHashDomain>;
 
 hash_domain!(
     SignerSignatureHashDomain,
-    "com.tari.tari-project.base_layer.core.transactions.side_chain.signer_signature",
+    "com.tari.base_layer.core.transactions.side_chain.signer_signature",
     1
 );
 
-pub type SignerSignatureHasherBlake256 = DomainSeparatedHasher<Blake256, SignerSignatureHashDomain>;
+pub type SignerSignatureHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, SignerSignatureHashDomain>;

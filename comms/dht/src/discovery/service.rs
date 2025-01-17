@@ -20,15 +20,14 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Instant};
 
 use log::*;
 use rand::{rngs::OsRng, RngCore};
 use tari_comms::{
     log_if_error,
-    peer_manager::{NodeId, NodeIdentity, Peer, PeerFeatures, PeerManager},
+    peer_manager::{NodeIdentity, Peer, PeerManager},
     types::CommsPublicKey,
-    validate_peer_addresses,
 };
 use tari_shutdown::ShutdownSignal;
 use tari_utilities::{hex::Hex, ByteArray};
@@ -38,11 +37,15 @@ use tokio::{
 };
 
 use crate::{
+    actor::OffenceSeverity,
     discovery::{requester::DhtDiscoveryRequest, DhtDiscoveryError},
     envelope::{DhtMessageType, NodeDestination},
     outbound::{OutboundEncryption, OutboundMessageRequester, SendMessageParams},
+    peer_validator::{DhtPeerValidatorError, PeerValidator},
     proto::dht::{DiscoveryMessage, DiscoveryResponseMessage},
+    rpc::UnvalidatedPeerInfo,
     DhtConfig,
+    DhtRequester,
 };
 
 const LOG_TARGET: &str = "comms::dht::discovery_service";
@@ -68,6 +71,7 @@ pub struct DhtDiscoveryService {
     node_identity: Arc<NodeIdentity>,
     outbound_requester: OutboundMessageRequester,
     peer_manager: Arc<PeerManager>,
+    dht: DhtRequester,
     request_rx: mpsc::Receiver<DhtDiscoveryRequest>,
     shutdown_signal: ShutdownSignal,
     inflight_discoveries: HashMap<u64, DiscoveryRequestState>,
@@ -78,6 +82,7 @@ impl DhtDiscoveryService {
         config: Arc<DhtConfig>,
         node_identity: Arc<NodeIdentity>,
         peer_manager: Arc<PeerManager>,
+        dht: DhtRequester,
         outbound_requester: OutboundMessageRequester,
         request_rx: mpsc::Receiver<DhtDiscoveryRequest>,
         shutdown_signal: ShutdownSignal,
@@ -86,6 +91,7 @@ impl DhtDiscoveryService {
             config,
             outbound_requester,
             node_identity,
+            dht,
             peer_manager,
             shutdown_signal,
             request_rx,
@@ -133,7 +139,14 @@ impl DhtDiscoveryService {
                 );
             },
 
-            NotifyDiscoveryResponseReceived(discovery_msg) => self.handle_discovery_response(discovery_msg).await,
+            NotifyDiscoveryResponseReceived(discovery_msg) => {
+                if let Err(err) = self.handle_discovery_response(discovery_msg).await {
+                    error!(
+                        target: LOG_TARGET,
+                        "Failed to handle discovery response message because '{:?}'", err
+                    );
+                }
+            },
         }
     }
 
@@ -160,13 +173,10 @@ impl DhtDiscoveryService {
         requests
     }
 
-    async fn handle_discovery_response(&mut self, discovery_msg: Box<DiscoveryResponseMessage>) {
-        trace!(
-            target: LOG_TARGET,
-            "Received discovery response message from {}",
-            discovery_msg.node_id.to_hex()
-        );
-
+    async fn handle_discovery_response(
+        &mut self,
+        discovery_msg: Box<DiscoveryResponseMessage>,
+    ) -> Result<(), DhtDiscoveryError> {
         match self.inflight_discoveries.remove(&discovery_msg.nonce) {
             Some(request) => {
                 let DiscoveryRequestState {
@@ -175,7 +185,30 @@ impl DhtDiscoveryService {
                     start_ts,
                 } = request;
 
-                let result = self.validate_then_add_peer(&public_key, discovery_msg).await;
+                // Make sure that the response is for the expected public key
+                if discovery_msg.public_key.as_bytes() != public_key.as_bytes() {
+                    warn!(
+                        target: LOG_TARGET,
+                        "Received a discovery response does not match the expected public key '{:#.5}'",
+                        public_key
+                    );
+                    self.dht
+                        .ban_peer(
+                            *public_key,
+                            OffenceSeverity::Medium,
+                            "Received a discovery response does not match the public key we requested",
+                        )
+                        .await;
+
+                    return Ok(());
+                }
+                trace!(
+                    target: LOG_TARGET,
+                    "Received discovery response message from {}",
+                    public_key
+                );
+
+                let result = self.validate_then_add_peer(discovery_msg).await;
 
                 // Resolve any other pending discover requests if the peer was found
                 match &result {
@@ -217,56 +250,44 @@ impl DhtDiscoveryService {
                     target: LOG_TARGET,
                     "Received a discovery response from peer '{}' that this node did not expect. It may have been \
                      cancelled earlier.",
-                    discovery_msg.node_id.to_hex()
+                    discovery_msg.public_key.to_hex()
                 );
             },
         }
+
+        Ok(())
     }
 
     async fn validate_then_add_peer(
         &mut self,
-        public_key: &CommsPublicKey,
         discovery_msg: Box<DiscoveryResponseMessage>,
     ) -> Result<Peer, DhtDiscoveryError> {
-        let node_id = self.validate_raw_node_id(public_key, &discovery_msg.node_id)?;
-
-        let addresses = discovery_msg
-            .addresses
-            .into_iter()
-            .filter_map(|addr| addr.parse().ok())
-            .collect::<Vec<_>>();
-
-        validate_peer_addresses(&addresses, self.config.allow_test_addresses)
-            .map_err(|err| DhtDiscoveryError::InvalidPeerMultiaddr(err.to_string()))?;
-
-        let peer = self
-            .peer_manager
-            .add_or_update_online_peer(
-                public_key,
-                node_id,
-                addresses,
-                PeerFeatures::from_bits_truncate(discovery_msg.peer_features),
-            )
+        let validator = PeerValidator::new(&self.config);
+        let info = UnvalidatedPeerInfo::try_from(*discovery_msg)
+            .map_err(|e| DhtDiscoveryError::InvalidDiscoveryResponse { details: e })?;
+        let public_key = info.public_key.clone();
+        let existing_peer = self.peer_manager.find_by_public_key(&public_key).await?;
+        let valid_peer = self
+            .ban_offence(&public_key, validator.validate_peer(info, existing_peer))
             .await?;
+        self.peer_manager.add_peer(valid_peer.clone()).await?;
 
-        Ok(peer)
+        Ok(valid_peer)
     }
 
-    fn validate_raw_node_id(
-        &self,
+    async fn ban_offence<T>(
+        &mut self,
         public_key: &CommsPublicKey,
-        raw_node_id: &[u8],
-    ) -> Result<NodeId, DhtDiscoveryError> {
-        // The reason that we check the given node id against what we expect instead of just using the given node id
-        // is in future the NodeId may not necessarily be derived from the public key (i.e. DAN node is registered on
-        // the base layer)
-        let expected_node_id = NodeId::from_key(public_key);
-        let node_id = NodeId::from_bytes(raw_node_id).map_err(|_| DhtDiscoveryError::InvalidNodeId)?;
-        if expected_node_id == node_id {
-            Ok(expected_node_id)
-        } else {
-            // TODO: Misbehaviour #banheuristic
-            Err(DhtDiscoveryError::InvalidNodeId)
+        result: Result<T, DhtPeerValidatorError>,
+    ) -> Result<T, DhtPeerValidatorError> {
+        match result {
+            Ok(peer) => Ok(peer),
+            Err(err @ DhtPeerValidatorError::NewAndExistingMismatch { .. }) => Err(err),
+            Err(err @ DhtPeerValidatorError::IdentityTooManyClaims { .. }) |
+            Err(err @ DhtPeerValidatorError::ValidatorError(_)) => {
+                self.dht.ban_peer(public_key.clone(), OffenceSeverity::High, &err).await;
+                Err(err)
+            },
         }
     }
 
@@ -277,6 +298,11 @@ impl DhtDiscoveryService {
         reply_tx: oneshot::Sender<Result<Peer, DhtDiscoveryError>>,
     ) -> Result<(), DhtDiscoveryError> {
         let nonce = OsRng.next_u64();
+        if *dest_pubkey == *self.node_identity.public_key() {
+            let _result = reply_tx.send(Err(DhtDiscoveryError::CannotDiscoverThisNode));
+            return Ok(());
+        }
+
         if let Err(err) = self.send_discover(nonce, destination, dest_pubkey.clone()).await {
             let _result = reply_tx.send(Err(err));
             return Ok(());
@@ -317,8 +343,13 @@ impl DhtDiscoveryService {
         dest_public_key: Box<CommsPublicKey>,
     ) -> Result<(), DhtDiscoveryError> {
         let discover_msg = DiscoveryMessage {
-            node_id: self.node_identity.node_id().to_vec(),
-            addresses: vec![self.node_identity.public_address().to_string()],
+            public_key: self.node_identity.public_key().to_vec(),
+            addresses: self
+                .node_identity
+                .public_addresses()
+                .into_iter()
+                .map(|a| a.to_vec())
+                .collect(),
             peer_features: self.node_identity.features().bits(),
             nonce,
             identity_signature: self.node_identity.identity_signature_read().as_ref().map(Into::into),
@@ -352,17 +383,16 @@ impl DhtDiscoveryService {
 mod test {
     use std::time::Duration;
 
-    use tari_comms::runtime;
     use tari_shutdown::Shutdown;
 
     use super::*;
     use crate::{
         discovery::DhtDiscoveryRequester,
         outbound::mock::create_outbound_service_mock,
-        test_utils::{build_peer_manager, make_node_identity},
+        test_utils::{build_peer_manager, create_dht_actor_mock, make_node_identity},
     };
 
-    #[runtime::test]
+    #[tokio::test]
     async fn send_discovery() {
         let node_identity = make_node_identity();
         let peer_manager = build_peer_manager();
@@ -374,18 +404,20 @@ mod test {
         // Requester which timeout instantly
         let mut requester = DhtDiscoveryRequester::new(sender, Duration::from_millis(1));
         let shutdown = Shutdown::new();
+        let (dht, _mock) = create_dht_actor_mock(1);
 
         DhtDiscoveryService::new(
             Default::default(),
             node_identity,
             peer_manager,
+            dht,
             outbound_requester,
             receiver,
             shutdown.to_signal(),
         )
         .spawn();
 
-        let dest_public_key = Box::new(CommsPublicKey::default());
+        let dest_public_key = Box::<tari_crypto::ristretto::RistrettoPublicKey>::default();
         let result = requester
             .discover_peer(
                 *dest_public_key.clone(),

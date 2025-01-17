@@ -25,13 +25,12 @@ use std::fmt::{self, Display, Formatter};
 use digest::Digest;
 use log::error;
 use serde::{Deserialize, Serialize};
-use tari_common::DomainDigest;
 use tari_utilities::hex::Hex;
 use thiserror::Error;
 
 use crate::{
     backend::ArrayLike,
-    common::{family, family_branch, find_peaks, hash_together, is_leaf, is_left_sibling, node_index},
+    common::{family, family_branch, find_peaks, hash_together, is_leaf, is_left_sibling, node_index, LeafIndex},
     error::MerkleMountainRangeError,
     serde_support,
     Hash,
@@ -60,13 +59,13 @@ pub enum MerkleProofError {
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, PartialOrd, Ord, Default)]
 pub struct MerkleProof {
     /// The size of the MMR at the time the proof was created.
-    mmr_size: usize,
+    pub mmr_size: usize,
     /// The sibling path from the leaf up to the final sibling hashing to the local root.
     #[serde(with = "serde_support::hash")]
-    path: Vec<Hash>,
+    pub path: Vec<Hash>,
     /// The set of MMR peaks, not including the local peak for the candidate node
     #[serde(with = "serde_support::hash")]
-    peaks: Vec<Hash>,
+    pub peaks: Vec<Hash>,
 }
 
 impl MerkleProof {
@@ -78,10 +77,10 @@ impl MerkleProof {
     /// See [MerkleProof::for_node] for more details on how the proof is constructed.
     pub fn for_leaf_node<D, B>(
         mmr: &MerkleMountainRange<D, B>,
-        leaf_index: usize,
+        leaf_index: LeafIndex,
     ) -> Result<MerkleProof, MerkleProofError>
     where
-        D: Digest + DomainDigest,
+        D: Digest,
         B: ArrayLike<Value = Hash>,
     {
         let pos = node_index(leaf_index);
@@ -100,7 +99,7 @@ impl MerkleProof {
     /// other MMR implementations work).
     pub fn for_node<D, B>(mmr: &MerkleMountainRange<D, B>, pos: usize) -> Result<MerkleProof, MerkleProofError>
     where
-        D: Digest + DomainDigest,
+        D: Digest,
         B: ArrayLike<Value = Hash>,
     {
         // check this pos is actually a leaf in the MMR
@@ -113,7 +112,7 @@ impl MerkleProof {
 
     fn generate_proof<D, B>(mmr: &MerkleMountainRange<D, B>, pos: usize) -> Result<MerkleProof, MerkleProofError>
     where
-        D: Digest + DomainDigest,
+        D: Digest,
         B: ArrayLike<Value = Hash>,
     {
         // check we actually have a hash in the MMR at this pos
@@ -137,7 +136,7 @@ impl MerkleProof {
 
         // Get the peaks of the merkle trees, which are bagged together to form the root
         // For the proof, we must leave out the local root for the candidate node
-        let peaks = find_peaks(mmr_size);
+        let peaks = find_peaks(mmr_size).ok_or(MerkleMountainRangeError::InvalidMmrSize)?;
         let mut peak_hashes = Vec::with_capacity(peaks.len() - 1);
         for peak_index in peaks {
             if peak_index != peak_pos {
@@ -155,26 +154,21 @@ impl MerkleProof {
         })
     }
 
-    pub fn verify_leaf<D: Digest + DomainDigest>(
+    pub fn verify_leaf<D: Digest>(
         &self,
         root: &HashSlice,
         hash: &HashSlice,
-        leaf_index: usize,
+        leaf_index: LeafIndex,
     ) -> Result<(), MerkleProofError> {
         let pos = node_index(leaf_index);
         self.verify::<D>(root, hash, pos)
     }
 
     /// Verifies the Merkle proof against the provided root hash, element and position in the MMR.
-    pub fn verify<D: Digest + DomainDigest>(
-        &self,
-        root: &HashSlice,
-        hash: &HashSlice,
-        pos: usize,
-    ) -> Result<(), MerkleProofError> {
+    pub fn verify<D: Digest>(&self, root: &HashSlice, hash: &HashSlice, pos: usize) -> Result<(), MerkleProofError> {
         let mut proof = self.clone();
         // calculate the peaks once as these are based on overall MMR size (and will not change)
-        let peaks = find_peaks(self.mmr_size);
+        let peaks = find_peaks(self.mmr_size).ok_or(MerkleMountainRangeError::InvalidMmrSize)?;
         proof.verify_consume::<D>(root, hash, pos, &peaks)
     }
 
@@ -191,12 +185,7 @@ impl MerkleProof {
     ///
     /// After running [verify_consume], we'll know the hash of 6 and it's position (the local root), and so we'll also
     /// know where to insert the hash in the peak list.
-    fn check_root<D: Digest + DomainDigest>(
-        &self,
-        hash: &HashSlice,
-        pos: usize,
-        peaks: &[usize],
-    ) -> Result<Hash, MerkleProofError> {
+    fn check_root<D: Digest>(&self, hash: &HashSlice, pos: usize, peaks: &[usize]) -> Result<Hash, MerkleProofError> {
         // The peak hash list provided in the proof does not include the local peak determined from the candidate
         // node, so len(peak) must be len(self.peaks) + 1.
         if peaks.len() != self.peaks.len() + 1 {
@@ -209,10 +198,10 @@ impl MerkleProof {
             .iter()
             .fold((hasher, peak_hashes), |(hasher, mut peak_hashes), i| {
                 if *i == pos {
-                    (hasher.chain(hash), peak_hashes)
+                    (hasher.chain_update(hash), peak_hashes)
                 } else {
                     let hash = peak_hashes.next().unwrap();
-                    (hasher.chain(hash), peak_hashes)
+                    (hasher.chain_update(hash), peak_hashes)
                 }
             });
         Ok(hasher.finalize().to_vec())
@@ -230,7 +219,7 @@ impl MerkleProof {
     /// calculating the parent hash, and then calling `verify_consume` again using the parent hash and position.
     /// Once `self.path` is empty, we have the local root and position, this data is used to hash all the peaks
     /// together in `check_root` to calculate the final merkle root.
-    fn verify_consume<D: Digest + DomainDigest>(
+    fn verify_consume<D: Digest>(
         &mut self,
         root: &HashSlice,
         hash: &HashSlice,

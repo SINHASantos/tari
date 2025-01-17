@@ -12,39 +12,103 @@ use thiserror::Error;
 
 pub use crate::tx_id::TxId;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionStatus {
     /// This transaction has been completed between the parties but has not been broadcast to the base layer network.
-    Completed,
+    Completed = 0,
     /// This transaction has been broadcast to the base layer network and is currently in one or more base node
     /// mempools.
-    Broadcast,
+    Broadcast = 1,
     /// This transaction has been mined and included in a block.
-    MinedUnconfirmed,
+    MinedUnconfirmed = 2,
     /// This transaction was generated as part of importing a spendable unblinded UTXO
-    Imported,
+    Imported = 3,
     /// This transaction is still being negotiated by the parties
-    Pending,
+    #[default]
+    Pending = 4,
     /// This is a created Coinbase Transaction
-    Coinbase,
+    Coinbase = 5,
     /// This transaction is mined and confirmed at the current base node's height
-    MinedConfirmed,
+    MinedConfirmed = 6,
     /// This transaction was Rejected by the mempool
-    Rejected,
-    /// This is faux transaction mainly for one-sided transaction outputs or wallet recovery outputs have been found
-    FauxUnconfirmed,
-    /// All Imported and FauxUnconfirmed transactions will end up with this status when the outputs have been confirmed
-    FauxConfirmed,
+    Rejected = 7,
+    /// This transaction import status is used when a one-sided transaction has been scanned but is unconfirmed
+    OneSidedUnconfirmed = 8,
+    /// This transaction import status is used when a one-sided transaction has been scanned and confirmed
+    OneSidedConfirmed = 9,
     /// This transaction is still being queued for initial sending
-    Queued,
+    Queued = 10,
+    /// This transaction import status is used when a coinbase transaction has been scanned but is unconfirmed
+    CoinbaseUnconfirmed = 11,
+    /// This transaction import status is used when a coinbase transaction has been scanned and confirmed
+    CoinbaseConfirmed = 12,
+    /// This transaction import status is used when a coinbase transaction has been scanned but the outputs are not
+    /// currently confirmed on the blockchain via the output manager
+    CoinbaseNotInBlockChain = 13,
 }
 
 impl TransactionStatus {
-    pub fn is_faux(&self) -> bool {
+    pub fn is_imported_from_chain(&self) -> bool {
         matches!(
             self,
-            TransactionStatus::Imported | TransactionStatus::FauxUnconfirmed | TransactionStatus::FauxConfirmed
+            TransactionStatus::Imported | TransactionStatus::OneSidedUnconfirmed | TransactionStatus::OneSidedConfirmed
         )
+    }
+
+    pub fn is_coinbase(&self) -> bool {
+        matches!(
+            self,
+            TransactionStatus::CoinbaseUnconfirmed |
+                TransactionStatus::CoinbaseConfirmed |
+                TransactionStatus::CoinbaseNotInBlockChain
+        )
+    }
+
+    pub fn is_confirmed(&self) -> bool {
+        matches!(
+            self,
+            TransactionStatus::OneSidedConfirmed |
+                TransactionStatus::CoinbaseConfirmed |
+                TransactionStatus::MinedConfirmed
+        )
+    }
+
+    pub fn mined_confirm(&self) -> Self {
+        match self {
+            TransactionStatus::Completed |
+            TransactionStatus::Broadcast |
+            TransactionStatus::Pending |
+            TransactionStatus::Coinbase |
+            TransactionStatus::Rejected |
+            TransactionStatus::Queued |
+            TransactionStatus::MinedUnconfirmed |
+            TransactionStatus::MinedConfirmed => TransactionStatus::MinedConfirmed,
+            TransactionStatus::Imported |
+            TransactionStatus::OneSidedUnconfirmed |
+            TransactionStatus::OneSidedConfirmed => TransactionStatus::OneSidedConfirmed,
+            TransactionStatus::CoinbaseNotInBlockChain |
+            TransactionStatus::CoinbaseConfirmed |
+            TransactionStatus::CoinbaseUnconfirmed => TransactionStatus::CoinbaseConfirmed,
+        }
+    }
+
+    pub fn mined_unconfirm(&self) -> Self {
+        match self {
+            TransactionStatus::Completed |
+            TransactionStatus::Broadcast |
+            TransactionStatus::Pending |
+            TransactionStatus::Coinbase |
+            TransactionStatus::Rejected |
+            TransactionStatus::Queued |
+            TransactionStatus::MinedUnconfirmed |
+            TransactionStatus::MinedConfirmed => TransactionStatus::MinedUnconfirmed,
+            TransactionStatus::Imported |
+            TransactionStatus::OneSidedUnconfirmed |
+            TransactionStatus::OneSidedConfirmed => TransactionStatus::OneSidedUnconfirmed,
+            TransactionStatus::CoinbaseConfirmed |
+            TransactionStatus::CoinbaseUnconfirmed |
+            TransactionStatus::CoinbaseNotInBlockChain => TransactionStatus::CoinbaseUnconfirmed,
+        }
     }
 }
 
@@ -67,17 +131,14 @@ impl TryFrom<i32> for TransactionStatus {
             5 => Ok(TransactionStatus::Coinbase),
             6 => Ok(TransactionStatus::MinedConfirmed),
             7 => Ok(TransactionStatus::Rejected),
-            8 => Ok(TransactionStatus::FauxUnconfirmed),
-            9 => Ok(TransactionStatus::FauxConfirmed),
+            8 => Ok(TransactionStatus::OneSidedUnconfirmed),
+            9 => Ok(TransactionStatus::OneSidedConfirmed),
             10 => Ok(TransactionStatus::Queued),
+            11 => Ok(TransactionStatus::CoinbaseUnconfirmed),
+            12 => Ok(TransactionStatus::CoinbaseConfirmed),
+            13 => Ok(TransactionStatus::CoinbaseNotInBlockChain),
             code => Err(TransactionConversionError { code }),
         }
-    }
-}
-
-impl Default for TransactionStatus {
-    fn default() -> Self {
-        TransactionStatus::Pending
     }
 }
 
@@ -93,8 +154,11 @@ impl Display for TransactionStatus {
             TransactionStatus::Pending => write!(f, "Pending"),
             TransactionStatus::Coinbase => write!(f, "Coinbase"),
             TransactionStatus::Rejected => write!(f, "Rejected"),
-            TransactionStatus::FauxUnconfirmed => write!(f, "FauxUnconfirmed"),
-            TransactionStatus::FauxConfirmed => write!(f, "FauxConfirmed"),
+            TransactionStatus::OneSidedUnconfirmed => write!(f, "One-Sided Unconfirmed"),
+            TransactionStatus::OneSidedConfirmed => write!(f, "One-Sided Confirmed"),
+            TransactionStatus::CoinbaseUnconfirmed => write!(f, "Coinbase Unconfirmed"),
+            TransactionStatus::CoinbaseConfirmed => write!(f, "Coinbase Confirmed"),
+            TransactionStatus::CoinbaseNotInBlockChain => write!(f, "Coinbase not mined"),
             TransactionStatus::Queued => write!(f, "Queued"),
         }
     }
@@ -102,14 +166,18 @@ impl Display for TransactionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportStatus {
+    /// Special case where we import a tx received from broadcast
+    Broadcast,
     /// This transaction import status is used when importing a spendable UTXO
     Imported,
     /// This transaction import status is used when a one-sided transaction has been scanned but is unconfirmed
-    FauxUnconfirmed,
+    OneSidedUnconfirmed,
     /// This transaction import status is used when a one-sided transaction has been scanned and confirmed
-    FauxConfirmed,
-    /// This is a coinbase that is imported
-    Coinbase,
+    OneSidedConfirmed,
+    /// This transaction import status is used when a coinbasetransaction has been scanned but is unconfirmed
+    CoinbaseUnconfirmed,
+    /// This transaction import status is used when a coinbase transaction has been scanned and confirmed
+    CoinbaseConfirmed,
 }
 
 impl TryFrom<ImportStatus> for TransactionStatus {
@@ -117,10 +185,12 @@ impl TryFrom<ImportStatus> for TransactionStatus {
 
     fn try_from(value: ImportStatus) -> Result<Self, Self::Error> {
         match value {
+            ImportStatus::Broadcast => Ok(TransactionStatus::Broadcast),
             ImportStatus::Imported => Ok(TransactionStatus::Imported),
-            ImportStatus::FauxUnconfirmed => Ok(TransactionStatus::FauxUnconfirmed),
-            ImportStatus::FauxConfirmed => Ok(TransactionStatus::FauxConfirmed),
-            ImportStatus::Coinbase => Ok(TransactionStatus::MinedConfirmed),
+            ImportStatus::OneSidedUnconfirmed => Ok(TransactionStatus::OneSidedUnconfirmed),
+            ImportStatus::OneSidedConfirmed => Ok(TransactionStatus::OneSidedConfirmed),
+            ImportStatus::CoinbaseUnconfirmed => Ok(TransactionStatus::CoinbaseUnconfirmed),
+            ImportStatus::CoinbaseConfirmed => Ok(TransactionStatus::CoinbaseConfirmed),
         }
     }
 }
@@ -130,10 +200,12 @@ impl TryFrom<TransactionStatus> for ImportStatus {
 
     fn try_from(value: TransactionStatus) -> Result<Self, Self::Error> {
         match value {
+            TransactionStatus::Broadcast => Ok(ImportStatus::Broadcast),
             TransactionStatus::Imported => Ok(ImportStatus::Imported),
-            TransactionStatus::FauxUnconfirmed => Ok(ImportStatus::FauxUnconfirmed),
-            TransactionStatus::FauxConfirmed => Ok(ImportStatus::FauxConfirmed),
-            TransactionStatus::Coinbase => Ok(ImportStatus::Coinbase),
+            TransactionStatus::OneSidedUnconfirmed => Ok(ImportStatus::OneSidedUnconfirmed),
+            TransactionStatus::OneSidedConfirmed => Ok(ImportStatus::OneSidedConfirmed),
+            TransactionStatus::CoinbaseUnconfirmed => Ok(ImportStatus::CoinbaseUnconfirmed),
+            TransactionStatus::CoinbaseConfirmed => Ok(ImportStatus::CoinbaseConfirmed),
             _ => Err(TransactionConversionError { code: i32::MAX }),
         }
     }
@@ -142,10 +214,12 @@ impl TryFrom<TransactionStatus> for ImportStatus {
 impl fmt::Display for ImportStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self {
+            ImportStatus::Broadcast => write!(f, "Broadcast"),
             ImportStatus::Imported => write!(f, "Imported"),
-            ImportStatus::FauxUnconfirmed => write!(f, "FauxUnconfirmed"),
-            ImportStatus::FauxConfirmed => write!(f, "FauxConfirmed"),
-            ImportStatus::Coinbase => write!(f, "Coinbase"),
+            ImportStatus::OneSidedUnconfirmed => write!(f, "OneSidedUnconfirmed"),
+            ImportStatus::OneSidedConfirmed => write!(f, "OneSidedConfirmed"),
+            ImportStatus::CoinbaseUnconfirmed => write!(f, "CoinbaseUnconfirmed"),
+            ImportStatus::CoinbaseConfirmed => write!(f, "CoinbaseConfirmed"),
         }
     }
 }

@@ -20,11 +20,11 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{cmp, sync::Arc};
+use std::{cmp, convert::TryInto, sync::Arc};
 
 use log::*;
 use tari_comms::{
-    peer_manager::{NodeId, Peer, PeerFeatures, PeerQuery},
+    peer_manager::{NodeId, Peer, PeerFeatures},
     protocol::rpc::{Request, RpcError, RpcStatus, Streaming},
     utils,
     PeerManager,
@@ -34,7 +34,7 @@ use tokio::{sync::mpsc, task};
 
 use crate::{
     proto::rpc::{GetCloserPeersRequest, GetPeersRequest, GetPeersResponse},
-    rpc::DhtRpcService,
+    rpc::{DhtRpcService, UnvalidatedPeerInfo},
 };
 
 const LOG_TARGET: &str = "comms::dht::rpc";
@@ -51,21 +51,36 @@ impl DhtRpcServiceImpl {
         Self { peer_manager }
     }
 
-    pub fn stream_peers(&self, peers: Vec<Peer>) -> Streaming<GetPeersResponse> {
+    pub fn stream_peers(
+        &self,
+        peers: Vec<Peer>,
+        max_claims: usize,
+        max_addresses_per_claim: usize,
+    ) -> Streaming<GetPeersResponse> {
         if peers.is_empty() {
             return Streaming::empty();
         }
 
         // A maximum buffer size of 10 is selected arbitrarily and is to allow the producer/consumer some room to
         // buffer.
-        let (tx, rx) = mpsc::channel(cmp::min(10, peers.len() as usize));
+        let (tx, rx) = mpsc::channel(cmp::min(10, peers.len()));
         task::spawn(async move {
             let iter = peers
                 .into_iter()
-                .map(|peer| GetPeersResponse {
-                    peer: Some(peer.into()),
+                .filter_map(|peer| {
+                    let peer_info =
+                        UnvalidatedPeerInfo::from_peer_limited_claims(peer, max_claims, max_addresses_per_claim);
+
+                    if peer_info.claims.is_empty() {
+                        None
+                    } else {
+                        Some(GetPeersResponse {
+                            peer: Some(peer_info.into()),
+                        })
+                    }
                 })
                 .map(Ok);
+
             let _result = utils::mpsc::send_all(&tx, iter).await;
         });
 
@@ -91,10 +106,28 @@ impl DhtRpcService for DhtRpcServiceImpl {
             )));
         }
 
+        let max_claims = message.max_claims.try_into().map_err(|_|
+            // This can't happen on a >= 32-bit arch
+            RpcStatus::bad_request("max_claims is too large"))?;
+
+        if max_claims == 0 {
+            return Err(RpcStatus::bad_request("max_claims must be greater than zero"));
+        }
+
+        let max_addresses_per_claim = message.max_addresses_per_claim.try_into().map_err(|_|
+            // This can't happen on a >= 32-bit arch
+            RpcStatus::bad_request("max_addresses_per_claim is too large"))?;
+
+        if max_addresses_per_claim == 0 {
+            return Err(RpcStatus::bad_request(
+                "max_addresses_per_claim must be greater than zero",
+            ));
+        }
+
         let node_id = if message.closer_to.is_empty() {
             request.context().peer_node_id().clone()
         } else {
-            NodeId::from_bytes(&message.closer_to)
+            NodeId::from_canonical_bytes(&message.closer_to)
                 .map_err(|_| RpcStatus::bad_request("`closer_to` did not contain a valid NodeId"))?
         };
 
@@ -108,7 +141,7 @@ impl DhtRpcService for DhtRpcServiceImpl {
         let mut excluded = message
             .excluded
             .iter()
-            .filter_map(|node_id| NodeId::from_bytes(node_id).ok())
+            .filter_map(|node_id| NodeId::from_canonical_bytes(node_id).ok())
             .collect::<Vec<_>>();
 
         if excluded.len() != message.excluded.len() {
@@ -137,29 +170,38 @@ impl DhtRpcService for DhtRpcServiceImpl {
             node_id.short_str()
         );
 
-        Ok(self.stream_peers(peers))
+        Ok(self.stream_peers(peers, max_claims, max_addresses_per_claim))
     }
 
     async fn get_peers(&self, request: Request<GetPeersRequest>) -> Result<Streaming<GetPeersResponse>, RpcStatus> {
         let message = request.message();
-        let requester_node_id = request.context().peer_node_id();
-
-        let mut query = PeerQuery::new().select_where(|peer| {
-            &peer.node_id != requester_node_id &&
-                (message.include_clients || !peer.features.is_client()) &&
-                !peer.is_banned()
-        });
-
-        if message.n > 0 {
-            query = query.limit(message.n as usize);
+        let excluded_peers = vec![request.context().peer_node_id().clone()];
+        let mut features = Some(PeerFeatures::COMMUNICATION_NODE);
+        if message.include_clients {
+            features = None;
         }
 
-        // TODO: This result set can/will be large
-        //       Ideally, we'd need a lazy-loaded iterator, however that requires a long-lived read transaction and
-        //       the lifetime of that transaction is proportional on the time it takes to send the peers.
-        //       Either we should not need to return all peers, or we can find a way to do an iterator which does not
-        //       require a long-lived read transaction (we don't strictly care about read consistency in this case).
-        let peers = self.peer_manager.perform_query(query).await.map_err(RpcError::from)?;
+        let max_claims = message.max_claims.try_into().map_err(|_|
+            // This can't happen on a >= 32-bit arch
+            RpcStatus::bad_request("max_claims is too large"))?;
+        if max_claims == 0 {
+            return Err(RpcStatus::bad_request("max_claims must be greater than zero"));
+        }
+        let max_addresses_per_claim = message.max_addresses_per_claim.try_into().map_err(|_|
+            // This can't happen on a >= 32-bit arch
+            RpcStatus::bad_request("max_addresses_per_claim is too large"))?;
+
+        if max_addresses_per_claim == 0 {
+            return Err(RpcStatus::bad_request(
+                "max_addresses_per_claim must be greater than zero",
+            ));
+        }
+
+        let peers = self
+            .peer_manager
+            .discovery_syncing(message.n as usize, &excluded_peers, features)
+            .await
+            .map_err(RpcError::from)?;
 
         let node_id = request.context().peer_node_id();
         debug!(
@@ -174,6 +216,6 @@ impl DhtRpcService for DhtRpcServiceImpl {
             node_id.short_str()
         );
 
-        Ok(self.stream_peers(peers))
+        Ok(self.stream_peers(peers, max_claims, max_addresses_per_claim))
     }
 }

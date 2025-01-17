@@ -20,20 +20,13 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use crate::{
-    error::MerkleMountainRangeError,
-    pruned_hashset::PrunedHashSet,
-    ArrayLike,
-    Hash,
-    MerkleMountainRange,
-    MutableMmr,
-};
-use digest::Digest;
 use std::{convert::TryFrom, marker::PhantomData};
-use tari_common::DomainDigest;
+
+use digest::Digest;
+
+use crate::{error::MerkleMountainRangeError, pruned_hashset::PrunedHashSet, ArrayLike, Hash, MerkleMountainRange};
 
 pub type PrunedMmr<D> = MerkleMountainRange<D, PrunedHashSet>;
-pub type PrunedMutableMmr<D> = MutableMmr<D, PrunedHashSet>;
 
 /// Create a pruned Merkle Mountain Range from the provided MMR. Pruning entails throwing all the hashes of the
 /// pruned MMR away, except for the current peaks. A new MMR instance is returned that allows you to continue
@@ -42,7 +35,7 @@ pub type PrunedMutableMmr<D> = MutableMmr<D, PrunedHashSet>;
 /// `validate` will throw an error.
 pub fn prune_mmr<D, B>(mmr: &MerkleMountainRange<D, B>) -> Result<PrunedMmr<D>, MerkleMountainRangeError>
 where
-    D: Digest + DomainDigest,
+    D: Digest,
     B: ArrayLike<Value = Hash>,
 {
     let backend = PrunedHashSet::try_from(mmr)?;
@@ -52,59 +45,12 @@ where
     })
 }
 
-/// A convenience function in the same vein as [prune_mmr], but applied to `MutableMmr` instances.
-pub fn prune_mutable_mmr<D, B>(mmr: &MutableMmr<D, B>) -> Result<PrunedMutableMmr<D>, MerkleMountainRangeError>
-where
-    D: Digest + DomainDigest,
-    B: ArrayLike<Value = Hash>,
-{
-    let backend = PrunedHashSet::try_from(&mmr.mmr)?;
-    Ok(MutableMmr {
-        mmr: MerkleMountainRange::new(backend),
-        deleted: mmr.deleted.clone(),
-        size: mmr.size,
-    })
-}
-
-/// `calculate_mmr_root`` takes an MMR instance and efficiently calculates the new MMR root by applying the given
-/// additions to calculate a new MMR root without changing the original MMR.
-///
-/// This is done by creating a memory-backed sparse (pruned) copy of the original MMR, applying the changes and then
-/// calculating a new root.
-///
-/// # Parameters
-/// * `src`: A reference to the original MMR
-/// * `additions`: A vector of leaf node hashes to append to the MMR
-/// * `deletions`: A vector of leaf node _indices_ that will be marked as deleted.
-///
-/// # Returns
-/// The new MMR root as a result of applying the given changes
-pub fn calculate_pruned_mmr_root<D, B>(
-    src: &MutableMmr<D, B>,
-    additions: Vec<Hash>,
-    deletions: Vec<u32>,
-) -> Result<Hash, MerkleMountainRangeError>
-where
-    D: Digest + DomainDigest,
-    B: ArrayLike<Value = Hash>,
-{
-    let mut pruned_mmr = prune_mutable_mmr(src)?;
-    for hash in additions {
-        pruned_mmr.push(hash)?;
-    }
-    for index in deletions {
-        pruned_mmr.delete(index);
-    }
-    pruned_mmr.compress();
-    pruned_mmr.get_merkle_root()
-}
-
 pub fn calculate_mmr_root<D, B>(
     src: &MerkleMountainRange<D, B>,
     additions: Vec<Hash>,
 ) -> Result<Hash, MerkleMountainRangeError>
 where
-    D: Digest + DomainDigest,
+    D: Digest,
     B: ArrayLike<Value = Hash>,
 {
     let mut mmr = prune_mmr(src)?;

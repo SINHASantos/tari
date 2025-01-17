@@ -50,74 +50,80 @@ pub mod mempool;
 pub mod transactions;
 
 mod common;
-pub use common::borsh;
 
-#[allow(clippy::ptr_offset_with_cast)]
-#[allow(clippy::assign_op_pattern)]
-#[allow(clippy::manual_range_contains)]
-#[allow(clippy::range_plus_one)]
-pub mod large_ints {
-    uint::construct_uint! {
-        /// 256-bit unsigned integer.
-        pub struct U256(4);
-    }
+#[cfg(feature = "base_node")]
+pub use common::AuxChainHashes;
+pub use common::{borsh, one_sided, ConfidentialOutputHasher};
 
-    uint::construct_uint! {
-        /// 512-bit unsigned integer.
-        pub struct U512(8);
-    }
-}
-
-pub use large_ints::{U256, U512};
 #[cfg(feature = "base_node")]
 mod domain_hashing {
-    use tari_crypto::{hash::blake2::Blake256, hash_domain, hashing::DomainSeparatedHasher};
-    use tari_mmr::{pruned_hashset::PrunedHashSet, Hash, MerkleMountainRange, MutableMmr};
+    use std::convert::TryFrom;
 
-    hash_domain!(
-        KernelMmrHashDomain,
-        "com.tari.tari_project.base_layer.core.kernel_mmr",
-        1
-    );
+    use blake2::Blake2b;
+    use digest::consts::U32;
+    use tari_common_types::types::{FixedHash, FixedHashSizeError};
+    use tari_crypto::{hash_domain, hashing::DomainSeparatedHasher};
+    use tari_hashing::ValidatorNodeBmtHashDomain;
+    use tari_mmr::{
+        error::MerkleMountainRangeError,
+        pruned_hashset::PrunedHashSet,
+        sparse_merkle_tree::SparseMerkleTree,
+        BalancedBinaryMerkleTree,
+        Hash,
+        MerkleMountainRange,
+    };
 
-    pub type KernelMmrHasherBlake256 = DomainSeparatedHasher<Blake256, KernelMmrHashDomain>;
+    hash_domain!(KernelMmrHashDomain, "com.tari.base_layer.core.kernel_mmr", 1);
+
+    pub type KernelMmrHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, KernelMmrHashDomain>;
     pub type KernelMmr = MerkleMountainRange<KernelMmrHasherBlake256, Vec<Hash>>;
     pub type PrunedKernelMmr = MerkleMountainRange<KernelMmrHasherBlake256, PrunedHashSet>;
 
-    hash_domain!(
-        WitnessMmrHashDomain,
-        "com.tari.tari_project.base_layer.core.witness_mmr",
-        1
-    );
-    pub type WitnessMmrHasherBlake256 = DomainSeparatedHasher<Blake256, WitnessMmrHashDomain>;
-    pub type WitnessMmr = MerkleMountainRange<WitnessMmrHasherBlake256, Vec<Hash>>;
-    pub type PrunedWitnessMmr = MerkleMountainRange<WitnessMmrHasherBlake256, PrunedHashSet>;
+    hash_domain!(OutputSmtHashDomain, "com.tari.base_layer.core.output_smt", 1);
+    pub type OutputSmtHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, OutputSmtHashDomain>;
 
-    hash_domain!(
-        OutputMmrHashDomain,
-        "com.tari.tari_project.base_layer.core.output_mmr",
-        1
-    );
-    pub type OutputMmrHasherBlake256 = DomainSeparatedHasher<Blake256, OutputMmrHashDomain>;
-    pub type MutableOutputMmr = MutableMmr<OutputMmrHasherBlake256, Vec<Hash>>;
-    pub type PrunedOutputMmr = MerkleMountainRange<OutputMmrHasherBlake256, PrunedHashSet>;
-    pub type MutablePrunedOutputMmr = MutableMmr<OutputMmrHasherBlake256, PrunedHashSet>;
-
-    hash_domain!(
-        InputMmrHashDomain,
-        "com.tari.tari_project.base_layer.core.output_mmr",
-        1
-    );
-    pub type InputMmrHasherBlake256 = DomainSeparatedHasher<Blake256, InputMmrHashDomain>;
+    hash_domain!(InputMmrHashDomain, "com.tari.base_layer.core.input_mmr", 1);
+    pub type InputMmrHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, InputMmrHashDomain>;
     pub type PrunedInputMmr = MerkleMountainRange<InputMmrHasherBlake256, PrunedHashSet>;
+    pub type PrunedOutputMmr = MerkleMountainRange<InputMmrHasherBlake256, PrunedHashSet>;
 
-    hash_domain!(
-        ValidatorNodeMmrHashDomain,
-        "com.tari.tari_project.base_layer.core.validator_node_mmr",
-        1
-    );
-    pub type ValidatorNodeMmrHasherBlake256 = DomainSeparatedHasher<Blake256, ValidatorNodeMmrHashDomain>;
-    pub type ValidatorNodeMmr = MerkleMountainRange<ValidatorNodeMmrHasherBlake256, Vec<Hash>>;
+    pub type OutputSmt = SparseMerkleTree<OutputSmtHasherBlake256>;
+
+    pub type ValidatorNodeBmtHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, ValidatorNodeBmtHashDomain>;
+    pub type ValidatorNodeBMT = BalancedBinaryMerkleTree<ValidatorNodeBmtHasherBlake256>;
+
+    #[inline]
+    pub fn kernel_mr_hash_from_mmr(kernel_mmr: &KernelMmr) -> Result<FixedHash, MrHashError> {
+        Ok(FixedHash::try_from(kernel_mmr.get_merkle_root()?)?)
+    }
+
+    #[inline]
+    pub fn kernel_mr_hash_from_pruned_mmr(kernel_mmr: &PrunedKernelMmr) -> Result<FixedHash, MrHashError> {
+        Ok(FixedHash::try_from(kernel_mmr.get_merkle_root()?)?)
+    }
+
+    #[inline]
+    pub fn output_mr_hash_from_smt(output_smt: &mut OutputSmt) -> Result<FixedHash, MrHashError> {
+        Ok(FixedHash::try_from(output_smt.hash().as_slice())?)
+    }
+
+    #[inline]
+    pub fn input_mr_hash_from_pruned_mmr(input_mmr: &PrunedInputMmr) -> Result<FixedHash, MrHashError> {
+        Ok(FixedHash::try_from(input_mmr.get_merkle_root()?)?)
+    }
+
+    #[inline]
+    pub fn block_output_mr_hash_from_pruned_mmr(output_mmr: &PrunedOutputMmr) -> Result<FixedHash, MrHashError> {
+        Ok(FixedHash::try_from(output_mmr.get_merkle_root()?)?)
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum MrHashError {
+        #[error("Output SMT conversion error: {0}")]
+        FixedHashSizeError(#[from] FixedHashSizeError),
+        #[error("Input MR conversion error: {0}")]
+        MerkleMountainRangeError(#[from] MerkleMountainRangeError),
+    }
 }
 
 #[cfg(feature = "base_node")]

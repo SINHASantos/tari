@@ -72,7 +72,7 @@ pub fn slice_to_vec_pubkeys(slice: &[u8], num: usize) -> Result<Vec<RistrettoPub
     let public_keys = slice
         .chunks_exact(PUBLIC_KEY_LENGTH)
         .take(num)
-        .map(RistrettoPublicKey::from_bytes)
+        .map(RistrettoPublicKey::from_canonical_bytes)
         .collect::<Result<Vec<RistrettoPublicKey>, ByteArrayError>>()?;
 
     Ok(public_keys)
@@ -129,11 +129,11 @@ const OP_END_IF: u8 = 0x63;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Opcode {
     // Block Height Checks
-    /// Pops the top of the stack as `height`. Compare the current block height to `height`. Fails with
+    /// Compare the current block height to `height`. Fails with
     /// `IncompatibleTypes` if u64 is not a valid 64-bit unsigned integer. Fails with `VerifyFailed` if the block
     /// height < `height`.
     CheckHeightVerify(u64),
-    /// Pops the top of the stack as `height`. Pushes the value of (the current tip height - `height`) to the stack. In
+    /// Pushes the value of (the current tip height - `height`) to the stack. In
     /// other words, the top of the stack will hold the height difference between `height` and the current height.
     /// If the chain has progressed beyond `height`, the value is positive; and negative if the chain has yet to
     /// reach `height`. Fails with `IncompatibleTypes` if u64 is not a valid 64-bit unsigned integer. Fails with
@@ -143,7 +143,7 @@ pub enum Opcode {
     /// if there is not a valid integer value on top of the stack. Fails with `StackUnderflow` if the stack is empty.
     /// Fails with `VerifyFailed` if the block height < `height`.
     CompareHeightVerify,
-    /// Pops the top of the stack as `height`, then pushes the value of (`height` - the current height) to the stack.
+    /// Pops the top of the stack as `height`, then pushes the value of (the current height - `height`) to the stack.
     /// In other words, this opcode replaces the top of the stack with the difference between `height` and the
     /// current height. Fails with `InvalidInput` if there is not a valid integer value on top of the stack. Fails
     /// with `StackUnderflow` if the stack is empty.
@@ -222,7 +222,7 @@ pub enum Opcode {
     OrVerify(u8),
 
     // Cryptographic Operations
-    /// Pops the top element, hash it with the Blake256 hash function and push the result to the stack. Fails with
+    /// Pops the top element, hash it with the Blake2b<U32> hash function and push the result to the stack. Fails with
     /// `StackUnderflow` if the stack is empty. Fails with `InvalidInput` if the input is not a valid 32 byte hash
     /// value.
     HashBlake256,
@@ -262,9 +262,11 @@ pub enum Opcode {
     /// Identical to CheckMultiSig, except that the aggregate of the public keys is pushed to the stack if multiple
     /// signature validation succeeds. Fails with `VerifyFailed` if any signature is invalid.
     CheckMultiSigVerifyAggregatePubKey(u8, u8, Vec<RistrettoPublicKey>, Box<Message>),
-    /// Pops the top element from the stack, either a scalar or a hash, calculates the corresponding Ristretto point,
-    /// and pushes the result to the stack. Fails with `StackUnderflow` if the stack is empty. Fails with
-    /// `IncompatibleTypes` if the stack item is not a valid 32 byte sequence.
+    /// Pops the top element from the stack (either a scalar or a hash), parses it canonically as a Ristretto secret
+    /// key if possible, computes the corresponding Ristretto public key, and pushes this value to the stack.
+    /// Fails with `StackUnderflow` if the stack is empty.
+    /// Fails with `IncompatibleTypes` if the stack item is not either a scalar or a hash.
+    /// Fails with `InvalidInput` if the stack item cannot be canonically parsed as a Ristretto secret key.
     ToRistrettoPoint,
 
     // Miscellaneous
@@ -341,7 +343,7 @@ impl Opcode {
     /// Take a byte slice and read the next opcode from it, including any associated data. `read_next` returns a tuple
     /// of the deserialised opcode, and an updated slice that has the Opcode and data removed.
     fn read_next(bytes: &[u8]) -> Result<(Opcode, &[u8]), ScriptError> {
-        let code = bytes.get(0).ok_or(ScriptError::InvalidOpcode)?;
+        let code = bytes.first().ok_or(ScriptError::InvalidOpcode)?;
         #[allow(clippy::enum_glob_use)]
         use Opcode::*;
         match *code {
@@ -373,7 +375,7 @@ impl Opcode {
                 if bytes.len() < 33 {
                     return Err(ScriptError::InvalidData);
                 }
-                let p = RistrettoPublicKey::from_bytes(&bytes[1..33])?;
+                let p = RistrettoPublicKey::from_canonical_bytes(&bytes[1..33])?;
                 Ok((PushPubKey(Box::new(p)), &bytes[33..]))
             },
             OP_DROP => Ok((Drop, &bytes[1..])),
@@ -640,7 +642,7 @@ pub enum OpcodeVersion {
 
 #[cfg(test)]
 mod test {
-    use crate::{op_codes::*, Opcode, ScriptError};
+    use crate::op_codes::*;
 
     #[test]
     fn empty_script() {

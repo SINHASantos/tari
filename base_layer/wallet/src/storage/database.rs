@@ -25,14 +25,16 @@ use std::{
     sync::Arc,
 };
 
+use chrono::NaiveDateTime;
 use log::*;
-use tari_common_types::chain_metadata::ChainMetadata;
+use tari_common_types::{chain_metadata::ChainMetadata, wallet_types::WalletType};
 use tari_comms::{
     multiaddr::Multiaddr,
     peer_manager::{IdentitySignature, PeerFeatures},
     tor::TorIdentity,
 };
 use tari_key_manager::cipher_seed::CipherSeed;
+use tari_utilities::SafePassword;
 
 use crate::{error::WalletStorageError, utxo_scanner_service::service::ScannedBlock};
 
@@ -57,6 +59,19 @@ pub trait WalletBackend: Send + Sync + Clone {
         height: u64,
         exclude_recovered: bool,
     ) -> Result<(), WalletStorageError>;
+
+    /// Change the passphrase used to encrypt the database
+    fn change_passphrase(&self, existing: &SafePassword, new: &SafePassword) -> Result<(), WalletStorageError>;
+
+    fn create_burnt_proof(
+        &self,
+        id: u32,
+        reciprocal_claim_public_key: String,
+        payload: String,
+    ) -> Result<(), WalletStorageError>;
+    fn fetch_burnt_proof(&self, id: u32) -> Result<(u32, String, String, NaiveDateTime), WalletStorageError>;
+    fn fetch_burnt_proofs(&self) -> Result<Vec<(u32, String, String, NaiveDateTime)>, WalletStorageError>;
+    fn delete_burnt_proof(&self, id: u32) -> Result<(), WalletStorageError>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,9 +83,14 @@ pub enum DbKey {
     BaseNodeChainMetadata,
     ClientKey(String),
     MasterSeed,
-    PassphraseHash,
-    EncryptionSalt,
+    EncryptedMainKey,    // the database encryption key, itself encrypted with the secondary key
+    SecondaryKeySalt,    // the salt used (with the user's passphrase) to derive the secondary derivation key
+    SecondaryKeyVersion, // the parameter version for the secondary derivation key
+    SecondaryKeyHash,    // a hash commitment to the secondary derivation key
     WalletBirthday,
+    LastAccessedNetwork,
+    LastAccessedVersion,
+    WalletType,
 }
 
 impl DbKey {
@@ -82,10 +102,15 @@ impl DbKey {
             DbKey::TorId => "TorId".to_string(),
             DbKey::ClientKey(k) => format!("ClientKey.{}", k),
             DbKey::BaseNodeChainMetadata => "BaseNodeChainMetadata".to_string(),
-            DbKey::PassphraseHash => "PassphraseHash".to_string(),
-            DbKey::EncryptionSalt => "EncryptionSalt".to_string(),
+            DbKey::EncryptedMainKey => "EncryptedMainKey".to_string(),
+            DbKey::SecondaryKeySalt => "SecondaryKeySalt".to_string(),
+            DbKey::SecondaryKeyVersion => "SecondaryKeyVersion".to_string(),
+            DbKey::SecondaryKeyHash => "SecondaryKeyHash".to_string(),
             DbKey::WalletBirthday => "WalletBirthday".to_string(),
             DbKey::CommsIdentitySignature => "CommsIdentitySignature".to_string(),
+            DbKey::LastAccessedNetwork => "LastAccessedNetwork".to_string(),
+            DbKey::LastAccessedVersion => "LastAccessedVersion".to_string(),
+            DbKey::WalletType => "WalletType".to_string(),
         }
     }
 }
@@ -99,9 +124,14 @@ pub enum DbValue {
     ValueCleared,
     BaseNodeChainMetadata(ChainMetadata),
     MasterSeed(CipherSeed),
-    PassphraseHash(String),
-    EncryptionSalt(String),
+    EncryptedMainKey(String),
+    SecondaryKeySalt(String),
+    SecondaryKeyVersion(String),
+    SecondaryKeyHash(String),
     WalletBirthday(String),
+    LastAccessedNetwork(String),
+    LastAccessedVersion(String),
+    WalletType(WalletType),
 }
 
 #[derive(Clone)]
@@ -113,6 +143,8 @@ pub enum DbKeyValuePair {
     CommsAddress(Multiaddr),
     CommsFeatures(PeerFeatures),
     CommsIdentitySignature(Box<IdentitySignature>),
+    NetworkAndVersion((String, String)),
+    WalletType(WalletType),
 }
 
 pub enum WriteOperation {
@@ -130,6 +162,11 @@ where T: WalletBackend + 'static
 {
     pub fn new(db: T) -> Self {
         Self { db: Arc::new(db) }
+    }
+
+    pub fn change_passphrase(&self, existing: &SafePassword, new: &SafePassword) -> Result<(), WalletStorageError> {
+        self.db.change_passphrase(existing, new)?;
+        Ok(())
     }
 
     pub fn get_master_seed(&self) -> Result<Option<CipherSeed>, WalletStorageError> {
@@ -240,6 +277,14 @@ where T: WalletBackend + 'static
         Ok(())
     }
 
+    pub fn set_last_network_and_version(&self, network: String, version: String) -> Result<(), WalletStorageError> {
+        self.db
+            .write(WriteOperation::Insert(DbKeyValuePair::NetworkAndVersion((
+                network, version,
+            ))))?;
+        Ok(())
+    }
+
     pub fn get_client_key_value(&self, key: String) -> Result<Option<String>, WalletStorageError> {
         let c = match self.db.fetch(&DbKey::ClientKey(key.clone())) {
             Ok(None) => Ok(None),
@@ -321,6 +366,43 @@ where T: WalletBackend + 'static
         self.db.clear_scanned_blocks_before_height(height, exclude_recovered)?;
         Ok(())
     }
+
+    pub fn create_burnt_proof(
+        &self,
+        id: u32,
+        reciprocal_claim_public_key: String,
+        payload: String,
+    ) -> Result<(), WalletStorageError> {
+        self.db.create_burnt_proof(id, reciprocal_claim_public_key, payload)?;
+        Ok(())
+    }
+
+    pub fn fetch_burnt_proof(&self, id: u32) -> Result<(u32, String, String, NaiveDateTime), WalletStorageError> {
+        self.db.fetch_burnt_proof(id)
+    }
+
+    pub fn fetch_burnt_proofs(&self) -> Result<Vec<(u32, String, String, NaiveDateTime)>, WalletStorageError> {
+        self.db.fetch_burnt_proofs()
+    }
+
+    pub fn delete_burnt_proof(&self, id: u32) -> Result<(), WalletStorageError> {
+        self.db.delete_burnt_proof(id)
+    }
+
+    pub fn get_wallet_type(&self) -> Result<Option<WalletType>, WalletStorageError> {
+        match self.db.fetch(&DbKey::WalletType) {
+            Ok(None) => Ok(None),
+            Ok(Some(DbValue::WalletType(k))) => Ok(Some(k)),
+            Ok(Some(other)) => unexpected_result(DbKey::WalletType, other),
+            Err(e) => log_error(DbKey::WalletType, e),
+        }
+    }
+
+    pub fn set_wallet_type(&self, wallet_type: WalletType) -> Result<(), WalletStorageError> {
+        self.db
+            .write(WriteOperation::Insert(DbKeyValuePair::WalletType(wallet_type)))?;
+        Ok(())
+    }
 }
 
 impl Display for DbValue {
@@ -333,10 +415,15 @@ impl Display for DbValue {
             DbValue::CommsAddress(_) => f.write_str("Comms Address"),
             DbValue::TorId(v) => f.write_str(&format!("Tor ID: {}", v)),
             DbValue::BaseNodeChainMetadata(v) => f.write_str(&format!("Last seen Chain metadata from base node:{}", v)),
-            DbValue::PassphraseHash(h) => f.write_str(&format!("PassphraseHash: {}", h)),
-            DbValue::EncryptionSalt(s) => f.write_str(&format!("EncryptionSalt: {}", s)),
+            DbValue::EncryptedMainKey(k) => f.write_str(&format!("EncryptedMainKey: {:?}", k)),
+            DbValue::SecondaryKeySalt(s) => f.write_str(&format!("SecondaryKeySalt: {}", s)),
+            DbValue::SecondaryKeyVersion(v) => f.write_str(&format!("SecondaryKeyVersion: {}", v)),
+            DbValue::SecondaryKeyHash(h) => f.write_str(&format!("SecondaryKeyHash: {}", h)),
             DbValue::WalletBirthday(b) => f.write_str(&format!("WalletBirthday: {}", b)),
             DbValue::CommsIdentitySignature(_) => f.write_str("CommsIdentitySignature"),
+            DbValue::LastAccessedNetwork(network) => f.write_str(&format!("LastAccessedNetwork: {}", network)),
+            DbValue::LastAccessedVersion(version) => f.write_str(&format!("LastAccessedVersion: {}", version)),
+            DbValue::WalletType(wallet_type) => f.write_str(&format!("WalletType: {:?}", wallet_type)),
         }
     }
 }
@@ -378,7 +465,7 @@ mod test {
     fn test_database_crud() {
         let db_name = format!("{}.sqlite3", string(8).as_str());
         let db_folder = tempdir().unwrap().path().to_str().unwrap().to_string();
-        let connection = run_migration_and_create_sqlite_connection(&format!("{}{}", db_folder, db_name), 16).unwrap();
+        let connection = run_migration_and_create_sqlite_connection(format!("{}{}", db_folder, db_name), 16).unwrap();
 
         let passphrase = SafePassword::from("my secret lovely passphrase");
         let db = WalletDatabase::new(WalletSqliteDatabase::new(connection, passphrase).unwrap());

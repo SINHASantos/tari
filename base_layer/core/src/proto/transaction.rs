@@ -28,7 +28,7 @@ use std::{
 };
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use tari_common_types::types::{BlindingFactor, BulletRangeProof, Commitment, PublicKey};
+use tari_common_types::types::{BulletRangeProof, Commitment, PrivateKey, PublicKey};
 use tari_crypto::tari_utilities::{ByteArray, ByteArrayError};
 use tari_script::{ExecutionStack, TariScript};
 use tari_utilities::convert::try_convert_all;
@@ -37,13 +37,15 @@ use crate::{
     proto,
     transactions::{
         aggregated_body::AggregateBody,
-        tari_amount::MicroTari,
+        tari_amount::MicroMinotari,
         transaction_components::{
-            EncryptedValue,
+            CoinBaseExtra,
+            EncryptedData,
             KernelFeatures,
             OutputFeatures,
             OutputFeaturesVersion,
             OutputType,
+            RangeProofType,
             SideChainFeature,
             Transaction,
             TransactionInput,
@@ -55,14 +57,13 @@ use crate::{
         },
     },
 };
-
 //---------------------------------- TransactionKernel --------------------------------------------//
 
 impl TryFrom<proto::types::TransactionKernel> for TransactionKernel {
     type Error = String;
 
     fn try_from(kernel: proto::types::TransactionKernel) -> Result<Self, Self::Error> {
-        let excess = Commitment::from_bytes(
+        let excess = Commitment::from_canonical_bytes(
             &kernel
                 .excess
                 .ok_or_else(|| "Excess not provided in kernel".to_string())?
@@ -76,7 +77,9 @@ impl TryFrom<proto::types::TransactionKernel> for TransactionKernel {
             .try_into()?;
         let kernel_features = u8::try_from(kernel.features).map_err(|_| "Kernel features must be a single byte")?;
         let commitment = match kernel.burn_commitment {
-            Some(burn_commitment) => Some(Commitment::from_bytes(&burn_commitment.data).map_err(|e| e.to_string())?),
+            Some(burn_commitment) => {
+                Some(Commitment::from_canonical_bytes(&burn_commitment.data).map_err(|e| e.to_string())?)
+            },
             None => None,
         };
 
@@ -86,7 +89,7 @@ impl TryFrom<proto::types::TransactionKernel> for TransactionKernel {
             )?,
             KernelFeatures::from_bits(kernel_features)
                 .ok_or_else(|| "Invalid or unrecognised kernel feature flag".to_string())?,
-            MicroTari::from(kernel.fee),
+            MicroMinotari::from(kernel.fee),
             kernel.lock_height,
             excess,
             excess_sig,
@@ -124,14 +127,24 @@ impl TryFrom<proto::types::TransactionInput> for TransactionInput {
 
         // Check if the received Transaction input is in compact form or not
         if let Some(commitment) = input.commitment {
-            let commitment = Commitment::from_bytes(&commitment.data).map_err(|e| e.to_string())?;
+            let commitment = Commitment::from_canonical_bytes(&commitment.data).map_err(|e| e.to_string())?;
             let features = input
                 .features
                 .map(TryInto::try_into)
                 .ok_or_else(|| "transaction output features not provided".to_string())??;
 
-            let sender_offset_public_key =
-                PublicKey::from_bytes(input.sender_offset_public_key.as_bytes()).map_err(|err| format!("{:?}", err))?;
+            let sender_offset_public_key = PublicKey::from_canonical_bytes(input.sender_offset_public_key.as_bytes())
+                .map_err(|err| format!("{:?}", err))?;
+
+            let metadata_signature = input
+                .metadata_signature
+                .ok_or_else(|| "Metadata signature not provided".to_string())?
+                .try_into()
+                .map_err(|_| "Metadata signature could not be converted".to_string())?;
+            let rangeproof_hash = input
+                .rangeproof_hash
+                .try_into()
+                .map_err(|_| "Invalid rangeproof hash")?;
 
             let mut buffer_input_covenant = input.covenant.as_bytes();
             Ok(TransactionInput::new_with_output_data(
@@ -145,7 +158,9 @@ impl TryFrom<proto::types::TransactionInput> for TransactionInput {
                 script_signature,
                 sender_offset_public_key,
                 BorshDeserialize::deserialize(&mut buffer_input_covenant).map_err(|err| err.to_string())?,
-                EncryptedValue::from_bytes(&input.encrypted_value).map_err(|err| err.to_string())?,
+                EncryptedData::from_bytes(&input.encrypted_data).map_err(|err| err.to_string())?,
+                metadata_signature,
+                rangeproof_hash,
                 input.minimum_value_promise.into(),
             ))
         } else {
@@ -213,9 +228,20 @@ impl TryFrom<TransactionInput> for proto::types::TransactionInput {
                 output_hash: Vec::new(),
                 covenant,
                 version: input.version as u32,
-                encrypted_value: input
-                    .encrypted_value()
+                encrypted_data: input
+                    .encrypted_data()
                     .map_err(|_| "Non-compact Transaction input should contain encrypted value".to_string())?
+                    .to_byte_vec(),
+                metadata_signature: Some(
+                    input
+                        .metadata_signature()
+                        .map_err(|_| "Non-compact Transaction input should contain a metadata_signature".to_string())?
+                        .clone()
+                        .into(),
+                ),
+                rangeproof_hash: input
+                    .rangeproof_hash()
+                    .map_err(|_| "Non-compact Transaction input should contain a rangeproof hash".to_string())?
                     .to_vec(),
                 minimum_value_promise: input
                     .minimum_value_promise()
@@ -239,12 +265,18 @@ impl TryFrom<proto::types::TransactionOutput> for TransactionOutput {
 
         let commitment = output
             .commitment
-            .map(|commit| Commitment::from_bytes(&commit.data))
+            .map(|commit| Commitment::from_canonical_bytes(&commit.data))
             .ok_or_else(|| "Transaction output commitment not provided".to_string())?
             .map_err(|err| err.to_string())?;
 
-        let sender_offset_public_key =
-            PublicKey::from_bytes(output.sender_offset_public_key.as_bytes()).map_err(|err| format!("{:?}", err))?;
+        let sender_offset_public_key = PublicKey::from_canonical_bytes(output.sender_offset_public_key.as_bytes())
+            .map_err(|err| format!("{:?}", err))?;
+
+        let range_proof = if let Some(proof) = output.range_proof {
+            Some(BulletRangeProof::from_canonical_bytes(&proof.proof_bytes).map_err(|err| err.to_string())?)
+        } else {
+            None
+        };
 
         let script = TariScript::from_bytes(&output.script).map_err(|err| err.to_string())?;
 
@@ -257,9 +289,9 @@ impl TryFrom<proto::types::TransactionOutput> for TransactionOutput {
         let mut buffer = output.covenant.as_bytes();
         let covenant = BorshDeserialize::deserialize(&mut buffer).map_err(|e| e.to_string())?;
 
-        let encrypted_value = EncryptedValue::from_bytes(&output.encrypted_value).map_err(|err| err.to_string())?;
+        let encrypted_data = EncryptedData::from_bytes(&output.encrypted_data).map_err(|err| err.to_string())?;
 
-        let minimum_value_promise = MicroTari::zero();
+        let minimum_value_promise = output.minimum_value_promise.into();
 
         Ok(Self::new(
             TransactionOutputVersion::try_from(
@@ -267,12 +299,12 @@ impl TryFrom<proto::types::TransactionOutput> for TransactionOutput {
             )?,
             features,
             commitment,
-            BulletRangeProof(output.range_proof),
+            range_proof,
             script,
             sender_offset_public_key,
             metadata_signature,
             covenant,
-            encrypted_value,
+            encrypted_data,
             minimum_value_promise,
         ))
     }
@@ -284,16 +316,19 @@ impl TryFrom<TransactionOutput> for proto::types::TransactionOutput {
     fn try_from(output: TransactionOutput) -> Result<Self, Self::Error> {
         let mut covenant = Vec::new();
         BorshSerialize::serialize(&output.covenant, &mut covenant).map_err(|err| err.to_string())?;
+        let range_proof = output.proof.map(|proof| proto::types::RangeProof {
+            proof_bytes: proof.to_vec(),
+        });
         Ok(Self {
             features: Some(output.features.into()),
             commitment: Some(output.commitment.into()),
-            range_proof: output.proof.to_vec(),
+            range_proof,
             script: output.script.to_bytes(),
             sender_offset_public_key: output.sender_offset_public_key.as_bytes().to_vec(),
             metadata_signature: Some(output.metadata_signature.into()),
             covenant,
             version: output.version as u32,
-            encrypted_value: output.encrypted_value.to_vec(),
+            encrypted_data: output.encrypted_data.to_byte_vec(),
             minimum_value_promise: output.minimum_value_promise.into(),
         })
     }
@@ -316,14 +351,21 @@ impl TryFrom<proto::types::OutputFeatures> for OutputFeatures {
             .try_into()
             .map_err(|_| "Invalid output type: overflowed")?;
 
+        let range_proof_type = features
+            .range_proof_type
+            .try_into()
+            .map_err(|_| "Invalid range proof type: overflowed")?;
+
         Ok(OutputFeatures::new(
             OutputFeaturesVersion::try_from(
                 u8::try_from(features.version).map_err(|_| "Invalid version: overflowed u8")?,
             )?,
             OutputType::from_byte(output_type).ok_or_else(|| "Invalid or unrecognised output type".to_string())?,
             features.maturity,
-            features.coinbase_extra,
+            CoinBaseExtra::try_from(features.coinbase_extra).map_err(|e| e.to_string())?,
             sidechain_feature,
+            RangeProofType::from_byte(range_proof_type)
+                .ok_or_else(|| "Invalid or unrecognised range proof type".to_string())?,
         ))
     }
 }
@@ -333,9 +375,10 @@ impl From<OutputFeatures> for proto::types::OutputFeatures {
         Self {
             output_type: u32::from(features.output_type.as_byte()),
             maturity: features.maturity,
-            coinbase_extra: features.coinbase_extra,
+            coinbase_extra: features.coinbase_extra.to_vec(),
             version: features.version as u32,
             sidechain_feature: features.sidechain_feature.map(Into::into),
+            range_proof_type: u32::from(features.range_proof_type.as_byte()),
         }
     }
 }
@@ -381,7 +424,7 @@ impl TryFrom<proto::types::Transaction> for Transaction {
     fn try_from(tx: proto::types::Transaction) -> Result<Self, Self::Error> {
         let offset = tx
             .offset
-            .map(|offset| BlindingFactor::from_bytes(&offset.data))
+            .map(|offset| PrivateKey::from_canonical_bytes(&offset.data))
             .ok_or_else(|| "Blinding factor offset not provided".to_string())?
             .map_err(|err| err.to_string())?;
         let body = tx
@@ -390,7 +433,7 @@ impl TryFrom<proto::types::Transaction> for Transaction {
             .ok_or_else(|| "Body not provided".to_string())??;
         let script_offset = tx
             .script_offset
-            .map(|script_offset| BlindingFactor::from_bytes(&script_offset.data))
+            .map(|script_offset| PrivateKey::from_canonical_bytes(&script_offset.data))
             .ok_or_else(|| "Script offset not provided".to_string())?
             .map_err(|err| err.to_string())?;
 

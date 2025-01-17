@@ -1,21 +1,23 @@
 [package]
 name = "tari_libtor"
-version = "0.24.0"
+version = "1.10.0-pre.1"
 edition = "2021"
 license = "BSD-3-Clause"
 
 [dependencies]
 tari_common = { path = "../../common" }
 tari_p2p = { path = "../../base_layer/p2p" }
-tari_shutdown = { version = "^0.43", path = "../shutdown"}
 
 derivative = "2.2.0"
 log = "0.4.8"
-log4rs = { version = "1.2.0", default_features = false, features = ["config_parsing", "threshold_filter", "yaml_format"] }
-multiaddr = { version = "0.14.0" }
-rand = "0.7.3"
+rand = "0.8"
 tempfile = "3.1.0"
 tor-hash-passwd = "1.0.1"
 
 [target.'cfg(unix)'.dependencies]
-libtor = { version="46.9.0"}
+libtor = { version = "47.13.0", features = ["vendored-openssl"] }
+
+[package.metadata.cargo-machete]
+ignored = [
+    "openssl",
+] # this is so we can run cargo machete without getting false positive about macro dependancies

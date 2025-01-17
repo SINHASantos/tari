@@ -20,7 +20,7 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Instant};
 
 use lmdb_zero::{
     del,
@@ -37,6 +37,7 @@ use lmdb_zero::{
 };
 use log::*;
 use serde::{de::DeserializeOwned, Serialize};
+use tari_storage::lmdb_store::BYTES_PER_MB;
 use tari_utilities::hex::to_hex;
 
 use crate::chain_storage::{
@@ -50,6 +51,7 @@ use crate::chain_storage::{
 
 pub const LOG_TARGET: &str = "c::cs::lmdb_db::lmdb";
 
+/// Makes an insertion into the lmdb table, will error if the key already exists
 pub fn lmdb_insert<K, V>(
     txn: &WriteTransaction<'_>,
     db: &Database,
@@ -61,23 +63,36 @@ where
     K: AsLmdbBytes + ?Sized + Debug,
     V: Serialize + Debug,
 {
-    let val_buf = serialize(val)?;
-    trace!(target: LOG_TARGET, "LMDB: {} bytes inserted", val_buf.len());
+    let val_buf = serialize(val, None)?;
     match txn.access().put(db, key, &val_buf, put::NOOVERWRITE) {
-        Ok(_) => Ok(()),
-        Err(lmdb_zero::Error::Code(lmdb_zero::error::KEYEXIST)) => Err(ChainStorageError::KeyExists {
-            table_name,
-            key: to_hex(key.as_lmdb_bytes()),
-        }),
-        Err(lmdb_zero::Error::Code(lmdb_zero::error::MAP_FULL)) => Err(ChainStorageError::DbResizeRequired),
+        Ok(_) => {
+            trace!(
+                target: LOG_TARGET, "Inserted {} bytes with key '{}' into '{}'",
+                val_buf.len(), to_hex(key.as_lmdb_bytes()), table_name
+            );
+            Ok(())
+        },
+        err @ Err(lmdb_zero::Error::Code(lmdb_zero::error::KEYEXIST)) => {
+            error!(
+                target: LOG_TARGET, "Could not insert {} bytes with key '{}' into '{}' ({:?})",
+                val_buf.len(), to_hex(key.as_lmdb_bytes()), table_name, err
+            );
+            Err(ChainStorageError::KeyExists {
+                table_name,
+                key: to_hex(key.as_lmdb_bytes()),
+            })
+        },
+        err @ Err(lmdb_zero::Error::Code(lmdb_zero::error::MAP_FULL)) => {
+            info!(
+                target: LOG_TARGET, "Could not insert {} bytes with key '{}' into '{}' ({:?})",
+                val_buf.len(), to_hex(key.as_lmdb_bytes()), table_name, err
+            );
+            Err(ChainStorageError::DbResizeRequired(Some(val_buf.len())))
+        },
         Err(e) => {
             error!(
-                target: LOG_TARGET,
-                "Could not insert value into lmdb {} ({}/{:?}): {:?}",
-                table_name,
-                to_hex(key.as_lmdb_bytes()),
-                val,
-                e,
+                target: LOG_TARGET, "Could not insert {} bytes with key '{}' into '{}' ({:?})",
+                val_buf.len(), to_hex(key.as_lmdb_bytes()), table_name, e
             );
             Err(ChainStorageError::InsertError {
                 table: table_name,
@@ -98,11 +113,11 @@ where
     K: AsLmdbBytes + ?Sized,
     V: Serialize,
 {
-    let val_buf = serialize(val)?;
+    let val_buf = serialize(val, None)?;
     txn.access().put(db, key, &val_buf, put::Flags::empty()).map_err(|e| {
         if let lmdb_zero::Error::Code(code) = &e {
             if *code == lmdb_zero::error::MAP_FULL {
-                return ChainStorageError::DbResizeRequired;
+                return ChainStorageError::DbResizeRequired(Some(val_buf.len()));
             }
         }
         error!(
@@ -114,16 +129,23 @@ where
 }
 
 /// Inserts or replaces the item at the given key. If the key does not exist, a new entry is created
-pub fn lmdb_replace<K, V>(txn: &WriteTransaction<'_>, db: &Database, key: &K, val: &V) -> Result<(), ChainStorageError>
+pub fn lmdb_replace<K, V>(
+    txn: &WriteTransaction<'_>,
+    db: &Database,
+    key: &K,
+    val: &V,
+    size_hint: Option<usize>,
+) -> Result<(), ChainStorageError>
 where
     K: AsLmdbBytes + ?Sized,
     V: Serialize,
 {
-    let val_buf = serialize(val)?;
-    txn.access().put(db, key, &val_buf, put::Flags::empty()).map_err(|e| {
+    let val_buf = serialize(val, size_hint)?;
+    let start = Instant::now();
+    let res = txn.access().put(db, key, &val_buf, put::Flags::empty()).map_err(|e| {
         if let lmdb_zero::Error::Code(code) = &e {
             if *code == lmdb_zero::error::MAP_FULL {
-                return ChainStorageError::DbResizeRequired;
+                return ChainStorageError::DbResizeRequired(Some(val_buf.len()));
             }
         }
         error!(
@@ -131,7 +153,16 @@ where
             "Could not replace value in lmdb transaction: {:?}", e
         );
         ChainStorageError::AccessError(e.to_string())
-    })
+    });
+    if val_buf.len() >= BYTES_PER_MB {
+        let write_time = start.elapsed();
+        trace!(
+            "lmdb_replace - {} MB, lmdb write in {:.2?}",
+            val_buf.len() / BYTES_PER_MB,
+            write_time
+        );
+    }
+    res
 }
 
 /// Deletes the given key. An error is returned if the key does not exist
@@ -150,6 +181,7 @@ where
     Ok(())
 }
 
+/// Deletes the given key value pair. An error is returned if the key and value does not exist
 pub fn lmdb_delete_key_value<K, V>(
     txn: &WriteTransaction<'_>,
     db: &Database,
@@ -160,10 +192,11 @@ where
     K: AsLmdbBytes + ?Sized,
     V: Serialize,
 {
-    txn.access().del_item(db, key, &serialize(value)?)?;
+    txn.access().del_item(db, key, &serialize(value, None)?)?;
     Ok(())
 }
 
+/// Deletes all keys matching the key
 pub fn lmdb_delete_keys_starting_with<V>(
     txn: &WriteTransaction<'_>,
     db: &Database,
@@ -196,6 +229,7 @@ where
     Ok(result)
 }
 
+/// retrieves the given key value pair
 pub fn lmdb_get<K, V>(txn: &ConstTransaction<'_>, db: &Database, key: &K) -> Result<Option<V>, ChainStorageError>
 where
     K: AsLmdbBytes + ?Sized,
@@ -221,6 +255,7 @@ where
     }
 }
 
+/// retrieves the multiple values matching the key
 pub fn lmdb_get_multiple<K, V>(txn: &ConstTransaction<'_>, db: &Database, key: &K) -> Result<Vec<V>, ChainStorageError>
 where
     K: AsLmdbBytes + FromLmdbBytes + ?Sized,
@@ -250,6 +285,7 @@ where
     Ok(result)
 }
 
+/// Retrieves the last value stored in the database
 pub fn lmdb_last<V>(txn: &ConstTransaction<'_>, db: &Database) -> Result<Option<V>, ChainStorageError>
 where V: DeserializeOwned {
     let mut cursor = txn.cursor(db)?;
@@ -270,6 +306,7 @@ where V: DeserializeOwned {
     }
 }
 
+/// Checks if the key exists in the database
 pub fn lmdb_exists<K>(txn: &ConstTransaction<'_>, db: &Database, key: &K) -> Result<bool, ChainStorageError>
 where K: AsLmdbBytes + ?Sized {
     let access = txn.access();
@@ -283,6 +320,7 @@ where K: AsLmdbBytes + ?Sized {
     }
 }
 
+/// Returns the amount of entries of the database table
 pub fn lmdb_len(txn: &ConstTransaction<'_>, db: &Database) -> Result<usize, ChainStorageError> {
     let stats = txn.db_stat(db).map_err(|e| {
         error!(target: LOG_TARGET, "Could not read length from lmdb: {:?}", e);
@@ -302,7 +340,7 @@ where
 {
     let access = txn.access();
 
-    let cursor = txn.cursor(&*db).map_err(|e| {
+    let cursor = txn.cursor(db).map_err(|e| {
         error!(target: LOG_TARGET, "Could not get read cursor from lmdb: {:?}", e);
         ChainStorageError::AccessError(e.to_string())
     })?;
@@ -310,6 +348,7 @@ where
     Ok(KeyPrefixCursor::new(cursor, access, prefix_key))
 }
 
+/// Fetches values the key prefix
 pub fn lmdb_fetch_matching_after<V>(
     txn: &ConstTransaction<'_>,
     db: &Database,
@@ -326,6 +365,7 @@ where
     Ok(result)
 }
 
+/// Fetches first value the key prefix
 pub fn lmdb_first_after<K, V>(
     txn: &ConstTransaction<'_>,
     db: &Database,
@@ -350,6 +390,7 @@ where
     }
 }
 
+/// Filter the values matching the fn
 pub fn lmdb_filter_map_values<F, V, R>(
     txn: &ConstTransaction<'_>,
     db: &Database,
@@ -398,6 +439,7 @@ pub fn fetch_db_entry_sizes(txn: &ConstTransaction<'_>, db: &Database) -> Result
     Ok((num_entries, total_key_size, total_value_size))
 }
 
+/// deletes entries using the filter Fn
 pub fn lmdb_delete_each_where<K, V, F>(
     txn: &WriteTransaction<'_>,
     db: &Database,
@@ -435,6 +477,7 @@ where
     Ok(num_deleted)
 }
 
+/// Deletes the entire database
 pub fn lmdb_clear(txn: &WriteTransaction<'_>, db: &Database) -> Result<usize, ChainStorageError> {
     let mut cursor = txn.cursor(db)?;
     let mut access = txn.access();

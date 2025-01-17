@@ -23,30 +23,8 @@
 use std::mem::size_of;
 
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305};
-use chrono::{NaiveDateTime, Utc};
-use rand::{rngs::OsRng, RngCore};
-use tari_common::configuration::Network;
-use tari_common_types::{
-    tari_address::TariAddress,
-    transaction::{TransactionDirection, TransactionStatus, TxId},
-    types::{FixedHash, PrivateKey, PublicKey, Signature},
-};
-use tari_core::{
-    covenants::Covenant,
-    transactions::{
-        tari_amount::{uT, MicroTari},
-        test_helpers::{create_unblinded_output, TestParams},
-        transaction_components::{OutputFeatures, Transaction},
-        transaction_protocol::sender::TransactionSenderMessage,
-        CryptoFactories,
-        ReceiverTransactionProtocol,
-        SenderTransactionProtocol,
-    },
-};
-use tari_crypto::keys::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait};
-use tari_script::{script, ExecutionStack, TariScript};
-use tari_test_utils::random;
-use tari_wallet::{
+use chrono::{DateTime, Utc};
+use minotari_wallet::{
     storage::sqlite_utilities::run_migration_and_create_sqlite_connection,
     test_utils::create_consensus_constants,
     transaction_service::storage::{
@@ -61,55 +39,98 @@ use tari_wallet::{
         sqlite_db::TransactionServiceSqliteDatabase,
     },
 };
+use rand::{rngs::OsRng, RngCore};
+use tari_common::configuration::Network;
+use tari_common_types::{
+    key_branches::TransactionKeyManagerBranch,
+    tari_address::TariAddress,
+    transaction::{TransactionDirection, TransactionStatus, TxId},
+    types::{FixedHash, PrivateKey, PublicKey, Signature},
+};
+use tari_core::{
+    covenants::Covenant,
+    transactions::{
+        key_manager::{create_memory_db_key_manager, TransactionKeyManagerInterface},
+        tari_amount::{uT, MicroMinotari},
+        test_helpers::{create_wallet_output_with_data, TestParams},
+        transaction_components::{
+            encrypted_data::{PaymentId, TxType},
+            OutputFeatures,
+            RangeProofType,
+            Transaction,
+            TransactionOutput,
+            TransactionOutputVersion,
+            WalletOutput,
+        },
+        transaction_protocol::sender::TransactionSenderMessage,
+        ReceiverTransactionProtocol,
+        SenderTransactionProtocol,
+    },
+};
+use tari_crypto::keys::{PublicKey as PublicKeyTrait, SecretKey as SecretKeyTrait};
+use tari_key_manager::key_manager_service::{KeyId, KeyManagerInterface};
+use tari_script::{inputs, script};
+use tari_test_utils::random;
 use tempfile::tempdir;
 
-pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
+pub async fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
     let mut db = TransactionDatabase::new(backend);
-    let factories = CryptoFactories::default();
-    let input = create_unblinded_output(
-        TariScript::default(),
+    let key_manager = create_memory_db_key_manager().unwrap();
+    let input = create_wallet_output_with_data(
+        script!(Nop).unwrap(),
         OutputFeatures::default(),
-        &TestParams::new(),
-        MicroTari::from(100_000),
-    );
+        &TestParams::new(&key_manager).await,
+        MicroMinotari::from(100_000),
+        &key_manager,
+    )
+    .await
+    .unwrap();
     let constants = create_consensus_constants(0);
-    let mut builder = SenderTransactionProtocol::builder(1, constants);
-    let amount = MicroTari::from(10_000);
+    let key_manager = create_memory_db_key_manager().unwrap();
+    let mut builder = SenderTransactionProtocol::builder(constants.clone(), key_manager.clone());
+    let amount = MicroMinotari::from(10_000);
     builder
         .with_lock_height(0)
-        .with_fee_per_gram(MicroTari::from(177 / 5))
-        .with_offset(PrivateKey::random(&mut OsRng))
-        .with_private_nonce(PrivateKey::random(&mut OsRng))
-        .with_amount(0, amount)
-        .with_message("Yo!".to_string())
-        .with_input(
-            input
-                .as_transaction_input(&factories.commitment)
-                .expect("Should be able to make transaction input"),
-            input,
-        )
-        .with_change_secret(PrivateKey::random(&mut OsRng))
+        .with_fee_per_gram(MicroMinotari::from(177 / 5))
+        .with_payment_id(PaymentId::open("Yo!", TxType::PaymentToOther))
+        .with_input(input)
+        .await
+        .unwrap()
         .with_recipient_data(
-            0,
-            script!(Nop),
-            PrivateKey::random(&mut OsRng),
+            script!(Nop).unwrap(),
             Default::default(),
-            PrivateKey::random(&mut OsRng),
             Covenant::default(),
-            MicroTari::zero(),
+            MicroMinotari::zero(),
+            amount,
+            TariAddress::default(),
         )
-        .with_change_script(script!(Nop), ExecutionStack::default(), PrivateKey::random(&mut OsRng));
+        .await
+        .unwrap();
+    let change = TestParams::new(&key_manager).await;
+    builder.with_change_data(
+        script!(Nop).unwrap(),
+        inputs!(change.script_key_pk),
+        change.script_key_id.clone(),
+        change.commitment_mask_key_id.clone(),
+        Covenant::default(),
+        TariAddress::default(),
+    );
 
-    let stp = builder.build(&factories, None, u64::MAX).unwrap();
+    let stp = builder.build().await.unwrap();
 
-    let messages = vec!["Hey!".to_string(), "Yo!".to_string(), "Sup!".to_string()];
-    let amounts = vec![MicroTari::from(10_000), MicroTari::from(23_000), MicroTari::from(5_000)];
+    let messages = ["Hey!", "Yo!", "Sup!"];
+    let amounts = [
+        MicroMinotari::from(10_000),
+        MicroMinotari::from(23_000),
+        MicroMinotari::from(5_000),
+    ];
 
     let mut outbound_txs = Vec::new();
 
     for i in 0..messages.len() {
         let tx_id = TxId::from(i + 10);
-        let address = TariAddress::new(
+        let address = TariAddress::new_dual_address_with_default_features(
+            PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             Network::LocalNet,
         );
@@ -120,8 +141,8 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             fee: stp.clone().get_fee_amount().unwrap(),
             sender_protocol: stp.clone(),
             status: TransactionStatus::Pending,
-            message: messages[i].clone(),
-            timestamp: Utc::now().naive_utc(),
+            payment_id: PaymentId::open(messages[i], TxType::PaymentToOther),
+            timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
             send_count: 0,
@@ -142,8 +163,7 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
         assert_eq!(&retrieved_outbound_tx, i);
         assert_eq!(retrieved_outbound_tx.send_count, 0);
         assert!(retrieved_outbound_tx.last_send_timestamp.is_none());
-
-        assert_eq!(&retrieved_outbound_txs.get(&i.tx_id).unwrap(), &i);
+        assert!(retrieved_outbound_txs.iter().any(|tx| tx == i));
     }
 
     db.increment_send_count(outbound_txs[0].tx_id).unwrap();
@@ -157,18 +177,72 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
     } else {
         panic!("Should have found outbound tx");
     }
+    let sender = stp.clone().build_single_round_message(&key_manager).await.unwrap();
+    let commitment_mask_key = key_manager
+        .get_next_key(TransactionKeyManagerBranch::CommitmentMask.get_branch_key())
+        .await
+        .unwrap();
+    let script_key_id = KeyId::Derived {
+        key: (&commitment_mask_key.key_id).into(),
+    };
+
+    let public_script_key = key_manager.get_public_key_at_key_id(&script_key_id).await.unwrap();
+
+    let encrypted_data = key_manager
+        .encrypt_data_for_recovery(
+            &commitment_mask_key.key_id,
+            None,
+            sender.amount.as_u64(),
+            PaymentId::Empty,
+        )
+        .await
+        .unwrap();
+    let mut output = WalletOutput::new(
+        TransactionOutputVersion::get_current_version(),
+        sender.amount,
+        commitment_mask_key.key_id.clone(),
+        sender.features.clone(),
+        sender.script.clone(),
+        inputs!(public_script_key),
+        script_key_id,
+        sender.sender_offset_public_key.clone(),
+        Default::default(),
+        0,
+        Covenant::default(),
+        encrypted_data,
+        MicroMinotari::zero(),
+        PaymentId::Empty,
+        &key_manager,
+    )
+    .await
+    .unwrap();
+    let output_message = TransactionOutput::metadata_signature_message(&output);
+    output.metadata_signature = key_manager
+        .get_receiver_partial_metadata_signature(
+            &commitment_mask_key.key_id,
+            &sender.amount.into(),
+            &sender.sender_offset_public_key,
+            &sender.ephemeral_public_nonce,
+            &TransactionOutputVersion::get_current_version(),
+            &output_message,
+            RangeProofType::BulletProofPlus,
+        )
+        .await
+        .unwrap();
 
     let rtp = ReceiverTransactionProtocol::new(
-        TransactionSenderMessage::Single(Box::new(stp.clone().build_single_round_message().unwrap())),
-        PrivateKey::random(&mut OsRng),
-        PrivateKey::random(&mut OsRng),
-        &factories,
-    );
+        TransactionSenderMessage::Single(Box::new(sender)),
+        output,
+        &key_manager,
+        &constants,
+    )
+    .await;
 
     let mut inbound_txs = Vec::new();
 
     for i in 0..messages.len() {
-        let address = TariAddress::new(
+        let address = TariAddress::new_dual_address_with_default_features(
+            PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             Network::LocalNet,
         );
@@ -179,8 +253,8 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             amount: amounts[i],
             receiver_protocol: rtp.clone(),
             status: TransactionStatus::Pending,
-            message: messages[i].clone(),
-            timestamp: Utc::now().naive_utc(),
+            payment_id: PaymentId::open(messages[i], TxType::PaymentToOther),
+            timestamp: Utc::now(),
             cancelled: false,
             direct_send_success: false,
             send_count: 0,
@@ -195,7 +269,7 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
     let retrieved_inbound_txs = db.get_pending_inbound_transactions().unwrap();
     assert_eq!(inbound_txs.len(), messages.len());
     for i in inbound_txs.iter().take(messages.len()) {
-        let retrieved_tx = retrieved_inbound_txs.get(&i.tx_id).unwrap();
+        let retrieved_tx = retrieved_inbound_txs.iter().find(|tx| tx.tx_id == i.tx_id).unwrap();
         assert_eq!(&retrieved_tx, &i);
         assert_eq!(retrieved_tx.send_count, 0);
         assert!(retrieved_tx.last_send_timestamp.is_none());
@@ -237,11 +311,13 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
     );
 
     for i in 0..messages.len() {
-        let source_address = TariAddress::new(
+        let source_address = TariAddress::new_dual_address_with_default_features(
+            PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             Network::LocalNet,
         );
-        let dest_address = TariAddress::new(
+        let dest_address = TariAddress::new_dual_address_with_default_features(
+            PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
             Network::LocalNet,
         );
@@ -250,18 +326,16 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             source_address,
             destination_address: dest_address,
             amount: outbound_txs[i].amount,
-            fee: MicroTari::from(200),
+            fee: MicroMinotari::from(200),
             transaction: tx.clone(),
             status: match i {
                 0 => TransactionStatus::Completed,
                 1 => TransactionStatus::Broadcast,
                 _ => TransactionStatus::MinedUnconfirmed,
             },
-            message: messages[i].clone(),
-            timestamp: Utc::now().naive_utc(),
+            timestamp: Utc::now(),
             cancelled: None,
             direction: TransactionDirection::Outbound,
-            coinbase_block_height: None,
             send_count: 0,
             last_send_timestamp: None,
 
@@ -270,6 +344,7 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             mined_height: None,
             mined_in_block: None,
             mined_timestamp: None,
+            payment_id: PaymentId::open(messages[i], TxType::PaymentToOther),
         });
         db.complete_outbound_transaction(outbound_txs[i].tx_id, completed_txs[i].clone())
             .unwrap();
@@ -285,14 +360,20 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
 
     for i in 0..messages.len() {
         assert_eq!(
-            retrieved_completed_txs.get(&inbound_txs[i].tx_id).unwrap(),
+            retrieved_completed_txs
+                .iter()
+                .find(|tx| tx.tx_id == inbound_txs[i].tx_id)
+                .unwrap(),
             &CompletedTransaction {
                 tx_id: inbound_txs[i].tx_id,
                 ..completed_txs[i].clone()
             }
         );
         assert_eq!(
-            retrieved_completed_txs.get(&outbound_txs[i].tx_id).unwrap(),
+            retrieved_completed_txs
+                .iter()
+                .find(|tx| tx.tx_id == outbound_txs[i].tx_id)
+                .unwrap(),
             &completed_txs[i]
         );
     }
@@ -306,8 +387,16 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
 
     assert!(db.fetch_last_mined_transaction().unwrap().is_none());
 
-    db.set_transaction_mined_height(completed_txs[0].tx_id, 10, FixedHash::zero(), 0, 5, true, false)
-        .unwrap();
+    db.set_transaction_mined_height(
+        completed_txs[0].tx_id,
+        10,
+        FixedHash::zero(),
+        0,
+        5,
+        true,
+        &completed_txs[0].status,
+    )
+    .unwrap();
 
     assert_eq!(
         db.fetch_last_mined_transaction().unwrap().unwrap().tx_id,
@@ -324,23 +413,23 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
         panic!("Should have found completed tx");
     }
 
-    let completed_txs_map = db.get_completed_transactions().unwrap();
-    let num_completed_txs = completed_txs_map.len();
+    let completed_txs = db.get_completed_transactions().unwrap();
+    let num_completed_txs = completed_txs.len();
     assert_eq!(db.get_cancelled_completed_transactions().unwrap().len(), 0);
 
-    let cancelled_tx_id = completed_txs_map[&1u64.into()].tx_id;
+    let cancelled_tx_id = completed_txs[1].tx_id;
     assert!(db.get_cancelled_completed_transaction(cancelled_tx_id).is_err());
     db.reject_completed_transaction(cancelled_tx_id, TxCancellationReason::Unknown)
         .unwrap();
-    let completed_txs_map = db.get_completed_transactions().unwrap();
-    assert_eq!(completed_txs_map.len(), num_completed_txs - 1);
+    let completed_txs = db.get_completed_transactions().unwrap();
+    assert_eq!(completed_txs.len(), num_completed_txs - 1);
 
     db.get_cancelled_completed_transaction(cancelled_tx_id)
         .expect("Should find cancelled transaction");
 
-    let mut cancelled_txs = db.get_cancelled_completed_transactions().unwrap();
+    let cancelled_txs = db.get_cancelled_completed_transactions().unwrap();
     assert_eq!(cancelled_txs.len(), 1);
-    assert!(cancelled_txs.remove(&cancelled_tx_id).is_some());
+    assert!(cancelled_txs.iter().any(|c_tx| c_tx.tx_id == cancelled_tx_id));
 
     let any_cancelled_completed_tx = db.get_any_transaction(cancelled_tx_id).unwrap().unwrap();
     if let WalletTransaction::Completed(tx) = any_cancelled_completed_tx {
@@ -348,7 +437,8 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
     } else {
         panic!("Should have found cancelled completed tx");
     }
-    let address = TariAddress::new(
+    let address = TariAddress::new_dual_address_with_default_features(
+        PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
         PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
         Network::LocalNet,
     );
@@ -360,8 +450,8 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             22 * uT,
             rtp,
             TransactionStatus::Pending,
-            "To be cancelled".to_string(),
-            Utc::now().naive_utc(),
+            PaymentId::open("To be cancelled", TxType::PaymentToOther),
+            Utc::now(),
         ),
     )
     .unwrap();
@@ -396,10 +486,11 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
         panic!("Should have found cancelled inbound tx");
     }
 
-    let mut cancelled_txs = db.get_cancelled_pending_inbound_transactions().unwrap();
+    let cancelled_txs = db.get_cancelled_pending_inbound_transactions().unwrap();
     assert_eq!(cancelled_txs.len(), 1);
-    assert!(cancelled_txs.remove(&999u64.into()).is_some());
-    let address = TariAddress::new(
+    assert!(cancelled_txs.iter().any(|c_tx| c_tx.tx_id == TxId::from(999u64)));
+    let address = TariAddress::new_dual_address_with_default_features(
+        PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
         PublicKey::from_secret_key(&PrivateKey::random(&mut OsRng)),
         Network::LocalNet,
     );
@@ -412,8 +503,8 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
             stp.get_fee_amount().unwrap(),
             stp,
             TransactionStatus::Pending,
-            "To be cancelled".to_string(),
-            Utc::now().naive_utc(),
+            PaymentId::open("To be cancelled", TxType::PaymentToOther),
+            Utc::now(),
             false,
         ),
     )
@@ -444,9 +535,9 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
 
     assert_eq!(db.get_pending_outbound_transactions().unwrap().len(), 0);
 
-    let mut cancelled_txs = db.get_cancelled_pending_outbound_transactions().unwrap();
+    let cancelled_txs = db.get_cancelled_pending_outbound_transactions().unwrap();
     assert_eq!(cancelled_txs.len(), 1);
-    assert!(cancelled_txs.remove(&998u64.into()).is_some());
+    assert!(cancelled_txs.iter().any(|c_tx| c_tx.tx_id == TxId::from(998u64)));
 
     let any_cancelled_outbound_tx = db.get_any_transaction(998u64.into()).unwrap().unwrap();
     if let WalletTransaction::PendingOutbound(tx) = any_cancelled_outbound_tx {
@@ -455,30 +546,26 @@ pub fn test_db_backend<T: TransactionBackend + 'static>(backend: T) {
         panic!("Should have found cancelled outbound tx");
     }
 
+    // Transactions with empty kernel signatures should not be returned with this method, as those will be considered
+    // as faux transactions (imported or one-sided)
     let unmined_txs = db.fetch_unconfirmed_transactions_info().unwrap();
-
-    assert_eq!(unmined_txs.len(), 4);
-
-    db.set_transaction_as_unmined(completed_txs[0].tx_id).unwrap();
-
-    let unmined_txs = db.fetch_unconfirmed_transactions_info().unwrap();
-    assert_eq!(unmined_txs.len(), 5);
+    assert_eq!(unmined_txs.len(), 0);
 }
 
-#[test]
-pub fn test_transaction_service_sqlite_db() {
+#[tokio::test]
+pub async fn test_transaction_service_sqlite_db() {
     let db_name = format!("{}.sqlite3", random::string(8));
     let db_tempdir = tempdir().unwrap();
     let db_folder = db_tempdir.path().to_str().unwrap().to_string();
     let db_path = format!("{}/{}", db_folder, db_name);
-    let connection = run_migration_and_create_sqlite_connection(&db_path, 16).unwrap();
+    let connection = run_migration_and_create_sqlite_connection(db_path, 16).unwrap();
 
     let mut key = [0u8; size_of::<Key>()];
     OsRng.fill_bytes(&mut key);
     let key_ga = Key::from_slice(&key);
     let cipher = XChaCha20Poly1305::new(key_ga);
 
-    test_db_backend(TransactionServiceSqliteDatabase::new(connection, cipher));
+    test_db_backend(TransactionServiceSqliteDatabase::new(connection, cipher)).await;
 }
 
 #[tokio::test]
@@ -487,7 +574,7 @@ async fn import_tx_and_read_it_from_db() {
     let db_tempdir = tempdir().unwrap();
     let db_folder = db_tempdir.path().to_str().unwrap().to_string();
     let db_path = format!("{}/{}", db_folder, db_name);
-    let connection = run_migration_and_create_sqlite_connection(&db_path, 16).unwrap();
+    let connection = run_migration_and_create_sqlite_connection(db_path, 16).unwrap();
 
     let mut key = [0u8; size_of::<Key>()];
     OsRng.fill_bytes(&mut key);
@@ -499,8 +586,8 @@ async fn import_tx_and_read_it_from_db() {
         TxId::from(1u64),
         TariAddress::default(),
         TariAddress::default(),
-        MicroTari::from(100000),
-        MicroTari::from(0),
+        MicroMinotari::from(100000),
+        MicroMinotari::from(0),
         Transaction::new(
             Vec::new(),
             Vec::new(),
@@ -509,13 +596,13 @@ async fn import_tx_and_read_it_from_db() {
             PrivateKey::random(&mut OsRng),
         ),
         TransactionStatus::Imported,
-        "message".to_string(),
-        Utc::now().naive_utc(),
+        Utc::now(),
         TransactionDirection::Inbound,
-        Some(0),
         Some(5),
-        Some(NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-    );
+        Some(DateTime::from_timestamp(0, 0).unwrap()),
+        PaymentId::open("message", TxType::PaymentToOther),
+    )
+    .unwrap();
 
     sqlite_db
         .write(WriteOperation::Insert(DbKeyValuePair::CompletedTransaction(
@@ -528,8 +615,8 @@ async fn import_tx_and_read_it_from_db() {
         TxId::from(2u64),
         TariAddress::default(),
         TariAddress::default(),
-        MicroTari::from(100000),
-        MicroTari::from(0),
+        MicroMinotari::from(100000),
+        MicroMinotari::from(0),
         Transaction::new(
             Vec::new(),
             Vec::new(),
@@ -537,14 +624,14 @@ async fn import_tx_and_read_it_from_db() {
             PrivateKey::random(&mut OsRng),
             PrivateKey::random(&mut OsRng),
         ),
-        TransactionStatus::FauxUnconfirmed,
-        "message".to_string(),
-        Utc::now().naive_utc(),
+        TransactionStatus::OneSidedUnconfirmed,
+        Utc::now(),
         TransactionDirection::Inbound,
-        Some(0),
         Some(6),
-        Some(NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-    );
+        Some(DateTime::from_timestamp(0, 0).unwrap()),
+        PaymentId::open("message", TxType::PaymentToOther),
+    )
+    .unwrap();
 
     sqlite_db
         .write(WriteOperation::Insert(DbKeyValuePair::CompletedTransaction(
@@ -557,8 +644,8 @@ async fn import_tx_and_read_it_from_db() {
         TxId::from(3u64),
         TariAddress::default(),
         TariAddress::default(),
-        MicroTari::from(100000),
-        MicroTari::from(0),
+        MicroMinotari::from(100000),
+        MicroMinotari::from(0),
         Transaction::new(
             Vec::new(),
             Vec::new(),
@@ -566,14 +653,14 @@ async fn import_tx_and_read_it_from_db() {
             PrivateKey::random(&mut OsRng),
             PrivateKey::random(&mut OsRng),
         ),
-        TransactionStatus::FauxConfirmed,
-        "message".to_string(),
-        Utc::now().naive_utc(),
+        TransactionStatus::OneSidedConfirmed,
+        Utc::now(),
         TransactionDirection::Inbound,
-        Some(0),
         Some(7),
-        Some(NaiveDateTime::from_timestamp_opt(0, 0).unwrap()),
-    );
+        Some(DateTime::from_timestamp(0, 0).unwrap()),
+        PaymentId::open("message", TxType::PaymentToOther),
+    )
+    .unwrap();
 
     sqlite_db
         .write(WriteOperation::Insert(DbKeyValuePair::CompletedTransaction(
@@ -587,14 +674,14 @@ async fn import_tx_and_read_it_from_db() {
     assert_eq!(db_tx.first().unwrap().tx_id, TxId::from(1u64));
     assert_eq!(db_tx.first().unwrap().mined_height, Some(5));
 
-    let db_tx = sqlite_db.fetch_unconfirmed_faux_transactions().unwrap();
+    let db_tx = sqlite_db.fetch_unconfirmed_detected_transactions().unwrap();
     assert_eq!(db_tx.len(), 1);
     assert_eq!(db_tx.first().unwrap().tx_id, TxId::from(2u64));
     assert_eq!(db_tx.first().unwrap().mined_height, Some(6));
 
-    let db_tx = sqlite_db.fetch_confirmed_faux_transactions_from_height(10).unwrap();
+    let db_tx = sqlite_db.fetch_confirmed_detected_transactions_from_height(10).unwrap();
     assert_eq!(db_tx.len(), 0);
-    let db_tx = sqlite_db.fetch_confirmed_faux_transactions_from_height(4).unwrap();
+    let db_tx = sqlite_db.fetch_confirmed_detected_transactions_from_height(4).unwrap();
     assert_eq!(db_tx.len(), 1);
     assert_eq!(db_tx.first().unwrap().tx_id, TxId::from(3u64));
     assert_eq!(db_tx.first().unwrap().mined_height, Some(7));

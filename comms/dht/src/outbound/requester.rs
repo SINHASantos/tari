@@ -51,7 +51,34 @@ impl OutboundMessageRequester {
     }
 
     /// Send directly to a peer. If the peer does not exist in the peer list, a discovery will be initiated.
-    pub async fn send_direct<T>(
+    pub async fn send_direct_encrypted<T>(
+        &mut self,
+        dest_public_key: CommsPublicKey,
+        message: OutboundDomainMessage<T>,
+        encryption: OutboundEncryption,
+        source_info: String,
+    ) -> Result<MessageSendStates, DhtOutboundError>
+    where
+        T: prost::Message,
+    {
+        self.send_message(
+            SendMessageParams::new()
+                .with_debug_info(format!("Send direct to {} from {}", &dest_public_key, source_info))
+                .direct_public_key(dest_public_key.clone())
+                .with_discovery(true)
+                .with_encryption(encryption)
+                .with_destination(dest_public_key.into())
+                .finish(),
+            message,
+        )
+        .await?
+        .resolve()
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Send directly to a peer unencrypted. If the peer does not exist in the peer list, a discovery will be initiated.
+    pub async fn send_direct_unencrypted<T>(
         &mut self,
         dest_public_key: CommsPublicKey,
         message: OutboundDomainMessage<T>,
@@ -109,12 +136,14 @@ impl OutboundMessageRequester {
         encryption: OutboundEncryption,
         exclude_peers: Vec<NodeId>,
         message: OutboundDomainMessage<T>,
+        source_info: String,
     ) -> Result<MessageSendStates, DhtOutboundError>
     where
         T: prost::Message,
     {
         self.send_message(
             SendMessageParams::new()
+                .with_debug_info(source_info)
                 .propagate(destination.clone(), exclude_peers)
                 .with_encryption(encryption)
                 .with_destination(destination)
@@ -261,7 +290,7 @@ impl OutboundMessageRequester {
             message.to_propagation_header()
         };
         let msg = wrap_in_envelope_body!(header, message.into_inner());
-        let body = prepare_message(params.encryption.is_encrypt(), &msg);
+        let body = prepare_message(params.encryption.is_encrypt(), &msg)?;
         self.send_raw(params, body).await
     }
 
@@ -278,7 +307,7 @@ impl OutboundMessageRequester {
             trace!(target: LOG_TARGET, "Send Message: {} {:?}", params, message);
         }
         let msg = wrap_in_envelope_body!(message);
-        let body = prepare_message(params.encryption.is_encrypt(), &msg);
+        let body = prepare_message(params.encryption.is_encrypt(), &msg)?;
         self.send_raw(params, body).await
     }
 
@@ -295,7 +324,7 @@ impl OutboundMessageRequester {
             trace!(target: LOG_TARGET, "Send Message: {} {:?}", params, message);
         }
         let msg = wrap_in_envelope_body!(message);
-        let body = prepare_message(params.encryption.is_encrypt(), &msg);
+        let body = prepare_message(params.encryption.is_encrypt(), &msg)?;
         self.send_raw_no_wait(params, body).await
     }
 

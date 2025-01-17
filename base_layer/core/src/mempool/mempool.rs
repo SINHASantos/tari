@@ -22,7 +22,8 @@
 
 use std::sync::{Arc, RwLock};
 
-use tari_common_types::types::{PrivateKey, Signature};
+use log::debug;
+use tari_common_types::types::{FixedHash, PrivateKey, Signature};
 use tokio::task;
 
 use crate::{
@@ -38,8 +39,10 @@ use crate::{
         TxStorageResponse,
     },
     transactions::transaction_components::Transaction,
-    validation::MempoolTransactionValidation,
+    validation::TransactionValidator,
 };
+
+pub const LOG_TARGET: &str = "c::mp::mempool";
 
 /// The Mempool consists of an Unconfirmed Transaction Pool, Pending Pool, Orphan Pool and Reorg Pool and is responsible
 /// for managing and maintaining all unconfirmed transactions that have not yet been included in a block, and
@@ -51,11 +54,7 @@ pub struct Mempool {
 
 impl Mempool {
     /// Create a new Mempool with an UnconfirmedPool and ReOrgPool.
-    pub fn new(
-        config: MempoolConfig,
-        rules: ConsensusManager,
-        validator: Box<dyn MempoolTransactionValidation>,
-    ) -> Self {
+    pub fn new(config: MempoolConfig, rules: ConsensusManager, validator: Box<dyn TransactionValidator>) -> Self {
         Self {
             pool_storage: Arc::new(RwLock::new(MempoolStorage::new(config, rules, validator))),
         }
@@ -63,14 +62,21 @@ impl Mempool {
 
     /// Insert an unconfirmed transaction into the Mempool.
     pub async fn insert(&self, tx: Arc<Transaction>) -> Result<TxStorageResponse, MempoolError> {
-        self.with_write_access(|storage| Ok(storage.insert(tx))).await
+        self.with_write_access(|storage| {
+            storage
+                .insert(tx)
+                .map_err(|e| MempoolError::InternalError(e.to_string()))
+        })
+        .await
     }
 
     /// Inserts all transactions into the mempool.
     pub async fn insert_all(&self, transactions: Vec<Arc<Transaction>>) -> Result<(), MempoolError> {
         self.with_write_access(|storage| {
             for tx in transactions {
-                storage.insert(tx);
+                storage
+                    .insert(tx)
+                    .map_err(|e| MempoolError::InternalError(e.to_string()))?;
             }
 
             Ok(())
@@ -114,15 +120,40 @@ impl Mempool {
     /// Returns a list of transaction ranked by transaction priority up to a given weight.
     /// Only transactions that fit into a block will be returned
     pub async fn retrieve(&self, total_weight: u64) -> Result<Vec<Arc<Transaction>>, MempoolError> {
-        self.with_write_access(move |storage| storage.retrieve_and_revalidate(total_weight))
-            .await
+        let start = std::time::Instant::now();
+        let retrieved = self
+            .with_read_access(move |storage| storage.retrieve(total_weight))
+            .await?;
+        debug!(
+            target: LOG_TARGET,
+            "Retrieved {} highest priority transaction(s) from the mempool in {:.0?} ms",
+            retrieved.retrieved_transactions.len(),
+            start.elapsed()
+        );
+
+        if !retrieved.transactions_to_remove_and_insert.is_empty() {
+            // we need to remove all transactions that need to be rechecked.
+            debug!(
+                target: LOG_TARGET,
+                "Removing {} transaction(s) from unconfirmed pool because they need re-evaluation",
+                retrieved.transactions_to_remove_and_insert.len()
+            );
+
+            let transactions_to_remove_and_insert = retrieved.transactions_to_remove_and_insert.clone();
+            self.with_write_access(move |storage| {
+                storage.remove_and_reinsert_transactions(transactions_to_remove_and_insert)
+            })
+            .await?;
+        }
+
+        Ok(retrieved.retrieved_transactions)
     }
 
     pub async fn retrieve_by_excess_sigs(
         &self,
         excess_sigs: Vec<PrivateKey>,
     ) -> Result<(Vec<Arc<Transaction>>, Vec<PrivateKey>), MempoolError> {
-        self.with_read_access(move |storage| Ok(storage.retrieve_by_excess_sigs(&excess_sigs)))
+        self.with_read_access(move |storage| storage.retrieve_by_excess_sigs(&excess_sigs))
             .await
     }
 
@@ -139,7 +170,8 @@ impl Mempool {
 
     /// Gathers and returns the stats of the Mempool.
     pub async fn stats(&self) -> Result<StatsResponse, MempoolError> {
-        self.with_read_access(|storage| Ok(storage.stats())).await
+        self.with_read_access(|storage| storage.stats().map_err(|e| MempoolError::InternalError(e.to_string())))
+            .await
     }
 
     /// Gathers and returns a breakdown of all the transaction in the Mempool.
@@ -164,7 +196,7 @@ impl Mempool {
         let storage = self.pool_storage.clone();
         task::spawn_blocking(move || {
             let lock = storage.read().map_err(|_| MempoolError::RwLockPoisonError)?;
-            callback(&*lock)
+            callback(&lock)
         })
         .await?
     }
@@ -177,8 +209,12 @@ impl Mempool {
         let storage = self.pool_storage.clone();
         task::spawn_blocking(move || {
             let mut lock = storage.write().map_err(|_| MempoolError::RwLockPoisonError)?;
-            callback(&mut *lock)
+            callback(&mut lock)
         })
         .await?
+    }
+
+    pub async fn get_last_seen_hash(&self) -> Result<FixedHash, MempoolError> {
+        self.with_read_access(|storage| Ok(storage.last_seen_hash)).await
     }
 }

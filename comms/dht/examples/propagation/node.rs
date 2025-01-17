@@ -25,11 +25,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 use rand::rngs::OsRng;
 use tari_comms::{
     backoff::ConstantBackoff,
-    multiaddr::Multiaddr,
     peer_manager::PeerFeatures,
     pipeline,
     pipeline::SinkService,
-    protocol::{messaging::MessagingProtocolExtension, NodeNetworkInfo},
+    protocol::{messaging::MessagingProtocolExtension, NodeNetworkInfo, ProtocolId},
     tor,
     tor::TorIdentity,
     CommsBuilder,
@@ -46,6 +45,8 @@ use tokio::sync::{broadcast, mpsc};
 use tower::ServiceBuilder;
 
 use crate::parse_from_short_str;
+
+pub static MEMORYNET_MSG_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"t/msg/1.0");
 
 pub const TOR_CONTROL_PORT_ADDR: &str = "/ip4/127.0.0.1/tcp/9051";
 
@@ -67,8 +68,13 @@ pub async fn create<P: AsRef<Path>>(
     let peer_database = datastore.get_handle("peerdb").unwrap();
     let peer_database = LMDBWrapper::new(Arc::new(peer_database));
 
-    let node_identity = node_identity
-        .unwrap_or_else(|| Arc::new(NodeIdentity::random(&mut OsRng, Multiaddr::empty(), Default::default())));
+    let node_identity = node_identity.unwrap_or_else(|| {
+        Arc::new(NodeIdentity::random_multiple_addresses(
+            &mut OsRng,
+            vec![],
+            Default::default(),
+        ))
+    });
 
     let builder = CommsBuilder::new()
         .allow_test_addresses()
@@ -77,7 +83,7 @@ pub async fn create<P: AsRef<Path>>(
         .with_node_info(NodeNetworkInfo {
             major_version: 0,
             minor_version: 0,
-            network_byte: 0x25,
+            network_wire_byte: 0x25,
             user_agent: "/tari/propagator/0.0.1".to_string(),
         })
         .with_node_identity(node_identity.clone())
@@ -99,7 +105,7 @@ pub async fn create<P: AsRef<Path>>(
         hs_builder = hs_builder.with_tor_identity(tor_identity);
     }
 
-    let mut hs_ctl = hs_builder.build().await?;
+    let mut hs_ctl = hs_builder.build()?;
     let transport = hs_ctl.initialize_transport().await?;
 
     let comms_node = builder.with_listener_address(hs_ctl.proxied_address()).build()?;
@@ -128,6 +134,7 @@ pub async fn create<P: AsRef<Path>>(
     let comms_node = comms_node
         .with_hidden_service_controller(hs_ctl)
         .add_protocol_extension(MessagingProtocolExtension::new(
+            MEMORYNET_MSG_PROTOCOL_ID.clone(),
             event_tx,
             pipeline::Builder::new()
                 .with_inbound_pipeline(

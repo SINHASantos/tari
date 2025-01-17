@@ -20,8 +20,6 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::cmp;
-
 use log::*;
 use tari_comms::peer_manager::PeerFeatures;
 
@@ -56,7 +54,6 @@ impl DiscoveryReady {
         }
     }
 
-    // TODO: Reduce LOC for this function
     #[allow(clippy::too_many_lines)]
     async fn process(&mut self) -> Result<StateEvent, NetworkDiscoveryError> {
         let num_peers = self.context.peer_manager.count().await;
@@ -74,6 +71,11 @@ impl DiscoveryReady {
                 self.context.reset_num_rounds();
                 return Ok(StateEvent::Idle);
             }
+
+            warn!(
+                target: LOG_TARGET,
+                "DHT - Not enough current peers, choosing random peers to sync with"
+            );
 
             let peers = self
                 .context
@@ -95,8 +97,7 @@ impl DiscoveryReady {
             }
 
             return Ok(StateEvent::BeginDiscovery(DiscoveryParams {
-                // All peers
-                num_peers_to_request: None,
+                num_peers_to_request: self.config().network_discovery.max_peers_to_sync_per_round,
                 peers,
             }));
         }
@@ -108,18 +109,16 @@ impl DiscoveryReady {
             let round_num = self.context.increment_num_rounds();
             debug!(target: LOG_TARGET, "Completed peer round #{} ({})", round_num + 1, info);
 
-            if !info.has_new_neighbours() {
-                debug!(
-                    target: LOG_TARGET,
-                    "No new neighbours found this round {}. Going to on connect mode", info,
-                );
-                return Ok(StateEvent::OnConnectMode);
-            }
-
-            // If the last round was a success, but we didnt get any new peers, let's IDLE
-            if info.is_success() && !info.has_new_peers() && self.context.num_rounds() > 0 {
+            // If the last round was a success, but we didnt get any new peers, let's go to on connect or idle
+            // depending on the number of peers we have
+            if info.is_success() && !info.has_new_peers() {
                 self.context.reset_num_rounds();
-                return Ok(StateEvent::Idle);
+                if num_peers < self.context.config.network_discovery.min_desired_peers {
+                    return Ok(StateEvent::Idle);
+                } else {
+                    // We have enough peers, so we can go to on connect mode
+                    return Ok(StateEvent::OnConnectMode);
+                }
             }
 
             if self.context.num_rounds() >= self.config().network_discovery.idle_after_num_rounds {
@@ -130,14 +129,14 @@ impl DiscoveryReady {
 
         let peers = match last_round {
             Some(ref stats) => {
-                let num_peers_to_select =
-                    cmp::min(stats.num_new_neighbours, self.config().network_discovery.max_sync_peers);
+                let num_peers_to_select = self.config().network_discovery.max_sync_peers;
 
-                if stats.has_new_neighbours() {
+                if stats.has_new_peers() {
                     debug!(
                         target: LOG_TARGET,
-                        "Last peer sync round found {} new neighbour(s). Attempting to sync from those neighbours",
-                        stats.num_new_neighbours
+                        "Last peer sync round found {} new peer(s). Attempting to sync from those peers if they are \
+                         closer than existing peers",
+                        stats.num_new_peers,
                     );
                     self.context
                         .peer_manager
@@ -154,7 +153,7 @@ impl DiscoveryReady {
                 } else {
                     debug!(
                         target: LOG_TARGET,
-                        "Last peer sync round found no new neighbours. Transitioning to OnConnectMode",
+                        "Last peer sync round found no new peers. Transitioning to OnConnectMode",
                     );
                     return Ok(StateEvent::OnConnectMode);
                 }
@@ -188,8 +187,7 @@ impl DiscoveryReady {
         }
 
         Ok(StateEvent::BeginDiscovery(DiscoveryParams {
-            // Request all peers
-            num_peers_to_request: None,
+            num_peers_to_request: self.config().network_discovery.max_peers_to_sync_per_round,
             peers,
         }))
     }

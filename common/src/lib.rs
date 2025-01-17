@@ -53,6 +53,7 @@
 #[cfg(any(feature = "build", feature = "static-application-info"))]
 pub mod build;
 pub mod exit_codes;
+pub mod network_check;
 #[macro_use]
 mod logging;
 pub mod configuration;
@@ -64,10 +65,8 @@ pub use configuration::{
     utils::load_configuration,
 };
 pub mod dir_utils;
-pub use logging::initialize_logging;
 
-mod hashing;
-pub use hashing::{mac_domain_hasher, DomainDigest};
+pub use logging::initialize_logging;
 
 pub const DEFAULT_CONFIG: &str = "config/config.toml";
 pub const DEFAULT_BASE_NODE_LOG_CONFIG: &str = "config/log4rs_base_node.yml";

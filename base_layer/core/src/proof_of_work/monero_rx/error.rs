@@ -20,23 +20,67 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use randomx_rs::RandomXError;
 use tari_utilities::hex::HexError;
 
+use crate::{
+    common::{BanPeriod, BanReason},
+    proof_of_work::{
+        monero_rx::merkle_tree_parameters::MerkleTreeParametersError,
+        randomx_factory::RandomXVMFactoryError,
+        DifficultyError,
+    },
+};
+
+/// Errors that can occur when merging Monero PoW data with Tari PoW data
 #[derive(Debug, thiserror::Error)]
 pub enum MergeMineError {
+    #[error("Serialized POWData does not match provided data: {0}")]
+    SerializedPowDataDoesNotMatch(String),
     #[error("Serialization error: {0}")]
     SerializeError(String),
     #[error("Error deserializing Monero data: {0}")]
     DeserializeError(String),
     #[error("Hashing of Monero data failed: {0}")]
     HashingError(String),
-    #[error("RandomX error: {0}")]
-    RandomXError(#[from] RandomXError),
+    #[error("RandomX VM factory error: {0}")]
+    RandomXVMFactoryError(#[from] RandomXVMFactoryError),
     #[error("Validation error: {0}")]
     ValidationError(String),
     #[error("Hex conversion error: {0}")]
-    HexError(#[from] HexError),
+    HexError(String),
     #[error("Monero PoW data did not contain a valid merkle root")]
     InvalidMerkleRoot,
+    #[error("Invalid difficulty: {0}")]
+    DifficultyError(#[from] DifficultyError),
+    #[error("Cannot mine with 0 aux chains")]
+    ZeroAuxChains,
+    #[error("Merkle Tree Parameters error: {0}")]
+    MerkleTreeParamsError(#[from] MerkleTreeParametersError),
+}
+
+impl MergeMineError {
+    pub fn get_ban_reason(&self) -> Option<BanReason> {
+        match self {
+            err @ MergeMineError::SerializedPowDataDoesNotMatch(_) |
+            err @ MergeMineError::SerializeError(_) |
+            err @ MergeMineError::DeserializeError(_) |
+            err @ MergeMineError::HashingError(_) |
+            err @ MergeMineError::ValidationError(_) |
+            err @ MergeMineError::InvalidMerkleRoot |
+            err @ MergeMineError::DifficultyError(_) |
+            err @ MergeMineError::HexError(_) => Some(BanReason {
+                reason: err.to_string(),
+                ban_duration: BanPeriod::Long,
+            }),
+            MergeMineError::RandomXVMFactoryError(_) |
+            MergeMineError::ZeroAuxChains |
+            MergeMineError::MerkleTreeParamsError(_) => None,
+        }
+    }
+}
+
+impl From<HexError> for MergeMineError {
+    fn from(err: HexError) -> Self {
+        MergeMineError::HexError(err.to_string())
+    }
 }

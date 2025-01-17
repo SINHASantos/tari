@@ -30,6 +30,7 @@ use tempfile::{tempdir, TempDir};
 
 use crate::storage::sqlite_utilities::{
     run_migration_and_create_sqlite_connection,
+    run_migration_and_create_sqlite_memory_connection,
     wallet_db_connection::WalletDbConnection,
 };
 
@@ -54,13 +55,17 @@ pub fn make_wallet_database_connection(path: Option<String>) -> (WalletDbConnect
     let db_path = Path::new(&path_string).join(db_name);
 
     let connection =
-        run_migration_and_create_sqlite_connection(&db_path.to_str().expect("Should be able to make path"), 16)
-            .unwrap();
+        run_migration_and_create_sqlite_connection(db_path.to_str().expect("Should be able to make path"), 16).unwrap();
     (connection, temp_dir)
 }
 
+/// A test helper to create a temporary wallet service memory databases
+pub fn make_wallet_database_memory_connection() -> WalletDbConnection {
+    run_migration_and_create_sqlite_memory_connection(16).unwrap()
+}
+
 pub fn create_consensus_rules() -> ConsensusManager {
-    ConsensusManager::builder(Network::LocalNet).build()
+    ConsensusManager::builder(Network::LocalNet).build().unwrap()
 }
 
 pub fn create_consensus_constants(height: u64) -> ConsensusConstants {

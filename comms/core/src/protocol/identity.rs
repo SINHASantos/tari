@@ -31,10 +31,11 @@ use tokio::{
 };
 
 use crate::{
+    bans::{BAN_DURATION_LONG, BAN_DURATION_SHORT},
     message::MessageExt,
     peer_manager::NodeIdentity,
     proto::identity::PeerIdentityMsg,
-    protocol::{NodeNetworkInfo, ProtocolError, ProtocolId},
+    protocol::{NodeNetworkInfo, ProtocolId},
 };
 
 const LOG_TARGET: &str = "comms::protocol::identity";
@@ -65,7 +66,7 @@ where
 
     // Send this node's identity
     let msg_bytes = PeerIdentityMsg {
-        addresses: vec![node_identity.public_address().to_vec()],
+        addresses: node_identity.public_addresses().iter().map(|a| a.to_vec()).collect(),
         features: node_identity.features().bits(),
         supported_protocols,
         user_agent: network_info.user_agent,
@@ -73,30 +74,39 @@ where
     }
     .to_encoded_bytes();
 
-    write_protocol_frame(socket, network_info.major_version as u8, &msg_bytes).await?;
+    write_protocol_frame(socket, network_info.major_version, &msg_bytes).await?;
     socket.flush().await?;
 
     // Receive the connecting node's identity
-    let (version, msg_bytes) = time::timeout(Duration::from_secs(10), read_protocol_frame(socket)).await??;
+    let (_, msg_bytes) = time::timeout(
+        Duration::from_secs(10),
+        read_protocol_frame(socket, network_info.major_version),
+    )
+    .await??;
+
+    debug!(
+        target: LOG_TARGET,
+        "Identity message received {} bytes",
+        msg_bytes.len()
+    );
     let identity_msg = PeerIdentityMsg::decode(Bytes::from(msg_bytes))?;
-
-    if version > network_info.major_version {
-        warn!(
-            target: LOG_TARGET,
-            "Peer sent mismatching major protocol version '{}'. This node has version '{}'",
-            version,
-            network_info.major_version
-        );
-        return Err(IdentityProtocolError::ProtocolVersionMismatch);
-    }
-
     Ok(identity_msg)
 }
 
-async fn read_protocol_frame<S: AsyncRead + Unpin>(socket: &mut S) -> Result<(u8, Vec<u8>), IdentityProtocolError> {
+async fn read_protocol_frame<S: AsyncRead + Unpin>(
+    socket: &mut S,
+    max_supported_version: u8,
+) -> Result<(u8, Vec<u8>), IdentityProtocolError> {
     let mut buf = [0u8; 3];
     socket.read_exact(&mut buf).await?;
     let version = buf[0];
+    if version > max_supported_version {
+        return Err(IdentityProtocolError::UnsupportedProtocolVersion {
+            max_supported_version,
+            provided_version: version,
+        });
+    }
+
     let buf = [buf[1], buf[2]];
     let len = u16::from_le_bytes(buf);
     if len > MAX_IDENTITY_PROTOCOL_MSG_SIZE {
@@ -105,6 +115,7 @@ async fn read_protocol_frame<S: AsyncRead + Unpin>(socket: &mut S) -> Result<(u8
             got: len,
         });
     }
+
     let len = len as usize;
     let mut msg = vec![0u8; len];
     socket.read_exact(&mut msg).await?;
@@ -116,18 +127,18 @@ async fn write_protocol_frame<S: AsyncWrite + Unpin>(
     version: u8,
     msg_bytes: &[u8],
 ) -> Result<(), IdentityProtocolError> {
-    debug_assert!(
-        msg_bytes.len() <= MAX_IDENTITY_PROTOCOL_MSG_SIZE as usize,
-        "Sending identity protocol message of size {}, greater than {} bytes. This is a protocol violation",
-        msg_bytes.len(),
-        MAX_IDENTITY_PROTOCOL_MSG_SIZE
-    );
+    if msg_bytes.len() > MAX_IDENTITY_PROTOCOL_MSG_SIZE as usize {
+        return Err(IdentityProtocolError::InvariantError(format!(
+            "Sending identity protocol message of size {}, greater than {} bytes. This is a protocol violation",
+            msg_bytes.len(),
+            MAX_IDENTITY_PROTOCOL_MSG_SIZE
+        )));
+    }
 
     let len = u16::try_from(msg_bytes.len()).map_err(|_| {
-        IdentityProtocolError::ProtocolError(format!(
-            "Identity protocol attempted to send a message larger than u16::MAX bytes. len = {}",
-            msg_bytes.len()
-        ))
+        IdentityProtocolError::InvariantError(
+            "This node attempted to send a message of size greater than u16::MAX".to_string(),
+        )
     })?;
     let version_bytes = [version];
     let len_bytes = len.to_le_bytes();
@@ -148,31 +159,46 @@ async fn write_protocol_frame<S: AsyncWrite + Unpin>(
 pub enum IdentityProtocolError {
     #[error("IoError: {0}")]
     IoError(String),
-    #[error("ProtocolError: {0}")]
-    ProtocolError(String),
+    #[error("Possible bug: InvariantError {0}")]
+    InvariantError(String),
     #[error("ProtobufDecodeError: {0}")]
     ProtobufDecodeError(String),
-    #[error("Failed to encode protobuf message")]
-    ProtobufEncodingError,
     #[error("Peer unexpectedly closed the connection")]
     PeerUnexpectedCloseConnection,
     #[error("Timeout waiting for peer to send identity information")]
     Timeout,
-    #[error("Protocol version mismatch")]
-    ProtocolVersionMismatch,
+    #[error(
+        "Unsupported protocol version. Max supported version: {max_supported_version}, provided version: \
+         {provided_version}"
+    )]
+    UnsupportedProtocolVersion {
+        max_supported_version: u8,
+        provided_version: u8,
+    },
     #[error("Max identity protocol message size exceeded. Expected <= {expected} got {got}")]
     MaxMsgSizeExceeded { expected: u16, got: u16 },
+}
+
+impl IdentityProtocolError {
+    pub fn as_ban_duration(&self) -> Option<Duration> {
+        match self {
+            // Don't ban
+            IdentityProtocolError::InvariantError(_) | IdentityProtocolError::IoError(_) => None,
+            // Long bans
+            IdentityProtocolError::ProtobufDecodeError(_) | IdentityProtocolError::MaxMsgSizeExceeded { .. } => {
+                Some(BAN_DURATION_LONG)
+            },
+            // Short bans
+            IdentityProtocolError::PeerUnexpectedCloseConnection |
+            IdentityProtocolError::UnsupportedProtocolVersion { .. } |
+            IdentityProtocolError::Timeout => Some(BAN_DURATION_SHORT),
+        }
+    }
 }
 
 impl From<time::error::Elapsed> for IdentityProtocolError {
     fn from(_: time::error::Elapsed) -> Self {
         IdentityProtocolError::Timeout
-    }
-}
-
-impl From<ProtocolError> for IdentityProtocolError {
-    fn from(err: ProtocolError) -> Self {
-        IdentityProtocolError::ProtocolError(err.to_string())
     }
 }
 
@@ -195,12 +221,11 @@ mod test {
     use crate::{
         peer_manager::PeerFeatures,
         protocol::{IdentityProtocolError, NodeNetworkInfo},
-        runtime,
         test_utils::node_identity::build_node_identity,
         transports::{MemoryTransport, Transport},
     };
 
-    #[runtime::test]
+    #[tokio::test]
     async fn identity_exchange() {
         let transport = MemoryTransport;
         let addr = "/memory/0".parse().unwrap();
@@ -241,13 +266,27 @@ mod test {
         let identity1 = result2.unwrap();
 
         assert_eq!(identity1.features, node_identity1.features().bits());
-        assert_eq!(identity1.addresses, vec![node_identity1.public_address().to_vec()]);
+        assert_eq!(
+            identity1.addresses,
+            node_identity1
+                .public_addresses()
+                .iter()
+                .map(|a| a.to_vec())
+                .collect::<Vec<_>>()
+        );
 
         assert_eq!(identity2.features, node_identity2.features().bits());
-        assert_eq!(identity2.addresses, vec![node_identity2.public_address().to_vec()]);
+        assert_eq!(
+            identity2.addresses,
+            node_identity2
+                .public_addresses()
+                .iter()
+                .map(|a| a.to_vec())
+                .collect::<Vec<_>>()
+        );
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn fail_cases() {
         let transport = MemoryTransport;
         let addr = "/memory/0".parse().unwrap();
@@ -284,7 +323,7 @@ mod test {
         .await;
 
         let err = result1.unwrap_err();
-        assert!(matches!(err, IdentityProtocolError::ProtocolVersionMismatch));
+        assert!(matches!(err, IdentityProtocolError::UnsupportedProtocolVersion { .. }));
 
         // Passes because older versions are supported
         result2.unwrap();

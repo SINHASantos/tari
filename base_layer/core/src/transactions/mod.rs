@@ -6,10 +6,14 @@ pub mod aggregated_body;
 mod crypto_factories;
 
 pub use crypto_factories::CryptoFactories;
-use tari_crypto::hash_domain;
 
 mod coinbase_builder;
-pub use coinbase_builder::{CoinbaseBuildError, CoinbaseBuilder};
+pub use coinbase_builder::{
+    generate_coinbase,
+    generate_coinbase_with_wallet_output,
+    CoinbaseBuildError,
+    CoinbaseBuilder,
+};
 
 pub mod fee;
 pub mod tari_amount;
@@ -21,11 +25,10 @@ pub use format_currency::format_currency;
 pub mod transaction_protocol;
 pub use transaction_protocol::{recipient::ReceiverTransactionProtocol, sender::SenderTransactionProtocol};
 
-pub mod types;
 pub mod weight;
 
-#[macro_use]
-pub mod test_helpers;
+pub mod key_manager;
 
-hash_domain!(TransactionHashDomain, "com.tari.base_layer.core.transactions", 0);
-hash_domain!(TransactionKdfDomain, "com.tari.base_layer.core.transactions.kdf", 0);
+#[macro_use]
+#[cfg(feature = "base_node")]
+pub mod test_helpers;

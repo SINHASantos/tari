@@ -23,9 +23,9 @@
 use chrono::NaiveDateTime;
 use futures::FutureExt;
 use log::*;
-use tari_common_types::types::HashOutput;
-use tari_comms::{connectivity::ConnectivityRequester, peer_manager::Peer, types::CommsPublicKey};
-use tari_core::transactions::{tari_amount::MicroTari, CryptoFactories};
+use tari_common_types::{tari_address::TariAddress, types::HashOutput};
+use tari_comms::{connectivity::ConnectivityRequester, types::CommsPublicKey};
+use tari_core::transactions::{tari_amount::MicroMinotari, CryptoFactories};
 use tari_shutdown::{Shutdown, ShutdownSignal};
 use tokio::{
     sync::{broadcast, watch},
@@ -34,12 +34,11 @@ use tokio::{
 
 use crate::{
     base_node_service::handle::{BaseNodeEvent, BaseNodeServiceHandle},
-    connectivity_service::WalletConnectivityInterface,
+    connectivity_service::{BaseNodePeerManager, WalletConnectivityInterface},
     error::WalletError,
     output_manager_service::handle::OutputManagerHandle,
     storage::database::{WalletBackend, WalletDatabase},
     transaction_service::handle::TransactionServiceHandle,
-    util::wallet_identity::WalletIdentity,
     utxo_scanner_service::{
         handle::UtxoScannerEvent,
         utxo_scanner_task::UtxoScannerTask,
@@ -50,9 +49,6 @@ use crate::{
 pub const LOG_TARGET: &str = "wallet::utxo_scanning";
 
 // Cache 1 days worth of headers.
-// TODO Determine a better strategy for maintaining a cache. Logarithmic sampling has been suggested but the problem
-// with it is that as you move on to the next block you need to resample say a 100 headers where a simple window like
-// this only samples 1 header per new block. A ticket has been added to the backlog to think about this #LOGGED
 pub const SCANNED_BLOCK_CACHE_SIZE: u64 = 720;
 
 pub struct UtxoScannerService<TBackend, TWalletConnectivity> {
@@ -148,7 +144,7 @@ where
                     event = base_node_service_event_stream.recv() => {
                         match event {
                             Ok(e) => {
-                                if let BaseNodeEvent::NewBlockDetected(h) = (*e).clone() {
+                                if let BaseNodeEvent::NewBlockDetected(_hash, h) = (*e).clone() {
                                         debug!(target: LOG_TARGET, "New block event received: {}", h);
                                         if local_shutdown.is_triggered() {
                                             debug!(target: LOG_TARGET, "Starting new round of UTXO scanning");
@@ -165,9 +161,9 @@ where
                     }
                     _ = self.resources.current_base_node_watcher.changed() => {
                         debug!(target: LOG_TARGET, "Base node change detected.");
-                        let peer =  self.resources.current_base_node_watcher.borrow().as_ref().cloned();
-                        if let Some(peer) = peer {
-                            self.peer_seeds = vec![peer.public_key];
+                        let selected_peer =  self.resources.current_base_node_watcher.borrow().as_ref().cloned();
+                        if let Some(peer) = selected_peer {
+                            self.peer_seeds = vec![peer.get_current_peer().public_key];
                         }
                         local_shutdown.trigger();
                     },
@@ -194,10 +190,10 @@ pub struct UtxoScannerResources<TBackend, TWalletConnectivity> {
     pub db: WalletDatabase<TBackend>,
     pub comms_connectivity: ConnectivityRequester,
     pub wallet_connectivity: TWalletConnectivity,
-    pub current_base_node_watcher: watch::Receiver<Option<Peer>>,
+    pub current_base_node_watcher: watch::Receiver<Option<BaseNodePeerManager>>,
     pub output_manager_service: OutputManagerHandle,
     pub transaction_service: TransactionServiceHandle,
-    pub wallet_identity: WalletIdentity,
+    pub one_sided_tari_address: TariAddress,
     pub factories: CryptoFactories,
     pub recovery_message: String,
     pub one_sided_payment_message: String,
@@ -208,6 +204,6 @@ pub struct ScannedBlock {
     pub header_hash: HashOutput,
     pub height: u64,
     pub num_outputs: Option<u64>,
-    pub amount: Option<MicroTari>,
+    pub amount: Option<MicroMinotari>,
     pub timestamp: NaiveDateTime,
 }

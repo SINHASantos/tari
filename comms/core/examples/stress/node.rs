@@ -29,7 +29,7 @@ use tari_comms::{
     multiaddr::Multiaddr,
     pipeline,
     pipeline::SinkService,
-    protocol::{messaging::MessagingProtocolExtension, ProtocolNotification, Protocols},
+    protocol::{messaging::MessagingProtocolExtension, ProtocolId, ProtocolNotification, Protocols},
     tor,
     tor::TorIdentity,
     transports::{predicate::FalsePredicate, SocksConfig, TcpWithTorTransport},
@@ -46,6 +46,8 @@ use tari_storage::{
 use tokio::sync::{broadcast, mpsc};
 
 use super::{error::Error, STRESS_PROTOCOL_NAME, TOR_CONTROL_PORT_ADDR, TOR_SOCKS_ADDR};
+
+static MSG_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"example/msg/1.0");
 
 pub async fn create(
     node_identity: Option<Arc<NodeIdentity>>,
@@ -88,9 +90,8 @@ pub async fn create(
     .parse::<Multiaddr>()
     .unwrap();
     let node_identity = node_identity
-        .map(|ni| {
-            ni.set_public_address(public_addr.clone());
-            ni
+        .inspect(|ni| {
+            ni.add_public_address(public_addr.clone());
         })
         .unwrap_or_else(|| Arc::new(NodeIdentity::random(&mut OsRng, public_addr, Default::default())));
 
@@ -115,6 +116,7 @@ pub async fn create(
             .build()?
             .add_protocol_extensions(protocols.into())
             .add_protocol_extension(MessagingProtocolExtension::new(
+                MSG_PROTOCOL_ID.clone(),
                 event_tx,
                 pipeline::Builder::new()
                     .with_inbound_pipeline(SinkService::new(inbound_tx))
@@ -139,7 +141,7 @@ pub async fn create(
             hs_builder = hs_builder.with_tor_identity(tor_identity);
         }
 
-        let mut hs_ctl = hs_builder.build().await?;
+        let mut hs_ctl = hs_builder.build()?;
         let transport = hs_ctl.initialize_transport().await?;
 
         builder
@@ -148,6 +150,7 @@ pub async fn create(
             .with_hidden_service_controller(hs_ctl)
             .add_protocol_extensions(protocols.into())
             .add_protocol_extension(MessagingProtocolExtension::new(
+                MSG_PROTOCOL_ID.clone(),
                 event_tx,
                 pipeline::Builder::new()
                     .with_inbound_pipeline(SinkService::new(inbound_tx))

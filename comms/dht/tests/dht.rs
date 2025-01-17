@@ -20,219 +20,27 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{sync::Arc, time::Duration};
+mod harness;
+use std::time::Duration;
 
-use rand::rngs::OsRng;
+use harness::*;
 use tari_comms::{
-    backoff::ConstantBackoff,
     connectivity::ConnectivityEvent,
     message::MessageExt,
-    peer_manager::{NodeId, NodeIdentity, Peer, PeerFeatures},
-    pipeline,
-    pipeline::SinkService,
-    protocol::messaging::{MessagingEvent, MessagingEventSender, MessagingProtocolExtension},
-    transports::MemoryTransport,
-    types::CommsDatabase,
-    CommsBuilder,
-    CommsNode,
+    peer_manager::{NodeId, PeerFeatures},
+    protocol::messaging::MessagingEvent,
 };
 use tari_comms_dht::{
     domain_message::OutboundDomainMessage,
     envelope::{DhtMessageType, NodeDestination},
     event::DhtEvent,
-    inbound::DecryptedDhtMessage,
     outbound::{OutboundEncryption, SendMessageParams},
-    DbConnectionUrl,
-    Dht,
-    DhtConfig,
 };
-use tari_shutdown::{Shutdown, ShutdownSignal};
-use tari_storage::{
-    lmdb_store::{LMDBBuilder, LMDBConfig},
-    LMDBWrapper,
-};
-use tari_test_utils::{
-    async_assert_eventually,
-    collect_try_recv,
-    paths::create_temporary_data_path,
-    random,
-    streams,
-    unpack_enum,
-};
-use tokio::{
-    sync::{broadcast, mpsc},
-    time,
-};
-use tower::ServiceBuilder;
+use tari_test_utils::{async_assert_eventually, collect_try_recv, streams, unpack_enum};
 
-struct TestNode {
-    name: String,
-    comms: CommsNode,
-    dht: Dht,
-    inbound_messages: mpsc::Receiver<DecryptedDhtMessage>,
-    messaging_events: broadcast::Sender<Arc<MessagingEvent>>,
-    shutdown: Shutdown,
-}
-
-impl TestNode {
-    pub fn node_identity(&self) -> Arc<NodeIdentity> {
-        self.comms.node_identity()
-    }
-
-    pub fn to_peer(&self) -> Peer {
-        self.comms.node_identity().to_peer()
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub async fn next_inbound_message(&mut self, timeout: Duration) -> Option<DecryptedDhtMessage> {
-        time::timeout(timeout, self.inbound_messages.recv()).await.ok()?
-    }
-
-    pub async fn shutdown(mut self) {
-        self.shutdown.trigger();
-        self.comms.wait_until_shutdown().await;
-    }
-}
-
-fn make_node_identity(features: PeerFeatures) -> Arc<NodeIdentity> {
-    let port = MemoryTransport::acquire_next_memsocket_port();
-    Arc::new(NodeIdentity::random(
-        &mut OsRng,
-        format!("/memory/{}", port).parse().unwrap(),
-        features,
-    ))
-}
-
-fn create_peer_storage() -> CommsDatabase {
-    let database_name = random::string(8);
-    let datastore = LMDBBuilder::new()
-        .set_path(create_temporary_data_path())
-        .set_env_config(LMDBConfig::default())
-        .set_max_number_of_databases(1)
-        .add_database(&database_name, lmdb_zero::db::CREATE)
-        .build()
-        .unwrap();
-
-    let peer_database = datastore.get_handle(&database_name).unwrap();
-    LMDBWrapper::new(Arc::new(peer_database))
-}
-
-async fn make_node<I: IntoIterator<Item = Peer>>(
-    name: &str,
-    features: PeerFeatures,
-    dht_config: DhtConfig,
-    known_peers: I,
-) -> TestNode {
-    let node_identity = make_node_identity(features);
-    make_node_with_node_identity(name, node_identity, dht_config, known_peers).await
-}
-
-async fn make_node_with_node_identity<I: IntoIterator<Item = Peer>>(
-    name: &str,
-    node_identity: Arc<NodeIdentity>,
-    dht_config: DhtConfig,
-    known_peers: I,
-) -> TestNode {
-    let (tx, inbound_messages) = mpsc::channel(10);
-    let shutdown = Shutdown::new();
-    let (comms, dht, messaging_events) = setup_comms_dht(
-        node_identity,
-        create_peer_storage(),
-        tx,
-        known_peers.into_iter().collect(),
-        dht_config,
-        shutdown.to_signal(),
-    )
-    .await;
-
-    TestNode {
-        name: name.to_string(),
-        comms,
-        dht,
-        inbound_messages,
-        messaging_events,
-        shutdown,
-    }
-}
-
-async fn setup_comms_dht(
-    node_identity: Arc<NodeIdentity>,
-    storage: CommsDatabase,
-    inbound_tx: mpsc::Sender<DecryptedDhtMessage>,
-    peers: Vec<Peer>,
-    dht_config: DhtConfig,
-    shutdown_signal: ShutdownSignal,
-) -> (CommsNode, Dht, MessagingEventSender) {
-    // Create inbound and outbound channels
-    let (outbound_tx, outbound_rx) = mpsc::channel(10);
-
-    let comms = CommsBuilder::new()
-        .allow_test_addresses()
-        // In this case the listener address and the public address are the same (/memory/...)
-        .with_listener_address(node_identity.public_address())
-        .with_shutdown_signal(shutdown_signal)
-        .with_node_identity(node_identity)
-        .with_peer_storage(storage,None)
-        .with_min_connectivity(1)
-        .with_dial_backoff(ConstantBackoff::new(Duration::from_millis(100)))
-        .build()
-        .unwrap();
-
-    let dht = Dht::builder()
-        .with_config(dht_config)
-        .with_database_url(DbConnectionUrl::MemoryShared(random::string(8)))
-        .with_outbound_sender(outbound_tx)
-        .build(
-            comms.node_identity(),
-            comms.peer_manager(),
-            comms.connectivity(),
-            comms.shutdown_signal(),
-        )
-        .await
-        .unwrap();
-
-    for peer in peers {
-        comms.peer_manager().add_peer(peer).await.unwrap();
-    }
-
-    let dht_outbound_layer = dht.outbound_middleware_layer();
-    let pipeline = pipeline::Builder::new()
-        .with_outbound_pipeline(outbound_rx, |sink| {
-            ServiceBuilder::new().layer(dht_outbound_layer).service(sink)
-        })
-        .max_concurrent_inbound_tasks(10)
-        .with_inbound_pipeline(
-            ServiceBuilder::new()
-                .layer(dht.inbound_middleware_layer())
-                .service(SinkService::new(inbound_tx)),
-        )
-        .build();
-
-    let (event_tx, _) = broadcast::channel(100);
-    let comms = comms
-        .add_protocol_extension(MessagingProtocolExtension::new(event_tx.clone(), pipeline))
-        .spawn_with_transport(MemoryTransport)
-        .await
-        .unwrap();
-
-    (comms, dht, event_tx)
-}
-
-fn dht_config() -> DhtConfig {
-    let mut config = DhtConfig::default_local_test();
-    config.allow_test_addresses = true;
-    config.saf.auto_request = false;
-    config.discovery_request_timeout = Duration::from_secs(60);
-    config.num_neighbouring_nodes = 8;
-    config
-}
-
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(non_snake_case)]
-async fn dht_join_propagation() {
+async fn test_dht_join_propagation() {
     // Create 3 nodes where only Node B knows A and C, but A and C want to talk to each other
 
     // Node C knows no one
@@ -254,18 +62,7 @@ async fn dht_join_propagation() {
     )
     .await;
 
-    node_A
-        .comms
-        .connectivity()
-        .wait_for_connectivity(Duration::from_secs(10))
-        .await
-        .unwrap();
-    node_B
-        .comms
-        .connectivity()
-        .wait_for_connectivity(Duration::from_secs(10))
-        .await
-        .unwrap();
+    wait_for_connectivity(&[&node_A, &node_B, &node_C]).await;
     // Send a join request from Node A, through B to C. As all Nodes are in the same network region, once
     // Node C receives the join request from Node A, it will send a direct join request back
     // to A.
@@ -300,9 +97,9 @@ async fn dht_join_propagation() {
     node_C.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(non_snake_case)]
-async fn dht_discover_propagation() {
+async fn test_dht_discover_propagation() {
     // Create 4 nodes where A knows B, B knows A and C, C knows B and D, and D knows C
 
     // Node D knows no one
@@ -348,6 +145,8 @@ async fn dht_discover_propagation() {
         .await
         .unwrap();
 
+    wait_for_connectivity(&[&node_A, &node_B, &node_C, &node_D]).await;
+
     // Send a discover request from Node A, through B and C, to D. Once Node D
     // receives the discover request from Node A, it should send a  discovery response
     // request back to A at which time this call will resolve (or timeout).
@@ -374,9 +173,9 @@ async fn dht_discover_propagation() {
     assert!(node_D_peer_manager.exists(node_A.node_identity().public_key()).await);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(non_snake_case)]
-async fn dht_store_forward() {
+async fn test_dht_store_forward() {
     let node_C_node_identity = make_node_identity(PeerFeatures::COMMUNICATION_NODE);
     // Node B knows about Node C
     let node_B = make_node("node_B", PeerFeatures::COMMUNICATION_NODE, dht_config(), None).await;
@@ -395,12 +194,7 @@ async fn dht_store_forward() {
         node_C_node_identity.node_id().short_str(),
     );
 
-    node_A
-        .comms
-        .connectivity()
-        .wait_for_connectivity(Duration::from_secs(10))
-        .await
-        .unwrap();
+    wait_for_connectivity(&[&node_A, &node_B]).await;
 
     let params = SendMessageParams::new()
         .broadcast(vec![])
@@ -450,7 +244,7 @@ async fn dht_store_forward() {
         .unwrap();
     // Wait for node C to and receive a response from the SAF request
     let event = collect_try_recv!(node_C_msg_events, take = 1, timeout = Duration::from_secs(20));
-    unpack_enum!(MessagingEvent::MessageReceived(_node_id, _msg) = &*event.get(0).unwrap().as_ref());
+    unpack_enum!(MessagingEvent::MessageReceived(_node_id, _msg) = event.first().unwrap());
 
     let msg = node_C.next_inbound_message(Duration::from_secs(5)).await.unwrap();
     assert_eq!(
@@ -479,7 +273,7 @@ async fn dht_store_forward() {
 
     // Check that Node C emitted the StoreAndForwardMessagesReceived event when it went Online
     let event = collect_try_recv!(node_C_dht_events, take = 1, timeout = Duration::from_secs(20));
-    unpack_enum!(DhtEvent::StoreAndForwardMessagesReceived = &*event.get(0).unwrap().as_ref());
+    unpack_enum!(DhtEvent::StoreAndForwardMessagesReceived = event.first().unwrap().as_ref());
 
     node_A.shutdown().await;
     node_B.shutdown().await;
@@ -489,7 +283,7 @@ async fn dht_store_forward() {
 #[tokio::test]
 #[allow(non_snake_case)]
 #[allow(clippy::too_many_lines)]
-async fn dht_propagate_dedup() {
+async fn test_dht_propagate_dedup() {
     let mut config = dht_config();
     // For this test we want to exactly measure the path of a message, so we disable repropagation of messages (i.e
     // allow 1 occurrence)
@@ -572,6 +366,7 @@ async fn dht_propagate_dedup() {
             OutboundEncryption::encrypt_for(node_D.node_identity().public_key().clone()),
             vec![],
             out_msg,
+            String::new(),
         )
         .await
         .unwrap();
@@ -634,7 +429,7 @@ async fn dht_propagate_dedup() {
 #[tokio::test]
 #[allow(non_snake_case)]
 #[allow(clippy::too_many_lines)]
-async fn dht_do_not_store_invalid_message_in_dedup() {
+async fn test_dht_do_not_store_invalid_message_in_dedup() {
     let mut config = dht_config();
     config.dedup_allowed_message_occurrences = 1;
 
@@ -724,7 +519,7 @@ async fn dht_do_not_store_invalid_message_in_dedup() {
     let header_unmodified = msg.dht_header.clone();
 
     // Modify the header
-    msg.dht_header.message_type = DhtMessageType::from_i32(3i32).unwrap();
+    msg.dht_header.message_type = DhtMessageType::try_from(3i32).unwrap();
 
     // Forward modified message to Node C - Should get us banned
     node_B
@@ -803,7 +598,7 @@ async fn dht_do_not_store_invalid_message_in_dedup() {
 
 #[tokio::test]
 #[allow(non_snake_case)]
-async fn dht_repropagate() {
+async fn test_dht_repropagate() {
     let mut config = dht_config();
     config.dedup_allowed_message_occurrences = 3;
     let mut node_C = make_node("node_C", PeerFeatures::COMMUNICATION_NODE, config.clone(), []).await;
@@ -861,6 +656,7 @@ async fn dht_repropagate() {
             OutboundEncryption::ClearText,
             vec![],
             out_msg.clone(),
+            String::new(),
         )
         .await
         .unwrap();
@@ -904,9 +700,9 @@ async fn dht_repropagate() {
     node_C.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(non_snake_case)]
-async fn dht_propagate_message_contents_not_malleable_ban() {
+async fn test_dht_propagate_message_contents_not_malleable_ban() {
     let node_C = make_node("node_C", PeerFeatures::COMMUNICATION_NODE, dht_config(), None).await;
     // Node B knows about Node C
     let mut node_B = make_node(
@@ -1009,9 +805,9 @@ async fn dht_propagate_message_contents_not_malleable_ban() {
     node_C.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[allow(non_snake_case)]
-async fn dht_header_not_malleable() {
+async fn test_dht_header_not_malleable() {
     let node_C = make_node("node_C", PeerFeatures::COMMUNICATION_NODE, dht_config(), None).await;
     // Node B knows about Node C
     let mut node_B = make_node(
@@ -1074,7 +870,7 @@ async fn dht_header_not_malleable() {
     let mut msg = node_B.next_inbound_message(Duration::from_secs(10)).await.unwrap();
 
     // Modify the header
-    msg.dht_header.message_type = DhtMessageType::from_i32(21i32).unwrap();
+    msg.dht_header.message_type = DhtMessageType::try_from(21i32).unwrap();
 
     let envelope = msg.decryption_result.unwrap();
     let mut connectivity_events = node_C.comms.connectivity().get_event_subscription();
@@ -1114,22 +910,29 @@ async fn dht_header_not_malleable() {
     node_C.shutdown().await;
 }
 
-fn filter_received(events: Vec<Arc<MessagingEvent>>) -> Vec<Arc<MessagingEvent>> {
+fn filter_received(events: Vec<MessagingEvent>) -> Vec<MessagingEvent> {
     events
         .into_iter()
-        .filter(|e| match &**e {
-            MessagingEvent::MessageReceived(_, _) => true,
-            _ => unreachable!(),
-        })
+        .filter(|e| matches!(e, MessagingEvent::MessageReceived(_, _)))
         .collect()
 }
 
-fn count_messages_received(events: &[Arc<MessagingEvent>], node_ids: &[&NodeId]) -> usize {
+fn count_messages_received(events: &[MessagingEvent], node_ids: &[&NodeId]) -> usize {
     events
         .iter()
         .filter(|event| {
-            unpack_enum!(MessagingEvent::MessageReceived(recv_node_id, _tag) = &***event);
-            node_ids.iter().any(|n| &*recv_node_id == *n)
+            unpack_enum!(MessagingEvent::MessageReceived(recv_node_id, _tag) = &**event);
+            node_ids.iter().any(|n| recv_node_id == *n)
         })
         .count()
+}
+
+async fn wait_for_connectivity(nodes: &[&TestNode]) {
+    for node in nodes {
+        node.comms
+            .connectivity()
+            .wait_for_connectivity(Duration::from_secs(10))
+            .await
+            .unwrap();
+    }
 }

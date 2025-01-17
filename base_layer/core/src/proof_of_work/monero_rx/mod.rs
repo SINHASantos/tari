@@ -24,14 +24,15 @@ pub use error::MergeMineError;
 
 mod helpers;
 pub use helpers::{
-    append_merge_mining_tag,
     construct_monero_data,
     create_blockhashing_blob_from_block,
     create_ordered_transaction_hashes_from_block,
     deserialize_monero_block_from_hex,
-    extract_tari_hash,
-    monero_difficulty,
+    extract_aux_merkle_root_from_block,
+    insert_aux_chain_mr_and_info_into_block,
+    randomx_difficulty,
     serialize_monero_block_to_hex,
+    verify_header,
 };
 
 mod fixed_array;
@@ -41,7 +42,9 @@ mod pow_data;
 pub use pow_data::MoneroPowData;
 
 mod merkle_tree;
+mod merkle_tree_parameters;
 pub use merkle_tree::{create_merkle_proof, tree_hash};
+pub use merkle_tree_parameters::MerkleTreeParameters;
 // Re-exports
 pub use monero::{
     consensus::{deserialize, serialize},

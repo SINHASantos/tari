@@ -23,8 +23,6 @@
 //!
 //! Horizon state synchronisation module for pruned mode.
 
-use std::mem;
-
 use log::*;
 
 use super::{StateEvent, StateInfo};
@@ -59,26 +57,33 @@ impl HorizonStateSync {
             Err(err) => return err.into(),
         };
 
+        let sync_peers = &mut self.sync_peers;
+        // Order sync peers according to accumulated difficulty
+        sync_peers.sort_by(|a, b| {
+            b.claimed_chain_metadata()
+                .accumulated_difficulty()
+                .cmp(&a.claimed_chain_metadata().accumulated_difficulty())
+        });
+
+        // Target horizon sync height based on the last header we have synced
         let last_header = match shared.db.fetch_last_header().await {
             Ok(h) => h,
             Err(err) => return err.into(),
         };
+        let target_horizon_sync_height = local_metadata.pruned_height_at_given_chain_tip(last_header.height);
 
-        let horizon_sync_height = local_metadata.horizon_block(last_header.height);
-        if local_metadata.pruned_height() >= horizon_sync_height {
-            info!(target: LOG_TARGET, "Horizon state was already synchronized.");
+        // Determine if we need to sync horizon state
+        if local_metadata.pruned_height() >= target_horizon_sync_height {
+            info!(target: LOG_TARGET, "Horizon state is already synchronized.");
             return StateEvent::HorizonStateSynchronized;
         }
-
-        // We're already synced because we have full blocks higher than our target pruned height
-        if local_metadata.height_of_longest_chain() >= horizon_sync_height {
+        if local_metadata.best_block_height() >= target_horizon_sync_height {
             info!(
                 target: LOG_TARGET,
-                "Tip height is higher than our pruned height. Horizon state is already synchronized."
+                "Our tip height is higher than our target pruned height. Horizon state is already synchronized."
             );
             return StateEvent::HorizonStateSynchronized;
         }
-        let sync_peers = mem::take(&mut self.sync_peers);
 
         let db = shared.db.clone();
         let config = shared.config.blockchain_sync_config.clone();
@@ -91,8 +96,8 @@ impl HorizonStateSync {
             db,
             connectivity,
             rules,
-            &sync_peers,
-            horizon_sync_height,
+            sync_peers,
+            target_horizon_sync_height,
             prover,
             validator,
         );

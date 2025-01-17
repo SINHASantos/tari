@@ -39,8 +39,6 @@ use crate::{
 
 /// The Mnemonic system simplifies the encoding and decoding of a secret key into and from a Mnemonic word sequence
 /// It can autodetect the language of the Mnemonic word sequence
-// TODO: Develop a language autodetection mechanism to distinguish between ChineseTraditional and ChineseSimplified
-// #LOGGED
 
 #[derive(Clone, Debug, PartialEq, Eq, EnumString, Display, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -284,7 +282,7 @@ pub trait Mnemonic<T> {
 mod test {
     use std::str::FromStr;
 
-    use rand::{self, rngs::OsRng};
+    use rand::rngs::OsRng;
     use tari_crypto::{keys::SecretKey, ristretto::RistrettoSecretKey, tari_utilities::byte_array::ByteArray};
 
     use super::*;

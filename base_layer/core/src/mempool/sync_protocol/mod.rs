@@ -96,10 +96,12 @@ use tokio::{
     time,
 };
 
+#[cfg(feature = "metrics")]
+use crate::mempool::metrics;
 use crate::{
     base_node::comms_interface::{BlockEvent, BlockEventReceiver},
     chain_storage::BlockAddResult,
-    mempool::{metrics, proto, Mempool, MempoolServiceConfig},
+    mempool::{proto, Mempool, MempoolServiceConfig},
     proto as shared_proto,
     transactions::transaction_components::Transaction,
 };
@@ -176,7 +178,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static
                 }
 
                 if !self.is_synched() {
-                    self.spawn_initiator_protocol(conn.clone()).await;
+                    self.spawn_initiator_protocol(*conn.clone()).await;
                 }
             },
             _ => {},
@@ -204,7 +206,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static
         // we want to at least sync initial_sync_num_peers, so we reset the num_synced to 0, so it can run till
         // initial_sync_num_peers again. This is made to run as a best effort in that it will at least run the
         // initial_sync_num_peers
-        self.num_synched.store(0, Ordering::Release);
+        self.num_synched.store(0, Ordering::SeqCst);
         let connections = match self
             .connectivity
             .select_connections(ConnectivitySelection::random_nodes(
@@ -544,6 +546,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin
 
         #[allow(clippy::cast_possible_truncation)]
         #[allow(clippy::cast_possible_wrap)]
+        #[cfg(feature = "metrics")]
         {
             let stats = self.mempool.stats().await?;
             metrics::unconfirmed_pool_size().set(stats.unconfirmed_txs as i64);
@@ -580,6 +583,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin
 
         let stored_result = self.mempool.insert(txn).await?;
         if stored_result.is_stored() {
+            #[cfg(feature = "metrics")]
             metrics::inbound_transactions(Some(&self.peer_node_id)).inc();
             debug!(
                 target: LOG_TARGET,
@@ -588,6 +592,7 @@ where TSubstream: AsyncRead + AsyncWrite + Unpin
                 self.peer_node_id.short_str()
             );
         } else {
+            #[cfg(feature = "metrics")]
             metrics::rejected_inbound_transactions(Some(&self.peer_node_id)).inc();
             debug!(
                 target: LOG_TARGET,

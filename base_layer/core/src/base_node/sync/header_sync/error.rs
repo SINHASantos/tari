@@ -22,16 +22,26 @@
 
 use std::time::Duration;
 
+use primitive_types::U256;
 use tari_comms::{
     connectivity::ConnectivityError,
     peer_manager::NodeId,
     protocol::rpc::{RpcError, RpcStatus},
 };
 
-use crate::{blocks::BlockError, chain_storage::ChainStorageError, validation::ValidationError};
+use crate::{
+    blocks::BlockError,
+    chain_storage::ChainStorageError,
+    common::{BanPeriod, BanReason},
+    validation::ValidationError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlockHeaderSyncError {
+    #[error("No more sync peers available: {0}")]
+    NoMoreSyncPeers(String),
+    #[error("Could not find peer info")]
+    PeerNotFound,
     #[error("RPC error: {0}")]
     RpcError(#[from] RpcError),
     #[error("RPC request failed: {0}")]
@@ -58,8 +68,6 @@ pub enum BlockHeaderSyncError {
     InvalidBlockHeight { expected: u64, actual: u64 },
     #[error("Unable to find chain split from peer `{0}`")]
     ChainSplitNotFound(NodeId),
-    #[error("Node could not find any other node with which to sync. Silence.")]
-    NetworkSilence,
     #[error("Invalid protocol response: {0}")]
     InvalidProtocolResponse(String),
     #[error("Header at height {height} did not form a chain. Expected {actual} to equal the previous hash {expected}")]
@@ -75,10 +83,12 @@ pub enum BlockHeaderSyncError {
          {local}"
     )]
     PeerSentInaccurateChainMetadata {
-        claimed: u128,
-        actual: Option<u128>,
-        local: u128,
+        claimed: U256,
+        actual: Option<U256>,
+        local: U256,
     },
+    #[error("This peer sent too many headers ({0}) in response to a chain split request")]
+    PeerSentTooManyHeaders(usize),
     #[error("Peer {peer} exceeded maximum permitted sync latency. latency: {latency:.2?}s, max: {max_latency:.2?}s")]
     MaxLatencyExceeded {
         peer: NodeId,
@@ -87,12 +97,45 @@ pub enum BlockHeaderSyncError {
     },
     #[error("All sync peers exceeded max allowed latency")]
     AllSyncPeersExceedLatency,
-    #[error(
-        "Validator node MMR at height {height} is not correct. Expected {actual} to equal the computed {computed}"
-    )]
-    ValidatorNodeMmr {
-        height: u64,
-        actual: String,
-        computed: String,
-    },
+}
+
+impl BlockHeaderSyncError {
+    pub fn get_ban_reason(&self) -> Option<BanReason> {
+        match self {
+            // no ban
+            BlockHeaderSyncError::NoMoreSyncPeers(_) |
+            BlockHeaderSyncError::SyncFailedAllPeers |
+            BlockHeaderSyncError::FailedToBan(_) |
+            BlockHeaderSyncError::AllSyncPeersExceedLatency |
+            BlockHeaderSyncError::ConnectivityError(_) |
+            BlockHeaderSyncError::NotInSync |
+            BlockHeaderSyncError::PeerNotFound => None,
+            BlockHeaderSyncError::ChainStorageError(e) => e.get_ban_reason(),
+
+            // short ban
+            err @ BlockHeaderSyncError::MaxLatencyExceeded { .. } |
+            err @ BlockHeaderSyncError::RpcError { .. } |
+            err @ BlockHeaderSyncError::RpcRequestError { .. } => Some(BanReason {
+                reason: format!("{}", err),
+                ban_duration: BanPeriod::Short,
+            }),
+
+            // long ban
+            err @ BlockHeaderSyncError::ReceivedInvalidHeader(_) |
+            err @ BlockHeaderSyncError::FoundHashIndexOutOfRange(_, _) |
+            err @ BlockHeaderSyncError::StartHashNotFound(_) |
+            err @ BlockHeaderSyncError::InvalidBlockHeight { .. } |
+            err @ BlockHeaderSyncError::ChainSplitNotFound(_) |
+            err @ BlockHeaderSyncError::InvalidProtocolResponse(_) |
+            err @ BlockHeaderSyncError::ChainLinkBroken { .. } |
+            err @ BlockHeaderSyncError::BlockError(_) |
+            err @ BlockHeaderSyncError::PeerSentInaccurateChainMetadata { .. } |
+            err @ BlockHeaderSyncError::PeerSentTooManyHeaders(_) => Some(BanReason {
+                reason: format!("{}", err),
+                ban_duration: BanPeriod::Long,
+            }),
+
+            BlockHeaderSyncError::ValidationFailed(err) => ValidationError::get_ban_reason(err),
+        }
+    }
 }

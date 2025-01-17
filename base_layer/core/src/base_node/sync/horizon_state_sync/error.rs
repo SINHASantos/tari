@@ -29,15 +29,17 @@ use tari_comms::{
     protocol::rpc::{RpcError, RpcStatus},
 };
 use tari_crypto::errors::RangeProofError;
-use tari_mmr::error::MerkleMountainRangeError;
+use tari_mmr::{error::MerkleMountainRangeError, sparse_merkle_tree::SMTError};
+use tari_utilities::ByteArrayError;
 use thiserror::Error;
 use tokio::task;
 
 use crate::{
-    base_node::comms_interface::CommsInterfaceError,
-    chain_storage::{ChainStorageError, MmrTree},
+    chain_storage::ChainStorageError,
+    common::{BanPeriod, BanReason},
     transactions::transaction_components::TransactionError,
     validation::ValidationError,
+    MrHashError,
 };
 
 #[derive(Debug, Error)]
@@ -46,27 +48,25 @@ pub enum HorizonSyncError {
     IncorrectResponse(String),
     #[error("Chain storage error: {0}")]
     ChainStorageError(#[from] ChainStorageError),
-    #[error("Comms interface error: {0}")]
-    CommsInterfaceError(#[from] CommsInterfaceError),
     #[error("Final state validation failed: {0}")]
     FinalStateValidationFailed(ValidationError),
     #[error("Join error: {0}")]
     JoinError(#[from] task::JoinError),
     #[error("A range proof verification has produced an error: {0}")]
-    RangeProofError(#[from] RangeProofError),
+    RangeProofError(String),
     #[error("An invalid transaction has been encountered: {0}")]
     TransactionError(#[from] TransactionError),
-    #[error("Invalid kernel signature: {0}")]
-    InvalidKernelSignature(TransactionError),
-    #[error("MMR did not match for {mmr_tree} at height {at_height}. Expected {actual_hex} to equal {expected_hex}")]
-    InvalidMmrRoot {
-        mmr_tree: MmrTree,
+    #[error(
+        "Merkle root did not match for {mr_tree} at height {at_height}. Expected {actual_hex} to equal {expected_hex}"
+    )]
+    InvalidMrRoot {
+        mr_tree: String,
         at_height: u64,
         expected_hex: String,
         actual_hex: String,
     },
-    #[error("Invalid range proof for output:{0} : {1}")]
-    InvalidRangeProof(String, String),
+    #[error("Invalid MMR position {mmr_position} at height {at_height}")]
+    InvalidMmrPosition { at_height: u64, mmr_position: u64 },
     #[error("RPC error: {0}")]
     RpcError(#[from] RpcError),
     #[error("RPC status: {0}")]
@@ -93,10 +93,75 @@ pub enum HorizonSyncError {
     AllSyncPeersExceedLatency,
     #[error("FixedHash size error: {0}")]
     FixedHashSizeError(#[from] FixedHashSizeError),
+    #[error("No more sync peers available: {0}")]
+    NoMoreSyncPeers(String),
+    #[error("Could not find peer info")]
+    PeerNotFound,
+    #[error("Sparse Merkle Tree error: {0}")]
+    SMTError(#[from] SMTError),
+    #[error("ByteArrayError error: {0}")]
+    ByteArrayError(String),
+    #[error("FixedHash size error: {0}")]
+    MrHashError(#[from] MrHashError),
+}
+
+impl From<ByteArrayError> for HorizonSyncError {
+    fn from(e: ByteArrayError) -> Self {
+        HorizonSyncError::ByteArrayError(e.to_string())
+    }
 }
 
 impl From<TryFromIntError> for HorizonSyncError {
     fn from(err: TryFromIntError) -> Self {
         HorizonSyncError::ConversionError(err.to_string())
+    }
+}
+
+impl From<RangeProofError> for HorizonSyncError {
+    fn from(e: RangeProofError) -> Self {
+        HorizonSyncError::RangeProofError(e.to_string())
+    }
+}
+
+impl HorizonSyncError {
+    pub fn get_ban_reason(&self) -> Option<BanReason> {
+        match self {
+            // no ban
+            HorizonSyncError::ChainStorageError(e) => e.get_ban_reason(),
+            HorizonSyncError::NoSyncPeers |
+            HorizonSyncError::FailedSyncAllPeers |
+            HorizonSyncError::AllSyncPeersExceedLatency |
+            HorizonSyncError::ConnectivityError(_) |
+            HorizonSyncError::NoMoreSyncPeers(_) |
+            HorizonSyncError::PeerNotFound |
+            HorizonSyncError::JoinError(_) |
+            HorizonSyncError::MrHashError(_) => None,
+
+            // short ban
+            err @ HorizonSyncError::MaxLatencyExceeded { .. } |
+            err @ HorizonSyncError::RpcError { .. } |
+            err @ HorizonSyncError::RpcStatus { .. } => Some(BanReason {
+                reason: format!("{}", err),
+                ban_duration: BanPeriod::Short,
+            }),
+
+            // long ban
+            err @ HorizonSyncError::IncorrectResponse(_) |
+            err @ HorizonSyncError::FinalStateValidationFailed(_) |
+            err @ HorizonSyncError::RangeProofError(_) |
+            err @ HorizonSyncError::InvalidMrRoot { .. } |
+            err @ HorizonSyncError::SMTError(_) |
+            err @ HorizonSyncError::InvalidMmrPosition { .. } |
+            err @ HorizonSyncError::ConversionError(_) |
+            err @ HorizonSyncError::MerkleMountainRangeError(_) |
+            err @ HorizonSyncError::FixedHashSizeError(_) |
+            err @ HorizonSyncError::TransactionError(_) |
+            err @ HorizonSyncError::ByteArrayError(_) => Some(BanReason {
+                reason: format!("{}", err),
+                ban_duration: BanPeriod::Long,
+            }),
+
+            HorizonSyncError::ValidationError(err) => ValidationError::get_ban_reason(err),
+        }
     }
 }

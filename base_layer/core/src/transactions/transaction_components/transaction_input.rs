@@ -28,11 +28,14 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+use blake2::Blake2b;
 use borsh::{BorshDeserialize, BorshSerialize};
+use digest::consts::{U32, U64};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use tari_common_types::types::{ComAndPubSignature, Commitment, CommitmentFactory, FixedHash, HashOutput, PublicKey};
-use tari_crypto::{commitment::HomomorphicCommitmentFactory, tari_utilities::hex::Hex};
+use tari_crypto::tari_utilities::hex::Hex;
+use tari_hashing::TransactionHashDomain;
 use tari_script::{ExecutionStack, ScriptContext, StackItem, TariScript};
 
 use super::{TransactionInputVersion, TransactionOutputVersion};
@@ -40,16 +43,14 @@ use crate::{
     consensus::DomainSeparatedConsensusHasher,
     covenants::Covenant,
     transactions::{
-        tari_amount::MicroTari,
+        tari_amount::MicroMinotari,
         transaction_components,
         transaction_components::{
             transaction_output::TransactionOutput,
-            EncryptedValue,
+            EncryptedData,
             OutputFeatures,
             TransactionError,
-            UnblindedOutput,
         },
-        TransactionHashDomain,
     },
 };
 
@@ -115,8 +116,10 @@ impl TransactionInput {
         script_signature: ComAndPubSignature,
         sender_offset_public_key: PublicKey,
         covenant: Covenant,
-        encrypted_value: EncryptedValue,
-        minimum_value_promise: MicroTari,
+        encrypted_data: EncryptedData,
+        metadata_signature: ComAndPubSignature,
+        rangeproof_hash: FixedHash,
+        minimum_value_promise: MicroMinotari,
     ) -> TransactionInput {
         TransactionInput::new(
             version,
@@ -127,7 +130,9 @@ impl TransactionInput {
                 sender_offset_public_key,
                 covenant,
                 version: TransactionOutputVersion::get_current_version(),
-                encrypted_value,
+                encrypted_data,
+                metadata_signature,
+                rangeproof_hash,
                 minimum_value_promise,
             },
             input_data,
@@ -144,8 +149,10 @@ impl TransactionInput {
         script: TariScript,
         sender_offset_public_key: PublicKey,
         covenant: Covenant,
-        encrypted_value: EncryptedValue,
-        minimum_value_promise: MicroTari,
+        encrypted_data: EncryptedData,
+        metadata_signature: ComAndPubSignature,
+        rangeproof_hash: FixedHash,
+        minimum_value_promise: MicroMinotari,
     ) {
         self.spent_output = SpentOutput::OutputData {
             version,
@@ -154,66 +161,119 @@ impl TransactionInput {
             script,
             sender_offset_public_key,
             covenant,
-            encrypted_value,
+            encrypted_data,
+            metadata_signature,
+            rangeproof_hash,
             minimum_value_promise,
         };
     }
 
-    pub fn build_script_challenge(
-        version: TransactionInputVersion,
+    /// Convenience function to create the entire script challenge
+    pub fn build_script_signature_challenge(
+        version: &TransactionInputVersion,
         ephemeral_commitment: &Commitment,
         ephemeral_pubkey: &PublicKey,
         script: &TariScript,
         input_data: &ExecutionStack,
         script_public_key: &PublicKey,
         commitment: &Commitment,
-    ) -> [u8; 32] {
+    ) -> [u8; 64] {
+        // We build the message separately to help with hardware wallet support. This reduces the amount of data that
+        // needs to be transferred in order to sign the signature.
+        let message = TransactionInput::build_script_signature_message(version, script, input_data);
+        TransactionInput::finalize_script_signature_challenge(
+            version,
+            ephemeral_commitment,
+            ephemeral_pubkey,
+            script_public_key,
+            commitment,
+            &message,
+        )
+    }
+
+    /// Convenience function to create the finalize script challenge
+    pub fn finalize_script_signature_challenge(
+        version: &TransactionInputVersion,
+        ephemeral_commitment: &Commitment,
+        ephemeral_pubkey: &PublicKey,
+        script_public_key: &PublicKey,
+        commitment: &Commitment,
+        message: &[u8; 32],
+    ) -> [u8; 64] {
         match version {
             TransactionInputVersion::V0 | TransactionInputVersion::V1 => {
-                DomainSeparatedConsensusHasher::<TransactionHashDomain>::new("script_challenge")
-                    .chain(&version)
+                DomainSeparatedConsensusHasher::<TransactionHashDomain, Blake2b<U64>>::new("script_challenge")
                     .chain(ephemeral_commitment)
                     .chain(ephemeral_pubkey)
-                    .chain(script)
-                    .chain(input_data)
                     .chain(script_public_key)
                     .chain(commitment)
+                    .chain(&message)
                     .finalize()
+                    .into()
             },
         }
     }
 
+    /// Convenience function to create the entire script signature message for the challenge. This contains all data
+    /// outside of the signing keys and nonces.
+    pub fn build_script_signature_message(
+        version: &TransactionInputVersion,
+        script: &TariScript,
+        input_data: &ExecutionStack,
+    ) -> [u8; 32] {
+        match version {
+            TransactionInputVersion::V0 | TransactionInputVersion::V1 => {
+                DomainSeparatedConsensusHasher::<TransactionHashDomain, Blake2b<U32>>::new("script_message")
+                    .chain(version)
+                    .chain(script)
+                    .chain(input_data)
+                    .finalize()
+                    .into()
+            },
+        }
+    }
+
+    /// Returns the Commitment of this input. An error is returned if this is a compact input.
     pub fn commitment(&self) -> Result<&Commitment, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("commitment".to_string())),
             SpentOutput::OutputData { ref commitment, .. } => Ok(commitment),
         }
     }
 
+    /// Returns the OutputFeatures of this input. An error is returned if this is a compact input.
     pub fn features(&self) -> Result<&OutputFeatures, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("features".to_string())),
             SpentOutput::OutputData { ref features, .. } => Ok(features),
         }
     }
 
+    /// Returns a mutable reference OutputFeatures of this input. An error is returned if this is a compact input.
+    /// This is only available for unit tests.
+    #[cfg(test)]
     pub fn features_mut(&mut self) -> Result<&mut OutputFeatures, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("features".to_string())),
             SpentOutput::OutputData { ref mut features, .. } => Ok(features),
         }
     }
 
+    /// Returns a reference to the TariScript of this input. An error is returned if this is a compact input.
     pub fn script(&self) -> Result<&TariScript, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("script".to_string())),
             SpentOutput::OutputData { ref script, .. } => Ok(script),
         }
     }
 
+    /// Returns a reference to the sender offset public key of this input. An error is returned if this is a compact
+    /// input.
     pub fn sender_offset_public_key(&self) -> Result<&PublicKey, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData(
+                "sender offset public key".to_string(),
+            )),
             SpentOutput::OutputData {
                 ref sender_offset_public_key,
                 ..
@@ -221,39 +281,54 @@ impl TransactionInput {
         }
     }
 
+    /// Returns a reference to the covenant of this input. An error is returned if this is a compact input.
     pub fn covenant(&self) -> Result<&Covenant, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("covenant".to_string())),
             SpentOutput::OutputData { ref covenant, .. } => Ok(covenant),
         }
     }
 
-    pub fn encrypted_value(&self) -> Result<&EncryptedValue, TransactionError> {
+    /// Returns a reference to the EncryptedData of this input. An error is returned if this is a compact input.
+    pub fn encrypted_data(&self) -> Result<&EncryptedData, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
-            SpentOutput::OutputData {
-                ref encrypted_value, ..
-            } => Ok(encrypted_value),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("encrypted data".to_string())),
+            SpentOutput::OutputData { ref encrypted_data, .. } => Ok(encrypted_data),
         }
     }
 
-    pub fn minimum_value_promise(&self) -> Result<&MicroTari, TransactionError> {
+    /// Returns a reference to the metadata signature of this input. An error is returned if this is a compact input.
+    pub fn metadata_signature(&self) -> Result<&ComAndPubSignature, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData(
+                "metadata signature".to_string(),
+            )),
+            SpentOutput::OutputData {
+                ref metadata_signature, ..
+            } => Ok(metadata_signature),
+        }
+    }
+
+    /// Returns a reference to the rangeproof hash of this input. An error is returned if this is a compact input.
+    pub fn rangeproof_hash(&self) -> Result<&FixedHash, TransactionError> {
+        match self.spent_output {
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("rangeproof hash".to_string())),
+            SpentOutput::OutputData {
+                ref rangeproof_hash, ..
+            } => Ok(rangeproof_hash),
+        }
+    }
+
+    /// Returns a reference to the minimum value promise of this input. An error is returned if this is a compact input.
+    pub fn minimum_value_promise(&self) -> Result<&MicroMinotari, TransactionError> {
+        match self.spent_output {
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData(
+                "minimum value promise".to_string(),
+            )),
             SpentOutput::OutputData {
                 ref minimum_value_promise,
                 ..
             } => Ok(minimum_value_promise),
-        }
-    }
-
-    /// Checks if the given un-blinded input instance corresponds to this blinded Transaction Input
-    pub fn opened_by(&self, input: &UnblindedOutput, factory: &CommitmentFactory) -> Result<bool, TransactionError> {
-        match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
-            SpentOutput::OutputData { ref commitment, .. } => {
-                Ok(factory.open(&input.spending_key, &input.value.into(), commitment))
-            },
         }
     }
 
@@ -263,13 +338,13 @@ impl TransactionInput {
         self.output_hash() == output.hash()
     }
 
-    /// This will run the script contained in the TransactionInput, returning either a script error or the resulting
-    /// public key.
+    /// This will run the script contained in the TransactionInput, returning the resulting
+    /// public key if execution succeeds, or otherwise a script error. An error is returned if this is a compact input.
     pub fn run_script(&self, context: Option<ScriptContext>) -> Result<PublicKey, TransactionError> {
         let context = context.unwrap_or_default();
 
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("script".to_string())),
             SpentOutput::OutputData { ref script, .. } => {
                 match script.execute_with_context(&self.input_data, &context)? {
                     StackItem::PublicKey(pubkey) => Ok(pubkey),
@@ -283,20 +358,24 @@ impl TransactionInput {
         }
     }
 
+    /// Validates the script signature. An error is returned if the script signature is invalid or this is a compact
+    /// input.
     pub fn validate_script_signature(
         &self,
         script_public_key: &PublicKey,
         factory: &CommitmentFactory,
     ) -> Result<(), TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData(
+                "script signature".to_string(),
+            )),
             SpentOutput::OutputData {
                 ref script,
                 ref commitment,
                 ..
             } => {
-                let challenge = TransactionInput::build_script_challenge(
-                    self.version,
+                let challenge = TransactionInput::build_script_signature_challenge(
+                    &self.version,
                     self.script_signature.ephemeral_commitment(),
                     self.script_signature.ephemeral_pubkey(),
                     script,
@@ -304,6 +383,7 @@ impl TransactionInput {
                     script_public_key,
                     commitment,
                 );
+
                 if self.script_signature.verify_challenge(
                     commitment,
                     script_public_key,
@@ -322,7 +402,7 @@ impl TransactionInput {
     }
 
     /// This will run the script and verify the script signature. If its valid, it will return the resulting public key
-    /// from the script.
+    /// from the script. An error is always returned if this is a compact input.
     pub fn run_and_verify_script(
         &self,
         factory: &CommitmentFactory,
@@ -334,9 +414,10 @@ impl TransactionInput {
     }
 
     /// Returns true if this input is mature at the given height, otherwise false
+    /// An error is returned if this is a compact input.
     pub fn is_mature_at(&self, block_height: u64) -> Result<bool, TransactionError> {
         match self.spent_output {
-            SpentOutput::OutputHash(_) => Err(TransactionError::MissingTransactionInputData),
+            SpentOutput::OutputHash(_) => Err(TransactionError::CompactInputMissingData("features".to_string())),
             SpentOutput::OutputData { ref features, .. } => Ok(features.maturity <= block_height),
         }
     }
@@ -352,30 +433,46 @@ impl TransactionInput {
                 script,
                 features,
                 covenant,
-                encrypted_value,
+                encrypted_data,
                 sender_offset_public_key,
+                metadata_signature,
+                rangeproof_hash,
                 minimum_value_promise,
                 ..
             } => transaction_components::hash_output(
                 *version,
                 features,
                 commitment,
+                rangeproof_hash,
                 script,
-                covenant,
-                encrypted_value,
                 sender_offset_public_key,
+                metadata_signature,
+                covenant,
+                encrypted_data,
                 *minimum_value_promise,
             ),
         }
     }
 
+    pub fn smt_hash(&self, mined_height: u64) -> FixedHash {
+        let utxo_hash = self.output_hash();
+        let smt_hash = DomainSeparatedConsensusHasher::<TransactionHashDomain, Blake2b<U32>>::new("smt_hash")
+            .chain(&utxo_hash)
+            .chain(&mined_height);
+
+        match self.version {
+            TransactionInputVersion::V0 | TransactionInputVersion::V1 => smt_hash.finalize().into(),
+        }
+    }
+
+    /// Returns true if this is a compact input, otherwise false.
     pub fn is_compact(&self) -> bool {
         matches!(self.spent_output, SpentOutput::OutputHash(_))
     }
 
     /// Implement the canonical hashing function for TransactionInput for use in ordering
     pub fn canonical_hash(&self) -> FixedHash {
-        let writer = DomainSeparatedConsensusHasher::<TransactionHashDomain>::new("transaction_input")
+        let writer = DomainSeparatedConsensusHasher::<TransactionHashDomain, Blake2b<U32>>::new("transaction_input")
             .chain(&self.version)
             .chain(&self.script_signature)
             .chain(&self.input_data)
@@ -384,27 +481,31 @@ impl TransactionInput {
         writer.finalize().into()
     }
 
+    /// Sets the input maturity. Only available in unit tests.
+    /// An error is returned if this is a compact input.
+    #[cfg(test)]
     pub fn set_maturity(&mut self, maturity: u64) -> Result<(), TransactionError> {
         if let SpentOutput::OutputData { ref mut features, .. } = self.spent_output {
             features.maturity = maturity;
             Ok(())
         } else {
-            Err(TransactionError::MissingTransactionInputData)
+            Err(TransactionError::CompactInputMissingData("features".to_string()))
         }
     }
 
     /// Sets the input's Tari script. Only useful in tests.
+    /// An error is returned if this is a compact input.
     #[cfg(test)]
     pub fn set_script(&mut self, new_script: TariScript) -> Result<(), TransactionError> {
         if let SpentOutput::OutputData { ref mut script, .. } = self.spent_output {
             *script = new_script;
             Ok(())
         } else {
-            Err(TransactionError::MissingTransactionInputData)
+            Err(TransactionError::CompactInputMissingData("script".to_string()))
         }
     }
 
-    /// Return a clone of this Input into its compact form
+    /// Return a copy of this TransactionInput in its compact form.
     pub fn to_compact(&self) -> Self {
         Self::new(
             self.version,
@@ -421,7 +522,7 @@ impl TransactionInput {
 impl Display for TransactionInput {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         match self.spent_output {
-            SpentOutput::OutputHash(ref h) => write!(fmt, "Input spending Output hash: {}", h.to_hex()),
+            SpentOutput::OutputHash(ref h) => write!(fmt, "Input spending Output hash: {}", h),
             SpentOutput::OutputData {
                 ref commitment,
                 ref script,
@@ -430,13 +531,14 @@ impl Display for TransactionInput {
                 ..
             } => write!(
                 fmt,
-                "{} [{:?}], Script: ({}), Offset_Pubkey: ({}), Input Hash: {}, Output: {}",
+                "({}, {}) [{:?}], Script: ({}), Input_data : ({}), Offset_Pubkey: ({}), Input Hash: {}",
                 commitment.to_hex(),
+                self.output_hash(),
                 features,
                 script,
+                self.input_data.to_hex(),
                 sender_offset_public_key.to_hex(),
-                self.canonical_hash().to_hex(),
-                self.output_hash().to_hex()
+                self.canonical_hash(),
             ),
         }
     }
@@ -454,13 +556,21 @@ impl Eq for TransactionInput {}
 
 impl PartialOrd for TransactionInput {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.output_hash().partial_cmp(&other.output_hash())
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for TransactionInput {
     fn cmp(&self, other: &Self) -> Ordering {
         self.output_hash().cmp(&other.output_hash())
+    }
+}
+
+impl Default for TransactionInput {
+    fn default() -> Self {
+        let output = SpentOutput::create_from_output(TransactionOutput::default());
+
+        TransactionInput::new_current_version(output, ExecutionStack::default(), Default::default())
     }
 }
 
@@ -476,8 +586,10 @@ pub enum SpentOutput {
         sender_offset_public_key: PublicKey,
         /// The transaction covenant
         covenant: Covenant,
-        encrypted_value: EncryptedValue,
-        minimum_value_promise: MicroTari,
+        encrypted_data: EncryptedData,
+        metadata_signature: ComAndPubSignature,
+        rangeproof_hash: FixedHash,
+        minimum_value_promise: MicroMinotari,
     },
 }
 
@@ -486,6 +598,25 @@ impl SpentOutput {
         match self {
             SpentOutput::OutputHash(_) => 0,
             SpentOutput::OutputData { .. } => 1,
+        }
+    }
+
+    pub fn create_from_output(output: TransactionOutput) -> SpentOutput {
+        let rp_hash = match output.proof {
+            Some(proof) => proof.hash(),
+            None => FixedHash::zero(),
+        };
+        SpentOutput::OutputData {
+            version: output.version,
+            features: output.features,
+            commitment: output.commitment,
+            script: output.script,
+            sender_offset_public_key: output.sender_offset_public_key,
+            covenant: output.covenant,
+            encrypted_data: output.encrypted_data,
+            metadata_signature: output.metadata_signature,
+            rangeproof_hash: rp_hash,
+            minimum_value_promise: output.minimum_value_promise,
         }
     }
 }

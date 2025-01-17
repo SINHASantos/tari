@@ -37,16 +37,15 @@ pub struct ChainMetadataServiceInitializer;
 impl ServiceInitializer for ChainMetadataServiceInitializer {
     async fn initialize(&mut self, context: ServiceInitializerContext) -> Result<(), ServiceInitializationError> {
         debug!(target: LOG_TARGET, "Initializing Chain Metadata Service");
-        // Buffer size set to 1 because only the most recent metadata is applicable
-        let (publisher, _) = broadcast::channel(1);
+        let (publisher, _) = broadcast::channel(20);
 
         let handle = ChainMetadataHandle::new(publisher.clone());
         context.register_handle(handle);
 
         context.spawn_until_shutdown(|handles| {
+            let connectivity = handles.expect_handle::<ConnectivityRequester>();
             let liveness = handles.expect_handle::<LivenessHandle>();
             let base_node = handles.expect_handle::<LocalNodeCommsInterface>();
-            let connectivity = handles.expect_handle::<ConnectivityRequester>();
 
             ChainMetadataService::new(liveness, base_node, connectivity, publisher).run()
         });

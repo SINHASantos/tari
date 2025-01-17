@@ -4,11 +4,7 @@
 use std::str::FromStr;
 
 use cipher_seed::BIRTHDAY_GENESIS_FROM_UNIX_EPOCH;
-use digest::Digest;
-use tari_crypto::{
-    hash_domain,
-    hashing::{DomainSeparatedHasher, LengthExtensionAttackResistant},
-};
+use tari_crypto::hash_domain;
 use tari_utilities::{hidden::Hidden, hidden_type, safe_array::SafeArray};
 use zeroize::Zeroize;
 
@@ -21,25 +17,19 @@ pub mod cipher_seed;
 pub mod diacritics;
 pub mod error;
 pub mod key_manager;
+#[cfg(feature = "key_manager_service")]
+pub mod key_manager_service;
 pub mod mnemonic;
 pub mod mnemonic_wordlists;
-//  https://github.com/rustwasm/wasm-bindgen/issues/2774
-#[allow(clippy::unused_unit)]
-#[cfg(feature = "wasm")]
-pub mod wasm;
+#[cfg(feature = "key_manager_service")]
+pub mod schema;
 
-hash_domain!(KeyManagerDomain, "com.tari.tari_project.base_layer.key_manager", 1);
+hash_domain!(KeyManagerDomain, "com.tari.base_layer.key_manager", 1);
 
-const LABEL_ARGON_ENCODING: &str = "argon2_encoding";
-const LABEL_CHACHA20_ENCODING: &str = "chacha20_encoding";
-const LABEL_MAC_GENERATION: &str = "mac_generation";
-const LABEL_DERIVE_KEY: &str = "derive_key";
-
-pub(crate) fn mac_domain_hasher<D: Digest + LengthExtensionAttackResistant>(
-    label: &'static str,
-) -> DomainSeparatedHasher<D, KeyManagerDomain> {
-    DomainSeparatedHasher::<D, KeyManagerDomain>::new_with_label(label)
-}
+const HASHER_LABEL_CIPHER_SEED_PBKDF_SALT: &str = "cipher_seed_pbkdf_salt";
+const HASHER_LABEL_CIPHER_SEED_ENCRYPTION_NONCE: &str = "cipher_seed_encryption_nonce";
+const HASHER_LABEL_CIPHER_SEED_MAC: &str = "cipher_seed_mac";
+const HASHER_LABEL_DERIVE_KEY: &str = "derive_key";
 
 hidden_type!(CipherSeedEncryptionKey, SafeArray<u8, CIPHER_SEED_ENCRYPTION_KEY_BYTES>);
 hidden_type!(CipherSeedMacKey, SafeArray< u8, CIPHER_SEED_MAC_KEY_BYTES>);
@@ -59,10 +49,7 @@ pub struct SeedWords {
 
 impl PartialEq for SeedWords {
     fn eq(&self, other: &Self) -> bool {
-        (other.len() == self.len()) &&
-            (0..self.len())
-                .into_iter()
-                .all(|i| self.get_word(i).unwrap() == other.get_word(i).unwrap())
+        (other.len() == self.len()) && (0..self.len()).all(|i| self.get_word(i).unwrap() == other.get_word(i).unwrap())
     }
 }
 
@@ -142,7 +129,7 @@ mod tests {
             Hidden::hide("olá".to_string()),
         ]);
 
-        let vec_words = vec![
+        let vec_words = [
             "hi".to_string(),
             "niao".to_string(),
             "hola".to_string(),

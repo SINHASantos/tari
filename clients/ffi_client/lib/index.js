@@ -25,10 +25,9 @@ const {
   strArrayPtr,
 } = require("./types");
 
-// todo: check if the lib exists first
 
 console.log("Set up library...");
-const libWallet = ffi.Library("./libtari_wallet_ffi.dylib", {
+const libWallet = ffi.Library("./libminotari_wallet_ffi.dylib", {
   byte_vector_create: [byteVectorRef, [u8ArrayPtr, u32, errPtr]],
   comms_config_create: [
     commsConfigRef,
@@ -45,7 +44,7 @@ const libWallet = ffi.Library("./libtari_wallet_ffi.dylib", {
     transportRef,
     ["string", u8ArrayPtr, u16, "string", "string", errPtr],
   ],
-  wallet_add_base_node_peer: [bool, [walletRef, u8ArrayPtr, "string", errPtr]],
+  wallet_set_base_node_peer: [bool, [walletRef, u8ArrayPtr, "string", errPtr]],
   wallet_create: [
     walletRef,
     [

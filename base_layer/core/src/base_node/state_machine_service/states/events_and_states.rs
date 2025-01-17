@@ -37,7 +37,7 @@ use crate::base_node::{
         Starting,
         Waiting,
     },
-    sync::{HorizonSyncInfo, SyncPeer},
+    sync::{AttemptSyncResult, HorizonSyncInfo, SyncPeer},
 };
 
 #[derive(Debug)]
@@ -57,8 +57,8 @@ pub enum BaseNodeState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateEvent {
     Initialized,
-    HeadersSynchronized(SyncPeer),
-    HeaderSyncFailed,
+    HeadersSynchronized(SyncPeer, AttemptSyncResult),
+    HeaderSyncFailed(String),
     ProceedToHorizonSync(Vec<SyncPeer>),
     ProceedToBlockSync(Vec<SyncPeer>),
     HorizonStateSynchronized,
@@ -90,12 +90,25 @@ pub enum SyncStatus {
         network: ChainMetadata,
         sync_peers: Vec<SyncPeer>,
     },
+    // There is a stronger chain but we are less the `blocks_before_considered_lagging` blocks behind it.
+    BehindButNotYetLagging {
+        local: ChainMetadata,
+        network: ChainMetadata,
+        sync_peers: Vec<SyncPeer>,
+    },
     UpToDate,
+    SyncNotPossible {
+        peers: Vec<SyncPeer>,
+    },
 }
 
 impl SyncStatus {
     pub fn is_lagging(&self) -> bool {
-        !self.is_up_to_date()
+        matches!(self, SyncStatus::Lagging { .. })
+    }
+
+    pub fn is_sync_not_possible(&self) -> bool {
+        matches!(self, SyncStatus::SyncNotPossible { .. })
     }
 
     pub fn is_up_to_date(&self) -> bool {
@@ -113,10 +126,14 @@ impl Display for SyncStatus {
                 f,
                 "Lagging behind {} peers (#{}, Difficulty: {})",
                 sync_peers.len(),
-                network.height_of_longest_chain(),
+                network.best_block_height(),
                 network.accumulated_difficulty(),
             ),
             UpToDate => f.write_str("UpToDate"),
+            SyncStatus::BehindButNotYetLagging { .. } => f.write_str("Behind but not yet lagging"),
+            SyncStatus::SyncNotPossible { .. } => {
+                f.write_str("Behind but we cannot sync as we have no viable peers to sync to")
+            },
         }
     }
 }
@@ -128,8 +145,8 @@ impl Display for StateEvent {
         match self {
             Initialized => write!(f, "Initialized"),
             BlocksSynchronized => write!(f, "Synchronised Blocks"),
-            HeadersSynchronized(peer) => write!(f, "Headers Synchronized from peer `{}`", peer),
-            HeaderSyncFailed => write!(f, "Header Synchronization Failed"),
+            HeadersSynchronized(peer, result) => write!(f, "Headers Synchronized from peer `{}` ({:?})", peer, result),
+            HeaderSyncFailed(err) => write!(f, "Header Synchronization Failed ({})", err),
             ProceedToHorizonSync(_) => write!(f, "Proceed to horizon sync"),
             ProceedToBlockSync(_) => write!(f, "Proceed to block sync"),
             HorizonStateSynchronized => write!(f, "Horizon State Synchronized"),
@@ -189,11 +206,21 @@ impl StateInfo {
                     .unwrap_or_else(|| "".to_string())
             ),
             HeaderSync(None) => "Starting header sync".to_string(),
-            HeaderSync(Some(info)) => format!("Syncing headers: {}", info.sync_progress_string()),
+            HeaderSync(Some(info)) => format!("Syncing headers: {}", info.sync_progress_string_headers()),
             HorizonSync(info) => info.to_progress_string(),
 
-            BlockSync(info) => format!("Syncing blocks: {}", info.sync_progress_string()),
-            Listening(_) => "Listening".to_string(),
+            BlockSync(info) => format!("Syncing blocks: {}", info.sync_progress_string_blocks()),
+            Listening(info) => {
+                if info.is_synced() {
+                    "Listening".to_string()
+                } else {
+                    format!(
+                        "Waiting for peer data: {}/{}",
+                        info.initial_delay_connected_count(),
+                        info.initial_sync_peer_wait_count()
+                    )
+                }
+            },
             SyncFailed(details) => format!("Sync failed: {}", details),
         }
     }
@@ -211,6 +238,13 @@ impl StateInfo {
         match self {
             StartUp | Connecting(_) | HeaderSync(_) | HorizonSync(_) | BlockSync(_) | SyncFailed(_) => false,
             Listening(info) => info.is_synced(),
+        }
+    }
+
+    pub fn get_initial_connected_peers(&self) -> u64 {
+        match self {
+            StateInfo::Listening(info) => info.initial_delay_connected_count(),
+            _ => 0,
         }
     }
 }
@@ -282,7 +316,15 @@ impl BlockSyncInfo {
         }
     }
 
-    pub fn sync_progress_string(&self) -> String {
+    pub fn sync_progress_string_headers(&self) -> String {
+        self.sync_progress("hdrs")
+    }
+
+    pub fn sync_progress_string_blocks(&self) -> String {
+        self.sync_progress("blks")
+    }
+
+    fn sync_progress(&self, item: &str) -> String {
         format!(
             "({}) {}/{} ({:.0}%){}{}",
             self.sync_peer.node_id().short_str(),
@@ -291,7 +333,7 @@ impl BlockSyncInfo {
             (self.local_height as f64 / self.tip_height as f64 * 100.0).floor(),
             self.sync_peer
                 .items_per_second()
-                .map(|bps| format!(" {:.2?} blks/s", bps))
+                .map(|bps| format!(" {:.2?} {}/s", bps, item))
                 .unwrap_or_default(),
             self.sync_peer
                 .calc_avg_latency()
@@ -303,6 +345,6 @@ impl BlockSyncInfo {
 
 impl Display for BlockSyncInfo {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        writeln!(f, "Syncing {}", self.sync_progress_string())
+        writeln!(f, "Syncing {}", self.sync_progress_string_blocks())
     }
 }

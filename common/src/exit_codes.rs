@@ -120,12 +120,22 @@ pub enum ExitCode {
     TorAuthConfiguration = 118,
     #[error("Unable to read Tor cookie file")]
     TorAuthUnreadableCookie = 119,
+    #[error("Tokio runtime error")]
+    TokioRuntimeError = 120,
+    #[error("Key manager service error")]
+    KeyManagerServiceError = 121,
+    #[error("Consensus manager builder error")]
+    ConsensusManagerBuilderError = 122,
+    #[error("Payment wallet address error")]
+    WalletPaymentAddress = 123,
+    #[error("Unable to configure TLS")]
+    TlsConfigurationError = 124,
+    #[error("Unable to setup tari pulse")]
+    TariPulseError = 125,
 }
 
 impl From<super::ConfigError> for ExitError {
     fn from(err: super::ConfigError) -> Self {
-        // TODO: Move it out
-        // error!(target: LOG_TARGET, "{}", err);
         Self::new(ExitCode::ConfigError, err.to_string())
     }
 }

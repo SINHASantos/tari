@@ -23,15 +23,18 @@
 mod bullet_rangeproofs;
 mod fixed_hash;
 
+use blake2::Blake2b;
 pub use bullet_rangeproofs::BulletRangeProof;
+use digest::consts::{U32, U64};
 use tari_crypto::{
-    hash::blake2::Blake256,
+    hasher,
     ristretto::{
         bulletproofs_plus::BulletproofsPlusService,
         pedersen::{extended_commitment_factory::ExtendedPedersenCommitmentFactory, PedersenCommitment},
         RistrettoComAndPubSig,
         RistrettoPublicKey,
         RistrettoSchnorr,
+        RistrettoSchnorrWithDomain,
         RistrettoSecretKey,
     },
 };
@@ -43,6 +46,8 @@ pub use fixed_hash::{FixedHash, FixedHashSizeError};
 /// Define the explicit Signature implementation for the Tari base layer. A different signature scheme can be
 /// employed by redefining this type.
 pub type Signature = RistrettoSchnorr;
+/// Define a generic signature type using a hash domain.
+pub type SignatureWithDomain<H> = RistrettoSchnorrWithDomain<H>;
 /// Define the explicit Commitment Signature implementation for the Tari base layer.
 pub type ComAndPubSignature = RistrettoComAndPubSig;
 
@@ -55,13 +60,12 @@ pub type PublicKey = RistrettoPublicKey;
 
 /// Define the explicit Secret key implementation for the Tari base layer.
 pub type PrivateKey = RistrettoSecretKey;
-pub type BlindingFactor = RistrettoSecretKey;
 
 /// Define the hash function that will be used to produce a signature challenge
-pub type SignatureHasher = Blake256;
+pub type SignatureHasher = Blake2b<U64>;
 
 /// Specify the digest type for signature challenges
-pub type Challenge = Blake256;
+pub type Challenge = Blake2b<U64>;
 
 /// Define the data type that is used to store results of a hash output
 pub type HashOutput = FixedHash;
@@ -77,9 +81,18 @@ pub type RangeProof = BulletRangeProof;
 
 use tari_crypto::{hash_domain, hashing::DomainSeparatedHasher};
 
-hash_domain!(
-    BulletRangeProofHashDomain,
-    "com.tari.tari-project.base_layer.common_types.bullet_rangeproofs"
+hasher!(
+    Blake2b<U64>,
+    WalletHasher,
+    "com.tari.base_layer.wallet",
+    1,
+    wallet_hasher
 );
 
-pub type BulletRangeProofHasherBlake256 = DomainSeparatedHasher<Blake256, BulletRangeProofHashDomain>;
+hash_domain!(
+    BulletRangeProofHashDomain,
+    "com.tari.base_layer.common_types.bullet_rangeproofs",
+    1
+);
+
+pub type BulletRangeProofHasherBlake256 = DomainSeparatedHasher<Blake2b<U32>, BulletRangeProofHashDomain>;

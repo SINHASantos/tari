@@ -1,6 +1,15 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    burnt_proofs (id) {
+        id -> Integer,
+        reciprocal_claim_public_key -> Text,
+        payload -> Text,
+        burned_at -> Timestamp,
+    }
+}
+
+diesel::table! {
     client_key_values (key) {
         key -> Text,
         value -> Text,
@@ -14,13 +23,11 @@ diesel::table! {
         destination_address -> Binary,
         amount -> BigInt,
         fee -> BigInt,
-        transaction_protocol -> Text,
+        transaction_protocol -> Binary,
         status -> Integer,
-        message -> Text,
         timestamp -> Timestamp,
         cancelled -> Nullable<Integer>,
         direction -> Nullable<Integer>,
-        coinbase_block_height -> Nullable<BigInt>,
         send_count -> Integer,
         last_send_timestamp -> Nullable<Timestamp>,
         confirmations -> Nullable<BigInt>,
@@ -29,16 +36,7 @@ diesel::table! {
         mined_timestamp -> Nullable<Timestamp>,
         transaction_signature_nonce -> Binary,
         transaction_signature_key -> Binary,
-    }
-}
-
-diesel::table! {
-    contacts (address) {
-        address -> Binary,
-        node_id -> Binary,
-        alias -> Text,
-        last_seen -> Nullable<Timestamp>,
-        latency -> Nullable<Integer>,
+        payment_id -> Nullable<Binary>,
     }
 }
 
@@ -47,29 +45,20 @@ diesel::table! {
         tx_id -> BigInt,
         source_address -> Binary,
         amount -> BigInt,
-        receiver_protocol -> Text,
-        message -> Text,
+        receiver_protocol -> Binary,
         timestamp -> Timestamp,
         cancelled -> Integer,
         direct_send_success -> Integer,
         send_count -> Integer,
         last_send_timestamp -> Nullable<Timestamp>,
-    }
-}
-
-diesel::table! {
-    key_manager_states (id) {
-        id -> Integer,
-        branch_seed -> Text,
-        primary_key_index -> Binary,
-        timestamp -> Timestamp,
+        payment_id -> Nullable<Binary>,
     }
 }
 
 diesel::table! {
     known_one_sided_payment_scripts (script_hash) {
         script_hash -> Binary,
-        private_key -> Binary,
+        private_key -> Text,
         script -> Binary,
         input -> Binary,
         script_lock_height -> BigInt,
@@ -82,29 +71,30 @@ diesel::table! {
         destination_address -> Binary,
         amount -> BigInt,
         fee -> BigInt,
-        sender_protocol -> Text,
-        message -> Text,
+        sender_protocol -> Binary,
         timestamp -> Timestamp,
         cancelled -> Integer,
         direct_send_success -> Integer,
         send_count -> Integer,
         last_send_timestamp -> Nullable<Timestamp>,
+        payment_id -> Nullable<Binary>,
     }
 }
 
 diesel::table! {
     outputs (id) {
         id -> Integer,
-        commitment -> Nullable<Binary>,
-        spending_key -> Binary,
+        commitment -> Binary,
+        rangeproof -> Nullable<Binary>,
+        spending_key -> Text,
         value -> BigInt,
         output_type -> Integer,
         maturity -> BigInt,
         status -> Integer,
-        hash -> Nullable<Binary>,
+        hash -> Binary,
         script -> Binary,
         input_data -> Binary,
-        script_private_key -> Binary,
+        script_private_key -> Text,
         script_lock_height -> BigInt,
         sender_offset_public_key -> Binary,
         metadata_signature_ephemeral_commitment -> Binary,
@@ -114,21 +104,20 @@ diesel::table! {
         metadata_signature_u_y -> Binary,
         mined_height -> Nullable<BigInt>,
         mined_in_block -> Nullable<Binary>,
-        mined_mmr_position -> Nullable<BigInt>,
         marked_deleted_at_height -> Nullable<BigInt>,
         marked_deleted_in_block -> Nullable<Binary>,
         received_in_tx_id -> Nullable<BigInt>,
         spent_in_tx_id -> Nullable<BigInt>,
-        coinbase_block_height -> Nullable<BigInt>,
-        metadata -> Nullable<Binary>,
+        coinbase_extra -> Nullable<Binary>,
         features_json -> Text,
         spending_priority -> Integer,
         covenant -> Binary,
         mined_timestamp -> Nullable<Timestamp>,
-        encrypted_value -> Binary,
+        encrypted_data -> Binary,
         minimum_value_promise -> BigInt,
         source -> Integer,
         last_validation_timestamp -> Nullable<Timestamp>,
+        payment_id -> Nullable<Binary>,
     }
 }
 
@@ -150,11 +139,10 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(
+    burnt_proofs,
     client_key_values,
     completed_transactions,
-    contacts,
     inbound_transactions,
-    key_manager_states,
     known_one_sided_payment_scripts,
     outbound_transactions,
     outputs,

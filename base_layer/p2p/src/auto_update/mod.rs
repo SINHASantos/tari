@@ -47,12 +47,12 @@ use tari_common::{
         bootstrap::ApplicationType,
         serializers::optional_seconds,
         utils::{deserialize_string_or_struct, serialize_string},
+        StringList,
     },
     DnsNameServer,
     SubConfigPath,
 };
 use tari_utilities::hex::Hex;
-pub use trust_dns_client::rr::dnssec::TrustAnchor;
 
 use crate::auto_update::{dns::UpdateSpec, signature::SignedMessageVerifier};
 
@@ -67,7 +67,7 @@ pub struct AutoUpdateConfig {
         serialize_with = "serialize_string"
     )]
     pub name_server: DnsNameServer,
-    pub update_uris: Vec<String>,
+    pub update_uris: StringList,
     pub use_dnssec: bool,
     pub download_base_url: String,
     pub hashes_url: String,
@@ -81,7 +81,7 @@ impl Default for AutoUpdateConfig {
         Self {
             override_from: None,
             name_server: DnsNameServer::from_str("1.1.1.1:53/cloudflare.net").unwrap(),
-            update_uris: vec![],
+            update_uris: vec![].into(),
             use_dnssec: false,
             download_base_url: String::new(),
             hashes_url: String::new(),
@@ -202,14 +202,7 @@ async fn http_download<T: IntoUrl>(url: T) -> Result<reqwest::Response, AutoUpda
     Ok(resp)
 }
 
-const MAINTAINERS: &[&str] = &[
-    include_str!("../../../../meta/gpg_keys/CjS77.asc"),
-    include_str!("../../../../meta/gpg_keys/hansieodendaal.asc"),
-    include_str!("../../../../meta/gpg_keys/philipr-za.asc"),
-    include_str!("../../../../meta/gpg_keys/sdbondi.asc"),
-    include_str!("../../../../meta/gpg_keys/swvheerden.asc"),
-    include_str!("../../../../meta/gpg_keys/delta1.asc"),
-];
+const MAINTAINERS: &[&str] = &[include_str!("gpg_keys/swvheerden.asc")];
 
 fn maintainers() -> impl Iterator<Item = pgp::SignedPublicKey> {
     MAINTAINERS.iter().map(|s| {
@@ -220,7 +213,6 @@ fn maintainers() -> impl Iterator<Item = pgp::SignedPublicKey> {
 
 #[cfg(test)]
 mod test {
-    use config;
     use tari_common::DefaultConfigLoader;
 
     use super::*;
@@ -275,7 +267,7 @@ download_base_url ="http://test.com"
             config.name_server,
             DnsNameServer::from_str("127.0.0.1:80/localtest").unwrap(),
         );
-        assert_eq!(config.update_uris, Vec::<String>::new());
+        assert_eq!(config.update_uris.into_vec(), Vec::<String>::new());
         assert_eq!(config.download_base_url, "http://test.com");
         // update_uris =
         // pub update_uris: Vec<String>,
@@ -295,7 +287,7 @@ download_base_url ="http://test.com"
             config.name_server,
             DnsNameServer::from_str("127.0.0.1:80/localtest2").unwrap(),
         );
-        assert_eq!(config.update_uris, vec!["http://none", "http://local"]);
+        assert_eq!(config.update_uris.into_vec(), vec!["http://none", "http://local"]);
         assert!(config.use_dnssec);
     }
     #[test]
@@ -307,7 +299,7 @@ download_base_url ="http://test.com"
             config.name_server,
             DnsNameServer::from_str("127.0.0.1:80/localtest2").unwrap(),
         );
-        assert_eq!(config.update_uris, vec!["http://none", "http://local"]);
+        assert_eq!(config.update_uris.into_vec(), vec!["http://none", "http://local"]);
         assert!(config.use_dnssec);
     }
 

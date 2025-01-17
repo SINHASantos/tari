@@ -45,7 +45,7 @@ pub async fn setup_liveness_service(
     peers: Vec<Arc<NodeIdentity>>,
     data_path: &str,
 ) -> (LivenessHandle, CommsNode, Dht, Shutdown) {
-    let (publisher, subscription_factory) = pubsub_connector(100, 20);
+    let (publisher, subscription_factory) = pubsub_connector(100);
     let subscription_factory = Arc::new(subscription_factory);
     let shutdown = Shutdown::new();
     let (comms, dht, _) =
@@ -54,6 +54,7 @@ pub async fn setup_liveness_service(
     let handles = StackBuilder::new(comms.shutdown_signal())
         .add_initializer(RegisterHandle::new(dht.clone()))
         .add_initializer(RegisterHandle::new(comms.connectivity()))
+        .add_initializer(RegisterHandle::new(comms.peer_manager()))
         .add_initializer(LivenessInitializer::new(
             Default::default(),
             Arc::clone(&subscription_factory),

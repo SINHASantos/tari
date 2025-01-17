@@ -30,7 +30,7 @@ use std::{
 };
 
 use futures::future;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use rand::{distributions, rngs::OsRng, Rng};
 use tari_comms::{
     backoff::ConstantBackoff,
@@ -42,6 +42,7 @@ use tari_comms::{
     protocol::{
         messaging::{MessagingEvent, MessagingEventReceiver, MessagingEventSender, MessagingProtocolExtension},
         rpc::RpcServer,
+        ProtocolId,
     },
     transports::MemoryTransport,
     types::CommsDatabase,
@@ -75,6 +76,7 @@ use tower::ServiceBuilder;
 
 use crate::memory_net::DrainBurst;
 
+pub static MEMORYNET_MSG_PROTOCOL_ID: ProtocolId = ProtocolId::from_static(b"t/msg/1.0");
 pub type NodeEventRx = mpsc::UnboundedReceiver<(NodeId, NodeId)>;
 pub type NodeEventTx = mpsc::UnboundedSender<(NodeId, NodeId)>;
 
@@ -89,10 +91,8 @@ macro_rules! banner {
     }
 }
 
-lazy_static! {
-    static ref NAME_MAP: Mutex<HashMap<NodeId, String>> = Mutex::new(HashMap::new());
-    static ref NAME_POS: Mutex<usize> = Mutex::new(0);
-}
+static NAME_MAP: Lazy<Mutex<HashMap<NodeId, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static NAME_POS: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(0));
 
 pub fn register_name(node_id: NodeId, name: String) {
     NAME_MAP.lock().unwrap().insert(node_id, name);
@@ -260,7 +260,7 @@ pub async fn network_connectivity_stats(nodes: &[TestNode], wallets: &[TestNode]
 pub async fn do_network_wide_propagation(nodes: &mut [TestNode], origin_node_index: Option<usize>) -> (usize, usize) {
     let random_node = match origin_node_index {
         Some(n) if n < nodes.len() => &nodes[n],
-        Some(_) | None => &nodes[OsRng.gen_range(0, nodes.len() - 1)],
+        Some(_) | None => &nodes[OsRng.gen_range(0..nodes.len() - 1)],
     };
 
     let random_node_id = random_node.comms.node_identity().node_id().clone();
@@ -306,7 +306,6 @@ pub async fn do_network_wide_propagation(nodes: &mut [TestNode], origin_node_ind
             let mut connectivity = node.comms.connectivity();
             let mut ims_rx = node.ims_rx.take().unwrap();
             let start = Instant::now();
-            let start_global = start_global;
             let node_name = node.name.clone();
 
             task::spawn(async move {
@@ -333,6 +332,7 @@ pub async fn do_network_wide_propagation(nodes: &mut [TestNode], origin_node_ind
                                 OutboundEncryption::ClearText,
                                 vec![msg.source_peer.node_id.clone()],
                                 OutboundDomainMessage::new(&0i32, public_msg),
+                                "Memory net example".to_string(),
                             )
                             .await
                             .unwrap();
@@ -465,7 +465,7 @@ pub async fn do_store_and_forward_message_propagation(
             let msg = time::timeout(Duration::from_secs(2), s.recv()).await;
             match msg {
                 Ok(Ok(evt)) => {
-                    if let MessagingEvent::MessageReceived(_, tag) = &*evt {
+                    if let MessagingEvent::MessageReceived(_, tag) = &evt {
                         println!("{} received propagated SAF message ({})", neighbour, tag);
                     }
                 },
@@ -632,8 +632,13 @@ fn connection_manager_logger(
                     println!("'{}' connected to '{}'", node_name, get_name(conn.peer_node_id()),);
                 },
             },
-            PeerDisconnected(_, node_id) => {
-                println!("'{}' disconnected from '{}'", get_name(node_id), node_name);
+            PeerDisconnected(_, node_id, minimized) => {
+                println!(
+                    "'{}' disconnected from '{}', {:?}",
+                    get_name(node_id),
+                    node_name,
+                    minimized
+                );
             },
             PeerConnectFailed(node_id, err) => {
                 println!(
@@ -655,6 +660,14 @@ fn connection_manager_logger(
                     get_name(node_id),
                     String::from_utf8_lossy(protocol),
                     node_name
+                );
+            },
+            PeerViolation { peer_node_id, details } => {
+                println!(
+                    "'{}' violated protocol with '{}' because '{}'",
+                    node_name,
+                    get_name(peer_node_id),
+                    details
                 );
             },
         }
@@ -737,11 +750,9 @@ impl TestNode {
             loop {
                 let event = messaging_events.recv().await;
                 use MessagingEvent::MessageReceived;
-                match event.as_deref() {
+                match event {
                     Ok(MessageReceived(peer_node_id, _)) => {
-                        messaging_events_tx
-                            .send((Clone::clone(&*peer_node_id), node_id.clone()))
-                            .unwrap();
+                        messaging_events_tx.send((peer_node_id, node_id.clone())).unwrap();
                     },
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
@@ -752,12 +763,10 @@ impl TestNode {
         });
     }
 
-    #[inline]
     pub fn node_identity(&self) -> Arc<NodeIdentity> {
         self.comms.node_identity()
     }
 
-    #[inline]
     pub fn to_peer(&self) -> Peer {
         self.comms.node_identity().to_peer()
     }
@@ -775,7 +784,7 @@ impl TestNode {
 
             match &*event {
                 PeerConnected(conn) if conn.peer_node_id() == node_id => {
-                    break Some(conn.clone());
+                    break Some(*conn.clone());
                 },
                 _ => {},
             }
@@ -905,7 +914,7 @@ async fn setup_comms_dht(
     let comms = CommsBuilder::new()
         .allow_test_addresses()
         // In this case the listener address and the public address are the same (/memory/...)
-        .with_listener_address(node_identity.public_address())
+        .with_listener_address(node_identity.first_public_address().unwrap())
         .with_shutdown_signal(shutdown_signal)
         .with_node_identity(node_identity)
         .with_min_connectivity(1)
@@ -964,7 +973,10 @@ async fn setup_comms_dht(
     let (messaging_events_tx, _) = broadcast::channel(100);
     let comms = comms
         .add_rpc_server(RpcServer::new().add_service(dht.rpc_service()))
-        .add_protocol_extension(MessagingProtocolExtension::new(messaging_events_tx.clone(), pipeline))
+        .add_protocol_extension(
+            MessagingProtocolExtension::new(MEMORYNET_MSG_PROTOCOL_ID.clone(), messaging_events_tx.clone(), pipeline)
+                .enable_message_received_event(),
+        )
         .spawn_with_transport(MemoryTransport)
         .await
         .unwrap();

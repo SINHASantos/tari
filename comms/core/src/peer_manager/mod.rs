@@ -70,8 +70,6 @@
 //! let returned_peer = peer_manager.find_by_node_id(&node_id).unwrap();
 //! ```
 
-mod connection_stats;
-
 mod error;
 pub use error::PeerManagerError;
 
@@ -106,6 +104,9 @@ pub use peer_query::{PeerQuery, PeerQuerySortBy};
 
 mod peer_storage;
 pub use peer_storage::PeerStorage;
+
+mod peer_identity_claim;
+pub use peer_identity_claim::PeerIdentityClaim;
 
 mod migrations;
 

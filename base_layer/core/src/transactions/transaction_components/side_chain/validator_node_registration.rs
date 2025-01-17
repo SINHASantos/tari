@@ -20,19 +20,19 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use blake2::Blake2b;
 use borsh::{BorshDeserialize, BorshSerialize};
+use digest::consts::U32;
+use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use tari_common_types::{
     epoch::VnEpoch,
     types::{FixedHash, PublicKey, Signature},
 };
+use tari_hashing::TransactionHashDomain;
 use tari_utilities::ByteArray;
 
-use crate::{
-    consensus::DomainSeparatedConsensusHasher,
-    transactions::{transaction_components::ValidatorNodeSignature, TransactionHashDomain},
-    U256,
-};
+use crate::{consensus::DomainSeparatedConsensusHasher, transactions::transaction_components::ValidatorNodeSignature};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Deserialize, Serialize, BorshSerialize, BorshDeserialize)]
 pub struct ValidatorNodeRegistration {
@@ -58,12 +58,12 @@ impl ValidatorNodeRegistration {
         match prev_shard_key {
             Some(prev) => {
                 if does_require_new_shard_key(self.public_key(), epoch, interval) {
-                    generate_shard_key(self.public_key(), &**block_hash)
+                    generate_shard_key(self.public_key(), block_hash)
                 } else {
                     prev
                 }
             },
-            None => generate_shard_key(self.public_key(), &**block_hash),
+            None => generate_shard_key(self.public_key(), block_hash),
         }
     }
 
@@ -84,10 +84,11 @@ fn does_require_new_shard_key(public_key: &PublicKey, epoch: VnEpoch, interval: 
 }
 
 fn generate_shard_key(public_key: &PublicKey, entropy: &[u8; 32]) -> [u8; 32] {
-    DomainSeparatedConsensusHasher::<TransactionHashDomain>::new("validator_node_shard_key")
+    DomainSeparatedConsensusHasher::<TransactionHashDomain, Blake2b<U32>>::new("validator_node_shard_key")
         .chain(public_key)
         .chain(entropy)
         .finalize()
+        .into()
 }
 
 #[cfg(test)]

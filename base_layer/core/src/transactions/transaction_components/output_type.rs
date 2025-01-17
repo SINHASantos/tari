@@ -44,8 +44,9 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
     BorshDeserialize,
 )]
 #[repr(u8)]
+#[borsh(use_discriminant = true)]
 pub enum OutputType {
-    /// An standard non-coinbase output.
+    /// An standard output.
     Standard = 0,
     /// Output is a coinbase output, must not be spent until maturity.
     Coinbase = 1,
@@ -82,7 +83,7 @@ impl OutputType {
     pub fn is_sidechain_type(&self) -> bool {
         matches!(
             self,
-            OutputType::ValidatorNodeRegistration | OutputType::CodeTemplateRegistration
+            OutputType::ValidatorNodeRegistration | OutputType::CodeTemplateRegistration | OutputType::Burn
         )
     }
 }
@@ -111,6 +112,8 @@ mod tests {
         assert_eq!(OutputType::from_byte(2), Some(OutputType::Burn));
         assert_eq!(OutputType::from_byte(3), Some(OutputType::ValidatorNodeRegistration));
         assert_eq!(OutputType::from_byte(4), Some(OutputType::CodeTemplateRegistration));
-        assert_eq!(OutputType::from_byte(108), None);
+        for i in 5..=255 {
+            assert_eq!(OutputType::from_byte(i), None);
+        }
     }
 }

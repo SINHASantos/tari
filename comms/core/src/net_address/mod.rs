@@ -23,7 +23,10 @@
 //! Extension types used by the [PeerManager](crate::PeerManager) to keep track of address reliability.
 
 mod multiaddr_with_stats;
-pub use multiaddr_with_stats::MutliaddrWithStats;
+pub use multiaddr_with_stats::{MultiaddrWithStats, PeerAddressSource};
 
 mod mutliaddresses_with_stats;
 pub use mutliaddresses_with_stats::MultiaddressesWithStats;
+
+mod multiaddr_range;
+pub use multiaddr_range::{MultiaddrRange, MultiaddrRangeList, IP4_TCP_TEST_ADDR_RANGE};

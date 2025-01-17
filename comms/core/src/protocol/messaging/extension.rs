@@ -20,23 +20,23 @@
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use tokio::sync::mpsc;
 use tower::Service;
 
 use super::MessagingProtocol;
 use crate::{
-    bounded_executor::{BoundedExecutor, OptionallyBoundedExecutor},
+    bounded_executor::BoundedExecutor,
     message::InboundMessage,
     pipeline,
     protocol::{
-        messaging::{protocol::MESSAGING_PROTOCOL, MessagingEventSender},
+        messaging::MessagingEventSender,
         ProtocolExtension,
         ProtocolExtensionContext,
         ProtocolExtensionError,
+        ProtocolId,
     },
-    runtime::task,
 };
 
 /// Buffer size for inbound messages from _all_ peers. If the message consumer is slow to get through this queue,
@@ -51,11 +51,38 @@ pub const MESSAGING_PROTOCOL_EVENTS_BUFFER_SIZE: usize = 30;
 pub struct MessagingProtocolExtension<TInPipe, TOutPipe, TOutReq> {
     event_tx: MessagingEventSender,
     pipeline: pipeline::Config<TInPipe, TOutPipe, TOutReq>,
+    enable_message_received_event: bool,
+    ban_duration: Duration,
+    protocol_id: ProtocolId,
 }
 
 impl<TInPipe, TOutPipe, TOutReq> MessagingProtocolExtension<TInPipe, TOutPipe, TOutReq> {
-    pub fn new(event_tx: MessagingEventSender, pipeline: pipeline::Config<TInPipe, TOutPipe, TOutReq>) -> Self {
-        Self { event_tx, pipeline }
+    pub fn new(
+        protocol_id: ProtocolId,
+        event_tx: MessagingEventSender,
+        pipeline: pipeline::Config<TInPipe, TOutPipe, TOutReq>,
+    ) -> Self {
+        Self {
+            protocol_id,
+            event_tx,
+            pipeline,
+            enable_message_received_event: false,
+            ban_duration: Duration::from_secs(10 * 60),
+        }
+    }
+
+    /// Enables the MessageReceived event which is disabled by default. This will enable sending the MessageReceived
+    /// event per message received. This is typically used in tests. If unused it should be disabled to reduce memory
+    /// usage (not reading the event from the channel).
+    pub fn enable_message_received_event(mut self) -> Self {
+        self.enable_message_received_event = true;
+        self
+    }
+
+    /// Sets the ban duration for peers that violate protocol. Default is 10 minutes.
+    pub fn with_ban_duration(mut self, ban_duration: Duration) -> Self {
+        self.ban_duration = ban_duration;
+        self
     }
 }
 
@@ -71,39 +98,46 @@ where
 {
     fn install(mut self: Box<Self>, context: &mut ProtocolExtensionContext) -> Result<(), ProtocolExtensionError> {
         let (proto_tx, proto_rx) = mpsc::channel(MESSAGING_PROTOCOL_EVENTS_BUFFER_SIZE);
-        context.add_protocol(&[MESSAGING_PROTOCOL.clone()], &proto_tx);
+        context.add_protocol(&[self.protocol_id.clone()], &proto_tx);
 
         let (inbound_message_tx, inbound_message_rx) = mpsc::channel(INBOUND_MESSAGE_BUFFER_SIZE);
 
         let message_receiver = self.pipeline.outbound.out_receiver.take().unwrap();
         let messaging = MessagingProtocol::new(
+            self.protocol_id.clone(),
             context.connectivity(),
             proto_rx,
             message_receiver,
             self.event_tx,
             inbound_message_tx,
             context.shutdown_signal(),
-        );
+        )
+        .set_message_received_event_enabled(self.enable_message_received_event)
+        .with_ban_duration(self.ban_duration);
 
         context.register_complete_signal(messaging.complete_signal());
 
         // Spawn messaging protocol
-        task::spawn(messaging.run());
+        tokio::spawn(messaging.run());
 
         // Spawn inbound pipeline
-        let bounded_executor = BoundedExecutor::from_current(self.pipeline.max_concurrent_inbound_tasks);
+        let bounded_executor = BoundedExecutor::new(self.pipeline.max_concurrent_inbound_tasks);
         let inbound = pipeline::Inbound::new(
             bounded_executor,
             inbound_message_rx,
             self.pipeline.inbound,
             context.shutdown_signal(),
         );
-        task::spawn(inbound.run());
+        tokio::spawn(inbound.run());
 
-        let executor = OptionallyBoundedExecutor::from_current(self.pipeline.max_concurrent_outbound_tasks);
+        let executor = BoundedExecutor::new(
+            self.pipeline
+                .max_concurrent_outbound_tasks
+                .unwrap_or_else(BoundedExecutor::max_theoretical_tasks),
+        );
         // Spawn outbound pipeline
         let outbound = pipeline::Outbound::new(executor, self.pipeline.outbound);
-        task::spawn(outbound.run());
+        tokio::spawn(outbound.run());
 
         Ok(())
     }

@@ -112,7 +112,7 @@
 //!
 //! * _All_ indices are numbered starting from zero.
 //! * MMR nodes refer to all the nodes in the Merkle Mountain Range and are ordered in the canonical mmr ordering
-//! described above.
+//! * described above.
 //! * Leaf nodes are numbered counting from zero and increment by one each time a leaf is added.
 //!
 //! To illustrate, consider this MMR:
@@ -131,15 +131,17 @@
 //!    0 1  2 3  4 5  6  7  8  9 10 11 12  <-- Leaf node indices
 //!    ----------------------------------
 //! ```
-
 pub type Hash = Vec<u8>;
 pub type HashSlice = [u8];
 
 mod backend;
+mod balanced_binary_merkle_proof;
+mod balanced_binary_merkle_tree;
 mod mem_backend_vec;
 mod merkle_mountain_range;
 mod merkle_proof;
 mod serde_support;
+pub mod sparse_merkle_tree;
 
 // Less commonly used exports
 pub mod common;
@@ -150,6 +152,12 @@ pub mod pruned_hashset;
 // Commonly used exports
 /// A vector-based backend for [MerkleMountainRange]
 pub use backend::{ArrayLike, ArrayLikeExt};
+pub use balanced_binary_merkle_proof::{
+    BalancedBinaryMerkleProof,
+    BalancedBinaryMerkleProofError,
+    MergedBalancedBinaryMerkleProof,
+};
+pub use balanced_binary_merkle_tree::{BalancedBinaryMerkleTree, BalancedBinaryMerkleTreeError};
 /// MemBackendVec is a shareable, memory only, vector that can be be used with MmrCache to store checkpoints.
 pub use mem_backend_vec::MemBackendVec;
 /// An immutable, append-only Merkle Mountain range (MMR) data structure
@@ -157,29 +165,4 @@ pub use merkle_mountain_range::MerkleMountainRange;
 /// A data structure for proving a hash inclusion in an MMR
 pub use merkle_proof::{MerkleProof, MerkleProofError};
 
-macro_rules! if_native_bitmap {
-    ($($item:item)*) => {
-        $(
-            #[cfg(feature = "native_bitmap")]
-            $item
-        )*
-    }
-}
-
-if_native_bitmap! {
-    mod merkle_checkpoint;
-    mod mmr_cache;
-    mod mutable_mmr;
-    mod mutable_mmr_leaf_nodes;
-    pub mod functions;
-
-    /// A Merkle checkpoint contains the set of hash additions and deletion indices.
-    pub use merkle_checkpoint::MerkleCheckPoint;
-    /// The MMR cache is used to calculate Merkle and Merklish roots based on the state of the set of shared
-    /// checkpoints.
-    pub use mmr_cache::{MmrCache, MmrCacheConfig};
-    /// An append-only Merkle Mountain range (MMR) data structure that allows deletion of existing leaf nodes.
-    pub use mutable_mmr::MutableMmr;
-    /// A data structure for storing all the data required to restore the state of an MMR.
-    pub use mutable_mmr_leaf_nodes::MutableMmrLeafNodes;
-}
+pub mod functions;

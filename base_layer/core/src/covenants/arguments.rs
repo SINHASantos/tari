@@ -28,15 +28,12 @@ use std::{
 use borsh::{BorshDeserialize, BorshSerialize};
 use integer_encoding::VarIntWriter;
 use tari_common_types::types::{Commitment, FixedHash, PublicKey};
+use tari_max_size::MaxSizeBytes;
 use tari_script::TariScript;
-use tari_utilities::{
-    hex::{to_hex, Hex},
-    ByteArray,
-};
+use tari_utilities::{hex::Hex, ByteArray};
 
 use super::decoder::CovenantDecodeError;
 use crate::{
-    consensus::MaxSizeBytes,
     covenants::{
         byte_codes,
         covenant::Covenant,
@@ -51,7 +48,10 @@ use crate::{
 const MAX_COVENANT_ARG_SIZE: usize = 4096;
 const MAX_BYTES_ARG_SIZE: usize = 4096;
 
+pub(crate) type BytesArg = MaxSizeBytes<MAX_BYTES_ARG_SIZE>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Covenant arguments
 pub enum CovenantArg {
     Hash(FixedHash),
     PublicKey(PublicKey),
@@ -62,14 +62,16 @@ pub enum CovenantArg {
     Uint(u64),
     OutputField(OutputField),
     OutputFields(OutputFields),
-    Bytes(Vec<u8>),
+    Bytes(BytesArg),
 }
 
 impl CovenantArg {
+    /// Checks if a stream of bytes results in valid argument code
     pub fn is_valid_code(code: u8) -> bool {
         byte_codes::is_valid_arg_code(code)
     }
 
+    /// Reads a `CovenantArg` from a buffer of bytes
     pub fn read_from(reader: &mut &[u8], code: u8) -> Result<Self, CovenantDecodeError> {
         use byte_codes::*;
         match code {
@@ -91,7 +93,6 @@ impl CovenantArg {
                 let buf = reader.read_variable_length_bytes(MAX_COVENANT_ARG_SIZE)?;
                 // Do not use consensus_decoding here because the compiler infinitely recurses to resolve the R generic,
                 // R becomes the reader of this call and so on. This impl has an arg limit anyway and so is safe
-                // TODO: Impose a limit on depth of covenants within covenants
                 let covenant = Covenant::from_bytes(&mut buf.as_bytes())?;
                 Ok(CovenantArg::Covenant(covenant))
             },
@@ -118,14 +119,15 @@ impl CovenantArg {
                 Ok(CovenantArg::OutputFields(fields))
             },
             ARG_BYTES => {
-                let buf = MaxSizeBytes::<MAX_BYTES_ARG_SIZE>::deserialize(reader)?;
-                Ok(CovenantArg::Bytes(buf.into()))
+                let buf = BytesArg::deserialize(reader)?;
+                Ok(CovenantArg::Bytes(buf))
             },
 
             _ => Err(CovenantDecodeError::UnknownArgByteCode { code }),
         }
     }
 
+    /// Parses the `CovenantArg` data to bytes and writes it to an IO writer
     pub fn write_to<W: io::Write>(&self, writer: &mut W) -> Result<(), io::Error> {
         use byte_codes::*;
         #[allow(clippy::enum_glob_use)]
@@ -180,8 +182,17 @@ impl CovenantArg {
     }
 }
 
+/// `require_x_impl!` is a helper macro that generates an implementation of a function with a specific signature
+/// based on the provided input parameters. Functionality:
+/// The macro expects to receive either three or four arguments.
+///     $name, represents the name of the function to be generated.
+///     $output, represents the name of the enum variant that the function will match against.
+///     $expected, represents an expression that will be used in the error message when the provided argument
+///         does not match the expected variant.
+///     (optional) $output_type, represents the type that the function will return. If
+///         not provided, it defaults to the same as $output.
 macro_rules! require_x_impl {
-    ($name:ident, $output:ident, $expected: expr, $output_type:ident) => {
+    ($name:ident, $output:ident, $expected: expr, $output_type:ty) => {
         #[allow(dead_code)]
         pub(super) fn $name(self) -> Result<$output_type, CovenantError> {
             match self {
@@ -215,25 +226,9 @@ impl CovenantArg {
 
     require_x_impl!(require_outputfields, OutputFields, "outputfields");
 
-    pub fn require_bytes(self) -> Result<Vec<u8>, CovenantError> {
-        match self {
-            CovenantArg::Bytes(val) => Ok(val),
-            got => Err(CovenantError::UnexpectedArgument {
-                expected: "bytes",
-                got: got.to_string(),
-            }),
-        }
-    }
+    require_x_impl!(require_bytes, Bytes, "bytes", BytesArg);
 
-    pub fn require_uint(self) -> Result<u64, CovenantError> {
-        match self {
-            CovenantArg::Uint(val) => Ok(val),
-            got => Err(CovenantError::UnexpectedArgument {
-                expected: "uint",
-                got: got.to_string(),
-            }),
-        }
-    }
+    require_x_impl!(require_uint, Uint, "u64", u64);
 }
 
 impl Display for CovenantArg {
@@ -241,7 +236,7 @@ impl Display for CovenantArg {
         #[allow(clippy::enum_glob_use)]
         use CovenantArg::*;
         match self {
-            Hash(hash) => write!(f, "Hash({})", to_hex(&hash[..])),
+            Hash(hash) => write!(f, "Hash({})", hash),
             PublicKey(public_key) => write!(f, "PublicKey({})", public_key.to_hex()),
             Commitment(commitment) => write!(f, "Commitment({})", commitment.to_hex()),
             TariScript(_) => write!(f, "TariScript(...)"),
@@ -285,6 +280,8 @@ mod test {
     }
 
     mod write_to_and_read_from {
+        use std::convert::TryFrom;
+
         use super::*;
 
         fn test_case(argument: CovenantArg, mut data: &[u8]) {
@@ -302,11 +299,11 @@ mod test {
         fn test() {
             test_case(CovenantArg::Uint(2048), &[ARG_UINT, 0, 8, 0, 0, 0, 0, 0, 0][..]);
             test_case(
-                CovenantArg::Covenant(covenant!(identity())),
+                CovenantArg::Covenant(covenant!(identity()).unwrap()),
                 &[ARG_COVENANT, 0x01, 0x20][..],
             );
             test_case(
-                CovenantArg::Bytes(vec![0x01, 0x02, 0xaa]),
+                CovenantArg::Bytes(BytesArg::try_from(vec![0x01, 0x02, 0xaa]).unwrap()),
                 &[ARG_BYTES, 0x03, 0x00, 0x00, 0x00, 0x01, 0x02, 0xaa][..],
             );
             test_case(
@@ -321,7 +318,11 @@ mod test {
                 CovenantArg::Hash(FixedHash::zero()),
                 &from_hex("010000000000000000000000000000000000000000000000000000000000000000").unwrap(),
             );
-            test_case(CovenantArg::TariScript(script!(Nop)), &[ARG_TARI_SCRIPT, 0x01, 0x73]);
+            test_case(CovenantArg::TariScript(script!(Nop).unwrap()), &[
+                ARG_TARI_SCRIPT,
+                0x01,
+                0x73,
+            ]);
             test_case(CovenantArg::OutputField(OutputField::Covenant), &[
                 ARG_OUTPUT_FIELD,
                 FIELD_COVENANT,

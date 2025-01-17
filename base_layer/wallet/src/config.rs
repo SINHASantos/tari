@@ -43,8 +43,6 @@ use crate::{
     transaction_service::config::TransactionServiceConfig,
 };
 
-pub const KEY_MANAGER_COMMS_SECRET_KEY_BRANCH_KEY: &str = "comms";
-
 fn deserialize_safe_password_option<'de, D>(deserializer: D) -> Result<Option<SafePassword>, D::Error>
 where D: serde::Deserializer<'de> {
     let password: Option<String> = Deserialize::deserialize(deserializer)?;
@@ -65,9 +63,6 @@ pub struct WalletConfig {
     pub output_manager_service_config: OutputManagerServiceConfig,
     /// The buffer size for the publish/subscribe connector channel, connecting comms messages to the domain layer
     pub buffer_size: usize,
-    /// The rate limit for the publish/subscribe connector channel, i.e. maximum amount of inbound messages to
-    /// accept - any rate attempting to exceed this limit will be throttled
-    pub buffer_rate_limit: usize,
     /// Selected network
     pub network: Network,
     /// The base_node_service_config config settings
@@ -75,6 +70,8 @@ pub struct WalletConfig {
     pub base_node_service_config: BaseNodeServiceConfig,
     /// The relative path to store persistent data
     pub data_dir: PathBuf,
+    /// The relative path to the config directory
+    pub config_dir: PathBuf,
     /// The main wallet db file
     pub db_file: PathBuf,
     /// The main wallet db sqlite database backend connection pool size for concurrent reads
@@ -94,7 +91,7 @@ pub struct WalletConfig {
     pub command_send_wait_stage: TransactionStage,
     /// Notification script file for a notifier service - allows a wallet to execute a script or program when certain
     /// transaction events are received by the console wallet .
-    /// (see example at 'applications/tari_console_wallet/src/notifier/notify_example.sh')
+    /// (see example at 'applications/minotari_console_wallet/src/notifier/notify_example.sh')
     pub notify_file: Option<PathBuf>,
     /// If true, a GRPC server will bind to the configured address and listen for incoming GRPC requests.
     pub grpc_enabled: bool,
@@ -102,6 +99,8 @@ pub struct WalletConfig {
     pub grpc_address: Option<Multiaddr>,
     /// GRPC authentication mode
     pub grpc_authentication: GrpcAuthentication,
+    /// GRPC tls enabled
+    pub grpc_tls_enabled: bool,
     /// A custom base node peer that will be used to obtain metadata from
     pub custom_base_node: Option<String>,
     /// A list of base node peers that the wallet should use for service requests and tracking chain state
@@ -117,13 +116,18 @@ pub struct WalletConfig {
     pub use_libtor: bool,
     /// A path to the file that stores the base node identity and secret key
     pub identity_file: Option<PathBuf>,
+    /// The cool down period between balance enquiry checks in seconds; requests faster than this will be ignored.
+    /// For specialized wallets processing many batch transactions this setting could be increased to 60 s to retain
+    /// responsiveness of the wallet with slightly delayed balance updates
+    #[serde(with = "serializers::seconds")]
+    pub balance_enquiry_cooldown_period: Duration,
 }
 
 impl Default for WalletConfig {
     fn default() -> Self {
         let p2p = P2pConfig {
             datastore_path: PathBuf::from("peer_db/wallet"),
-            listener_liveness_check_interval: None,
+            listener_self_liveness_check_interval: None,
             ..Default::default()
         };
         Self {
@@ -132,10 +136,10 @@ impl Default for WalletConfig {
             transaction_service_config: Default::default(),
             output_manager_service_config: Default::default(),
             buffer_size: 50_000,
-            buffer_rate_limit: 1_000,
             network: Default::default(),
             base_node_service_config: Default::default(),
             data_dir: PathBuf::from_str("data/wallet").unwrap(),
+            config_dir: PathBuf::from_str("config/wallet").unwrap(),
             db_file: PathBuf::from_str("db/console_wallet.db").unwrap(),
             db_connection_pool_size: 16, // Note: Do not reduce this default number
             password: None,
@@ -147,13 +151,15 @@ impl Default for WalletConfig {
             grpc_enabled: false,
             grpc_address: None,
             grpc_authentication: GrpcAuthentication::default(),
+            grpc_tls_enabled: false,
             custom_base_node: None,
             base_node_service_peers: StringList::default(),
             recovery_retry_limit: 3,
             fee_per_gram: 5,
             num_required_confirmations: 3,
-            use_libtor: false,
+            use_libtor: true,
             identity_file: None,
+            balance_enquiry_cooldown_period: Duration::from_secs(5),
         }
     }
 }
@@ -168,6 +174,9 @@ impl WalletConfig {
     pub fn set_base_path<P: AsRef<Path>>(&mut self, base_path: P) {
         if !self.data_dir.is_absolute() {
             self.data_dir = base_path.as_ref().join(self.data_dir.as_path());
+        }
+        if !self.config_dir.is_absolute() {
+            self.config_dir = base_path.as_ref().join(self.config_dir.as_path());
         }
         if !self.db_file.is_absolute() {
             self.db_file = self.data_dir.join(self.db_file.as_path());

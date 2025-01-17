@@ -33,7 +33,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Insertable, Default)]
-#[table_name = "stored_messages"]
+#[diesel(table_name = stored_messages)]
 pub struct NewStoredMessage {
     pub version: i32,
     pub origin_pubkey: Option<String>,
@@ -48,6 +48,9 @@ pub struct NewStoredMessage {
 }
 
 impl NewStoredMessage {
+    // converting u32 to i32 is okay here as it will get converted back, and is super unlikely to ever reach u32 as a
+    // version.
+    #[allow(clippy::cast_possible_wrap)]
     pub fn new(message: DecryptedDhtMessage, priority: StoredMessagePriority) -> Self {
         let DecryptedDhtMessage {
             authenticated_origin,

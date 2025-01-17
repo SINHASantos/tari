@@ -50,19 +50,19 @@ use super::{
     ConnectionManagerConfig,
     ConnectionManagerEvent,
 };
+#[cfg(feature = "metrics")]
+use crate::connection_manager::metrics;
 use crate::{
     bounded_executor::BoundedExecutor,
     connection_manager::{
-        liveness::LivenessSession,
-        metrics,
+        self_liveness::SelfLivenessSession,
         wire_mode::{WireMode, LIVENESS_WIRE_MODE},
     },
     multiaddr::Multiaddr,
     multiplexing::Yamux,
     noise::NoiseConfig,
-    peer_manager::{NodeIdentity, PeerFeatures},
+    peer_manager::NodeIdentity,
     protocol::ProtocolId,
-    runtime,
     transports::Transport,
     utils::multiaddr::multiaddr_to_socketaddr,
     PeerManager,
@@ -81,7 +81,7 @@ pub struct PeerListener<TTransport> {
     noise_config: NoiseConfig,
     peer_manager: Arc<PeerManager>,
     node_identity: Arc<NodeIdentity>,
-    our_supported_protocols: Vec<ProtocolId>,
+    our_supported_protocols: Arc<Vec<ProtocolId>>,
     liveness_session_count: Arc<AtomicUsize>,
     on_listening: OneshotTrigger<Result<Multiaddr, ConnectionManagerError>>,
 }
@@ -89,7 +89,7 @@ pub struct PeerListener<TTransport> {
 impl<TTransport> PeerListener<TTransport>
 where
     TTransport: Transport + Clone + Send + Sync + 'static,
-    TTransport::Output: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    TTransport::Output: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
     pub fn new(
         config: ConnectionManagerConfig,
@@ -109,8 +109,8 @@ where
             peer_manager,
             node_identity,
             shutdown_signal,
-            our_supported_protocols: Vec::new(),
-            bounded_executor: BoundedExecutor::from_current(config.max_simultaneous_inbound_connects),
+            our_supported_protocols: Arc::new(Vec::new()),
+            bounded_executor: BoundedExecutor::new(config.max_simultaneous_inbound_connects),
             liveness_session_count: Arc::new(AtomicUsize::new(config.liveness_max_sessions)),
             config,
             on_listening: oneshot_trigger::channel(),
@@ -128,13 +128,13 @@ where
 
     /// Set the supported protocols of this node to send to peers during the peer identity exchange
     pub fn set_supported_protocols(&mut self, our_supported_protocols: Vec<ProtocolId>) -> &mut Self {
-        self.our_supported_protocols = our_supported_protocols;
+        self.our_supported_protocols = Arc::new(our_supported_protocols);
         self
     }
 
     pub async fn listen(self) -> Result<Multiaddr, ConnectionManagerError> {
         let on_listening = self.on_listening();
-        runtime::current().spawn(self.run());
+        tokio::spawn(self.run());
         on_listening.await
     }
 
@@ -221,9 +221,9 @@ where
         shutdown_signal: ShutdownSignal,
     ) {
         permit.fetch_sub(1, Ordering::SeqCst);
-        let liveness = LivenessSession::new(socket);
+        let liveness = SelfLivenessSession::new(socket);
         debug!(target: LOG_TARGET, "Started liveness session");
-        runtime::current().spawn(async move {
+        tokio::spawn(async move {
             future::select(liveness.run(), shutdown_signal).await;
             permit.fetch_add(1, Ordering::SeqCst);
         });
@@ -241,13 +241,14 @@ where
 
         let span = span!(Level::TRACE, "connection_mann::listener::inbound_task",);
         let inbound_fut = async move {
+            #[cfg(feature = "metrics")]
             metrics::pending_connections(None, ConnectionDirection::Inbound).inc();
             match Self::read_wire_format(&mut socket, config.time_to_first_byte).await {
-                Ok(WireMode::Comms(byte)) if byte == config.network_info.network_byte => {
+                Ok(WireMode::Comms(byte)) if byte == config.network_info.network_wire_byte => {
                     let this_node_id_str = node_identity.node_id().short_str();
                     let result = Self::perform_socket_upgrade_procedure(
-                        node_identity,
-                        peer_manager,
+                        &node_identity,
+                        &peer_manager,
                         noise_config.clone(),
                         conn_man_notifier.clone(),
                         socket,
@@ -262,7 +263,7 @@ where
                             log_if_error!(
                                 target: LOG_TARGET,
                                 conn_man_notifier
-                                    .send(ConnectionManagerEvent::PeerConnected(peer_conn))
+                                    .send(ConnectionManagerEvent::PeerConnected(peer_conn.into()))
                                     .await,
                                 "Failed to publish event because '{error}'",
                             );
@@ -289,13 +290,13 @@ where
                         target: LOG_TARGET,
                         "Peer at address '{}' sent invalid wire format byte. Expected {:x?} got: {:x?} ",
                         peer_addr,
-                        config.network_info.network_byte,
+                        config.network_info.network_wire_byte,
                         byte,
                     );
                     let _result = socket.shutdown().await;
                 },
                 Ok(WireMode::Liveness) => {
-                    if config.liveness_self_check_interval.is_some() ||
+                    if config.self_liveness_self_check_interval.is_some() ||
                         (liveness_session_count.load(Ordering::SeqCst) > 0 &&
                             Self::is_address_in_liveness_cidr_range(&peer_addr, &config.liveness_cidr_allowlist))
                     {
@@ -319,13 +320,14 @@ where
                         "Peer at address '{}' failed to send its wire format. Expected network byte {:x?} or liveness \
                          byte {:x?} not received. Error: {}",
                         peer_addr,
-                        config.network_info.network_byte,
+                        config.network_info.network_wire_byte,
                         LIVENESS_WIRE_MODE,
                         err
                     );
                 },
             }
 
+            #[cfg(feature = "metrics")]
             metrics::pending_connections(None, ConnectionDirection::Inbound).dec();
         }
         .instrument(span);
@@ -336,95 +338,101 @@ where
     }
 
     async fn perform_socket_upgrade_procedure(
-        node_identity: Arc<NodeIdentity>,
-        peer_manager: Arc<PeerManager>,
+        node_identity: &NodeIdentity,
+        peer_manager: &PeerManager,
         noise_config: NoiseConfig,
         conn_man_notifier: mpsc::Sender<ConnectionManagerEvent>,
         socket: TTransport::Output,
         peer_addr: Multiaddr,
-        our_supported_protocols: Vec<ProtocolId>,
+        our_supported_protocols: Arc<Vec<ProtocolId>>,
         config: &ConnectionManagerConfig,
     ) -> Result<PeerConnection, ConnectionManagerError> {
-        static CONNECTION_DIRECTION: ConnectionDirection = ConnectionDirection::Inbound;
-        debug!(
+        const CONNECTION_DIRECTION: ConnectionDirection = ConnectionDirection::Inbound;
+        trace!(
             target: LOG_TARGET,
-            "Starting noise protocol upgrade for peer at address '{}'", peer_addr
+            "Listen - starting noise protocol upgrade for peer at address '{}'", peer_addr
         );
 
         let timer = Instant::now();
-        let mut noise_socket = time::timeout(
-            Duration::from_secs(30),
-            noise_config.upgrade_socket(socket, CONNECTION_DIRECTION),
-        )
-        .await
-        .map_err(|_| ConnectionManagerError::NoiseProtocolTimeout)??;
+        let mut noise_socket = noise_config
+            .upgrade_socket(socket, CONNECTION_DIRECTION)
+            .await
+            .map_err(|err| {
+                warn!(
+                    target: LOG_TARGET,
+                    "Listen - failed to upgrade noise: {} on address: {} ({})",
+                    node_identity.node_id(),
+                    peer_addr,
+                    err
+                );
+                err
+            })?;
 
         let authenticated_public_key = noise_socket
             .get_remote_public_key()
             .ok_or(ConnectionManagerError::InvalidStaticPublicKey)?;
+        let latency = timer.elapsed();
 
-        debug!(
+        trace!(
             target: LOG_TARGET,
-            "Noise socket upgrade completed in {:.2?} with public key '{}'",
-            timer.elapsed(),
+            "Listen - noise socket upgrade completed in {:.2?} with public key '{}'",
+            latency,
             authenticated_public_key
         );
 
         // Check if we know the peer and if it is banned
-        let known_peer = common::find_unbanned_peer(&peer_manager, &authenticated_public_key).await?;
+        let known_peer = common::find_unbanned_peer(peer_manager, &authenticated_public_key).await?;
 
-        debug!(
+        trace!(
             target: LOG_TARGET,
-            "Starting peer identity exchange for peer with public key '{}'", authenticated_public_key
+            "Listen - starting peer identity exchange for peer with public key '{}'",
+            authenticated_public_key
         );
 
-        let peer_identity = common::perform_identity_exchange(
+        let peer_identity_result = common::perform_identity_exchange(
             &mut noise_socket,
-            &node_identity,
-            &our_supported_protocols,
+            node_identity,
+            &*our_supported_protocols,
             config.network_info.clone(),
         )
-        .await?;
+        .await;
 
-        let features = PeerFeatures::from_bits_truncate(peer_identity.features);
-        debug!(
-            target: LOG_TARGET,
-            "Peer identity exchange succeeded on Inbound connection for peer '{}' (Features = {:?})",
-            authenticated_public_key,
-            features
+        let peer_identity =
+            common::ban_on_offence(peer_manager, &authenticated_public_key, peer_identity_result).await?;
+
+        let valid_peer_identity_result = common::validate_peer_identity_message(
+            &config.peer_validation_config,
+            &authenticated_public_key,
+            peer_identity,
         );
-        trace!(target: LOG_TARGET, "{:?}", peer_identity);
 
-        let (peer_node_id, their_supported_protocols) = common::validate_and_add_peer_from_peer_identity(
-            &peer_manager,
+        let valid_peer_identity =
+            common::ban_on_offence(peer_manager, &authenticated_public_key, valid_peer_identity_result).await?;
+
+        let peer = common::create_or_update_peer_from_validated_peer_identity(
             known_peer,
             authenticated_public_key,
-            peer_identity,
-            None,
-            config.allow_test_addresses,
-        )
-        .await?;
-
-        debug!(
-            target: LOG_TARGET,
-            "[ThisNode={}] Peer '{}' added to peer list.",
-            node_identity.node_id().short_str(),
-            peer_node_id.short_str()
+            &valid_peer_identity,
+            latency,
         );
 
         let muxer = Yamux::upgrade_connection(noise_socket, CONNECTION_DIRECTION)
             .map_err(|err| ConnectionManagerError::YamuxUpgradeFailure(err.to_string()))?;
 
-        peer_connection::create(
+        let conn = peer_connection::create(
             muxer,
             peer_addr,
-            peer_node_id,
-            features,
+            peer.node_id.clone(),
+            peer.features,
             CONNECTION_DIRECTION,
             conn_man_notifier,
             our_supported_protocols,
-            their_supported_protocols,
-        )
+            valid_peer_identity.metadata.supported_protocols,
+        );
+
+        peer_manager.add_peer(peer).await?;
+
+        Ok(conn)
     }
 
     async fn bind(&mut self) -> Result<(TTransport::Listener, Multiaddr), ConnectionManagerError> {

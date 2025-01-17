@@ -86,7 +86,7 @@ impl TransportConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum TransportType {
     /// Memory transport. Supports a single address type in the form '/memory/x' and can only communicate in-process.
@@ -144,11 +144,14 @@ pub struct TorTransportConfig {
     /// When these peer addresses are encountered when dialing another peer, the tor proxy is bypassed and the
     /// connection is made directly over TCP. /ip4, /ip6, /dns, /dns4 and /dns6 are supported.
     pub proxy_bypass_addresses: Vec<Multiaddr>,
-    /// When set to true, outbound TCP connections bypass the tor proxy. Defaults to false for better privacy, setting
-    /// to true may improve network performance for TCP nodes.
+    /// When set to true, outbound TCP connections bypass the tor proxy. Defaults to 'true' for better network
+    /// performance for TCP nodes; set it to 'false' for better privacy.
     pub proxy_bypass_for_outbound_tcp: bool,
-    /// If set, instructs tor to forward traffic the the provided address.
+    /// If set, instructs tor to forward traffic the provided address. Otherwise, an OS-assigned port on 127.0.0.1
+    /// is used.
     pub forward_address: Option<Multiaddr>,
+    /// If set, the listener will bind to this address instead of the forward_address.
+    pub listener_address_override: Option<Multiaddr>,
     /// The tor identity to use to create the hidden service. If None, a new one will be generated.
     #[serde(skip)]
     pub identity: Option<TorIdentity>,
@@ -193,8 +196,9 @@ impl Default for TorTransportConfig {
             control_auth: TorControlAuthentication::Auto,
             onion_port: NonZeroU16::new(18141).unwrap(),
             proxy_bypass_addresses: vec![],
-            proxy_bypass_for_outbound_tcp: false,
+            proxy_bypass_for_outbound_tcp: true,
             forward_address: None,
+            listener_address_override: None,
             identity: None,
         }
     }

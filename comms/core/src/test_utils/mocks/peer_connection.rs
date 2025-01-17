@@ -20,9 +20,12 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
+use std::{
+    str::FromStr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use tokio::{
@@ -41,7 +44,7 @@ use crate::{
     },
     multiaddr::Multiaddr,
     multiplexing,
-    multiplexing::{IncomingSubstreams, Substream, Yamux},
+    multiplexing::{IncomingSubstreams, Substream, Yamux, YamuxControlError},
     peer_manager::{NodeId, Peer, PeerFeatures},
     test_utils::{node_identity::build_node_identity, transport},
     utils::atomic_ref_counter::AtomicRefCounter,
@@ -51,13 +54,14 @@ static ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub fn create_dummy_peer_connection(node_id: NodeId) -> (PeerConnection, mpsc::Receiver<PeerConnectionRequest>) {
     let (tx, rx) = mpsc::channel(1);
+    let addr = Multiaddr::from_str("/ip4/23.23.23.23/tcp/80").unwrap();
     (
         PeerConnection::new(
             1,
             tx,
             node_id,
             PeerFeatures::COMMUNICATION_NODE,
-            Multiaddr::empty(),
+            addr,
             ConnectionDirection::Inbound,
             AtomicRefCounter::new(),
         ),
@@ -90,7 +94,7 @@ pub async fn create_peer_connection_mock_pair(
     (
         PeerConnection::new(
             // ID must be unique since it is used for connection equivalency, so we re-implement this in the mock
-            ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ID_COUNTER.fetch_add(1, Ordering::SeqCst),
             tx1,
             peer2.node_id,
             peer2.features,
@@ -100,7 +104,7 @@ pub async fn create_peer_connection_mock_pair(
         ),
         mock_state_in,
         PeerConnection::new(
-            ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ID_COUNTER.fetch_add(1, Ordering::SeqCst),
             tx2,
             peer1.node_id,
             peer1.features,
@@ -134,7 +138,7 @@ pub struct PeerConnectionMockState {
 impl PeerConnectionMockState {
     pub fn new(muxer: Yamux) -> Self {
         let control = muxer.get_yamux_control();
-        let substream_counter = control.substream_counter();
+        let substream_counter = muxer.substream_counter();
         Self {
             call_count: Arc::new(AtomicUsize::new(0)),
             mux_control: Arc::new(Mutex::new(control)),
@@ -168,7 +172,12 @@ impl PeerConnectionMockState {
     }
 
     pub async fn disconnect(&self) -> Result<(), PeerConnectionError> {
-        self.mux_control.lock().await.close().await.map_err(Into::into)
+        match self.mux_control.lock().await.close().await {
+            // Match the behaviour of the real PeerConnection.
+            Err(YamuxControlError::ConnectionClosed) => Ok(()),
+            Err(_err) => Ok(()), // Err(err.into()),
+            Ok(_) => Ok(()),
+        }
     }
 }
 
@@ -211,7 +220,7 @@ impl PeerConnectionMock {
                     reply_tx.send(Err(err)).unwrap();
                 },
             },
-            Disconnect(_, reply_tx) => {
+            Disconnect(_, reply_tx, _minimized) => {
                 self.receiver.close();
                 reply_tx.send(self.state.disconnect().await).unwrap();
             },

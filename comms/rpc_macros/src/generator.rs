@@ -164,7 +164,7 @@ impl RpcCodeGenerator {
                 let method_num = m.method_num;
                 let request_type = &m.request_type;
                 let result_type = &m.return_type;
-                let is_unit = m.request_type.as_ref().filter(|ty| is_unit_type(*ty)).is_some();
+                let is_unit = m.request_type.as_ref().filter(|ty| is_unit_type(ty)).is_some();
 
                 let var = if is_unit { quote!(()) } else { quote!(request) };
 
@@ -198,7 +198,7 @@ impl RpcCodeGenerator {
             pub async fn connect<TSubstream>(framed: #dep_mod::CanonicalFraming<TSubstream>) -> Result<Self, #dep_mod::RpcError>
               where TSubstream: #dep_mod::AsyncRead + #dep_mod::AsyncWrite + Unpin + Send + #dep_mod::StreamId + 'static {
                 use #dep_mod::NamedProtocolService;
-                let inner = #dep_mod::RpcClient::connect(Default::default(), Default::default(), framed, Self::PROTOCOL_NAME.into()).await?;
+                let inner = #dep_mod::RpcClient::connect(Default::default(), Default::default(), framed, Self::PROTOCOL_NAME.into(), None).await?;
                 Ok(Self { inner })
             }
 

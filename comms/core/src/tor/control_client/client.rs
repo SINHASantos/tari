@@ -60,8 +60,7 @@ impl TorControlPortClient {
         addr: Multiaddr,
         event_tx: broadcast::Sender<TorControlEvent>,
     ) -> Result<Self, TorClientError> {
-        let mut tcp = TcpTransport::new();
-        tcp.set_nodelay(true);
+        let tcp = TcpTransport::new();
         let socket = tcp.dial(&addr).await?;
         Ok(Self::new(socket, event_tx))
     }
@@ -126,9 +125,6 @@ impl TorControlPortClient {
     pub async fn get_info(&mut self, key_name: &'static str) -> Result<Vec<Cow<'_, str>>, TorClientError> {
         let command = commands::get_info(key_name);
         let response = self.request_response(command).await?;
-        if response.is_empty() {
-            return Err(TorClientError::ServerNoResponse);
-        }
         Ok(response)
     }
 
@@ -203,7 +199,6 @@ impl TorControlPortClient {
         let cmd_str = command.to_command_string().map_err(Into::into)?;
         self.send_line(cmd_str).await?;
         let responses = self.recv_next_responses().await?;
-        trace!(target: LOG_TARGET, "Response from tor: {:?}", responses);
         if responses.is_empty() {
             return Err(TorClientError::ServerNoResponse);
         }
@@ -248,23 +243,18 @@ impl TorControlPortClient {
 }
 
 /// Represents tor control port authentication mechanisms
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Authentication {
     /// Attempt to configure authentication automatically. This only works for no auth, or cookie auth.
     /// The cookie must be readable by the current process user.
     Auto,
     /// No control port authentication required
+    #[default]
     None,
     /// A hashed password will be sent to authenticate
     HashedPassword(String),
     /// Cookie authentication. The contents of the cookie file encoded as hex
     Cookie(String),
-}
-
-impl Default for Authentication {
-    fn default() -> Self {
-        Authentication::None
-    }
 }
 
 impl fmt::Display for Authentication {
@@ -289,10 +279,7 @@ mod test {
     use tokio_stream::StreamExt;
 
     use super::*;
-    use crate::{
-        runtime,
-        tor::control_client::{test_server, test_server::canned_responses, types::PrivateKey},
-    };
+    use crate::tor::control_client::{test_server, test_server::canned_responses};
 
     async fn setup_test() -> (TorControlPortClient, test_server::State) {
         let (_, mock_state, socket) = test_server::spawn().await;
@@ -301,7 +288,7 @@ mod test {
         (tor, mock_state)
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn connect() {
         let (mut listener, addr) = TcpTransport::default()
             .listen(&"/ip4/127.0.0.1/tcp/0".parse().unwrap())
@@ -318,7 +305,7 @@ mod test {
         in_sock.shutdown().await.unwrap();
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn authenticate() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -342,7 +329,7 @@ mod test {
         assert_eq!(req.remove(0), "AUTHENTICATE NOTACTUALLYHEXENCODED");
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn get_conf_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -357,7 +344,7 @@ mod test {
         assert_eq!(results[2], "8082 127.0.0.1:9001");
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn get_conf_err() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -367,7 +354,7 @@ mod test {
         unpack_enum!(TorClientError::TorCommandFailed(_s) = err);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn get_info_multiline_kv_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -379,7 +366,7 @@ mod test {
         assert_eq!(values, &["127.0.0.1:9050", "unix:/run/tor/socks"]);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn get_info_kv_multiline_value_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -394,7 +381,7 @@ mod test {
         ]);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn get_info_err() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -404,7 +391,7 @@ mod test {
         unpack_enum!(TorClientError::TorCommandFailed(_s) = err);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn add_onion_from_private_key_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -425,7 +412,7 @@ mod test {
         assert_eq!(request, "ADD_ONION RSA1024:dummy-key Port=8080,127.0.0.1:8080");
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn add_onion_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -457,7 +444,7 @@ mod test {
         assert_eq!(request, "ADD_ONION NEW:BEST NumStreams=10 Port=8080,127.0.0.1:8080");
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn add_onion_discard_pk_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -496,7 +483,7 @@ mod test {
         );
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn add_onion_err() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -510,7 +497,7 @@ mod test {
         unpack_enum!(TorClientError::TorCommandFailed(_s) = err);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn del_onion_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -522,7 +509,7 @@ mod test {
         assert_eq!(request, "DEL_ONION some-fake-id");
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn del_onion_err() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -534,7 +521,7 @@ mod test {
         assert_eq!(request, "DEL_ONION some-fake-id");
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn protocol_info_cookie_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -555,7 +542,7 @@ mod test {
         );
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn protocol_info_no_auth_ok() {
         let (mut tor, mock_state) = setup_test().await;
 
@@ -573,7 +560,7 @@ mod test {
         assert_eq!(info.auth_methods.cookie_file, None);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn protocol_info_err() {
         let (mut tor, mock_state) = setup_test().await;
 

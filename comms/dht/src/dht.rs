@@ -95,7 +95,7 @@ pub struct Dht {
     dht_sender: mpsc::Sender<DhtRequest>,
     /// Sender for SAF requests
     saf_sender: mpsc::Sender<StoreAndForwardRequest>,
-    /// Sender for SAF repsonse signals
+    /// Sender for SAF response signals
     saf_response_signal_sender: mpsc::Sender<()>,
     /// Sender for DHT discovery requests
     discovery_sender: mpsc::Sender<DhtDiscoveryRequest>,
@@ -197,6 +197,7 @@ impl Dht {
             self.config.clone(),
             Arc::clone(&self.node_identity),
             Arc::clone(&self.peer_manager),
+            self.dht_requester(),
             self.outbound_requester(),
             request_receiver,
             shutdown_signal,
@@ -321,6 +322,7 @@ impl Dht {
                 self.store_and_forward_requester(),
             ))
             .layer(ForwardLayer::new(
+                self.dht_requester(),
                 self.outbound_requester(),
                 self.node_identity.features().contains(PeerFeatures::DHT_STORE_FORWARD),
             ))
@@ -336,6 +338,7 @@ impl Dht {
                 self.config.clone(),
                 self.node_identity.clone(),
                 self.peer_manager.clone(),
+                self.dht_requester(),
                 self.discovery_service_requester(),
                 self.outbound_requester(),
             ))
@@ -389,7 +392,6 @@ impl Dht {
 
             match msg.dht_header.message_type {
                 DhtMessageType::SafRequestMessages => {
-                    // TODO: #banheuristic This is an indication of node misbehaviour
                     warn!(
                         "Received store and forward message from PublicKey={}. Store and forward feature is not \
                          supported by this node. Discarding message.",
@@ -450,26 +452,23 @@ fn discard_expired_messages(msg: &DhtInboundMessage) -> bool {
 
 #[cfg(test)]
 mod test {
-    use std::{sync::Arc, time::Duration};
+    use std::time::Duration;
 
     use tari_comms::{
         message::{MessageExt, MessageTag},
         pipeline::SinkService,
-        runtime,
         test_utils::mocks::create_connectivity_mock,
         types::CommsDHKE,
         wrap_in_envelope_body,
     };
     use tari_shutdown::Shutdown;
-    use tokio::{sync::mpsc, task, time};
-    use tower::{layer::Layer, Service};
+    use tokio::{task, time};
 
     use super::*;
     use crate::{
         crypt,
         envelope::DhtMessageFlags,
         outbound::mock::create_outbound_service_mock,
-        proto::envelope::DhtMessageType,
         test_utils::{
             build_peer_manager,
             make_client_identity,
@@ -480,8 +479,8 @@ mod test {
         },
     };
 
-    #[runtime::test]
-    async fn stack_unencrypted() {
+    #[tokio::test]
+    async fn test_stack_unencrypted() {
         let node_identity = make_node_identity();
         let peer_manager = build_peer_manager();
         let (connectivity, _) = create_connectivity_mock();
@@ -509,6 +508,7 @@ mod test {
         let mut service = dht.inbound_middleware_layer().layer(SinkService::new(out_tx));
 
         let msg = wrap_in_envelope_body!(b"secret".to_vec());
+        // Don't encrypt
         let dht_envelope = make_dht_envelope(
             &node_identity,
             &msg,
@@ -532,8 +532,8 @@ mod test {
         assert_eq!(msg, b"secret");
     }
 
-    #[runtime::test]
-    async fn stack_encrypted() {
+    #[tokio::test]
+    async fn test_stack_encrypted() {
         let node_identity = make_node_identity();
         let peer_manager = build_peer_manager();
         let (connectivity, _) = create_connectivity_mock();
@@ -541,10 +541,11 @@ mod test {
         peer_manager.add_peer(node_identity.to_peer()).await.unwrap();
 
         // Dummy out channel, we are not testing outbound here.
-        let (out_tx, _out_rx) = mpsc::channel(10);
+        let (out_tx, _) = mpsc::channel(10);
 
         let shutdown = Shutdown::new();
         let dht = Dht::builder()
+            .local_test()
             .with_outbound_sender(out_tx)
             .build(
                 Arc::clone(&node_identity),
@@ -585,8 +586,8 @@ mod test {
         assert_eq!(msg, b"secret");
     }
 
-    #[runtime::test]
-    async fn stack_forward() {
+    #[tokio::test]
+    async fn test_stack_forward() {
         let node_identity = make_node_identity();
         let peer_manager = build_peer_manager();
         let shutdown = Shutdown::new();
@@ -620,7 +621,7 @@ mod test {
         let ecdh_key = CommsDHKE::new(node_identity2.secret_key(), node_identity2.public_key());
         let key_message = crypt::generate_key_message(&ecdh_key);
         let mut encrypted_bytes = msg.encode_into_bytes_mut();
-        crypt::encrypt(&key_message, &mut encrypted_bytes).unwrap();
+        crypt::encrypt_message(&key_message, &mut encrypted_bytes, b"test associated data").unwrap();
         let dht_envelope = make_dht_envelope(
             &node_identity2,
             &encrypted_bytes.to_vec(),
@@ -650,8 +651,8 @@ mod test {
         assert_eq!(spy.call_count(), 0);
     }
 
-    #[runtime::test]
-    async fn stack_filter_saf_message() {
+    #[tokio::test]
+    async fn test_stack_filter_saf_message() {
         let node_identity = make_client_identity();
         let peer_manager = build_peer_manager();
         let (connectivity, _) = create_connectivity_mock();

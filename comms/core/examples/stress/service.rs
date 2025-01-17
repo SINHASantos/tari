@@ -63,10 +63,9 @@ pub fn start_service(
     let (request_tx, request_rx) = mpsc::channel(1);
 
     println!(
-        "Node credentials are {}::{} (local_listening_addr='{}')",
+        "Node credentials are {}::{:?})",
         node_identity.public_key().to_hex(),
-        node_identity.public_address(),
-        comms_node.listening_address(),
+        node_identity.public_addresses(),
     );
 
     let service = StressTestService::new(
@@ -474,7 +473,6 @@ async fn messaging_flood(
         while let Some(msg) = inbound_rx.recv().await {
             let msg_id = decode_msg(&msg.body);
             if msgs.len() == protocol.num_messages as usize {
-                // msg_id == 0 {
                 break;
             }
             msgs.push(msg_id);

@@ -19,36 +19,29 @@
 //  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
 //  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
 use std::{
     collections::HashMap,
+    convert::TryFrom,
     fs,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
-use croaring::Bitmap;
 use tari_common::configuration::Network;
 use tari_common_types::{
     chain_metadata::ChainMetadata,
-    types::{Commitment, HashOutput, PublicKey, Signature},
+    tari_address::TariAddress,
+    types::{Commitment, FixedHash, HashOutput, PublicKey, Signature},
 };
+use tari_mmr::sparse_merkle_tree::{NodeKey, ValueHash};
 use tari_storage::lmdb_store::LMDBConfig;
 use tari_test_utils::paths::create_temporary_data_path;
+use tari_utilities::ByteArray;
 
 use super::{create_block, mine_to_difficulty};
 use crate::{
-    blocks::{
-        genesis_block::get_genesis_block,
-        Block,
-        BlockAccumulatedData,
-        BlockHeader,
-        BlockHeaderAccumulatedData,
-        ChainBlock,
-        ChainHeader,
-        DeletedBitmap,
-    },
+    blocks::{Block, BlockAccumulatedData, BlockHeader, BlockHeaderAccumulatedData, ChainBlock, ChainHeader},
     chain_storage::{
         create_lmdb_database,
         BlockAddResult,
@@ -62,26 +55,34 @@ use crate::{
         DbTransaction,
         DbValue,
         HorizonData,
+        InputMinedInfo,
         LMDBDatabase,
         MmrTree,
-        PrunedOutput,
+        OutputMinedInfo,
         Reorg,
         TemplateRegistrationEntry,
-        UtxoMinedInfo,
         Validators,
     },
     consensus::{chain_strength_comparer::ChainStrengthComparerBuilder, ConsensusConstantsBuilder, ConsensusManager},
     proof_of_work::{AchievedTargetDifficulty, Difficulty, PowAlgorithm},
-    test_helpers::{block_spec::BlockSpecs, create_consensus_rules, BlockSpec},
+    test_helpers::{block_spec::BlockSpecs, create_consensus_rules, default_coinbase_entities, BlockSpec},
     transactions::{
-        transaction_components::{TransactionInput, TransactionKernel, UnblindedOutput},
+        key_manager::{create_memory_db_key_manager, MemoryDbKeyManager, TariKeyId},
+        transaction_components::{
+            RangeProofType,
+            TransactionInput,
+            TransactionKernel,
+            TransactionOutput,
+            WalletOutput,
+        },
         CryptoFactories,
     },
     validation::{
-        block_validators::{BodyOnlyValidator, OrphanBlockValidator},
+        block_body::{BlockBodyFullValidator, BlockBodyInternalConsistencyValidator},
         mocks::MockValidator,
         DifficultyCalculator,
     },
+    OutputSmt,
 };
 
 /// Create a new blockchain database containing the genesis block
@@ -91,12 +92,11 @@ pub fn create_new_blockchain() -> BlockchainDatabase<TempDatabase> {
 
 pub fn create_new_blockchain_with_network(network: Network) -> BlockchainDatabase<TempDatabase> {
     let consensus_constants = ConsensusConstantsBuilder::new(network).build();
-    let genesis = get_genesis_block(network);
     let consensus_manager = ConsensusManager::builder(network)
         .add_consensus_constants(consensus_constants)
-        .with_block(genesis)
         .on_ties(ChainStrengthComparerBuilder::new().by_height().build())
-        .build();
+        .build()
+        .unwrap();
     create_custom_blockchain(consensus_manager)
 }
 
@@ -107,28 +107,32 @@ pub fn create_custom_blockchain(rules: ConsensusManager) -> BlockchainDatabase<T
         MockValidator::new(true),
         MockValidator::new(true),
     );
-    create_store_with_consensus_and_validators(rules, validators)
+    let smt = Arc::new(RwLock::new(OutputSmt::new()));
+    create_store_with_consensus_and_validators(rules, validators, smt)
 }
 
 pub fn create_store_with_consensus_and_validators(
     rules: ConsensusManager,
     validators: Validators<TempDatabase>,
+    smt: Arc<RwLock<OutputSmt>>,
 ) -> BlockchainDatabase<TempDatabase> {
-    create_store_with_consensus_and_validators_and_config(rules, validators, BlockchainDatabaseConfig::default())
+    create_store_with_consensus_and_validators_and_config(rules, validators, BlockchainDatabaseConfig::default(), smt)
 }
 
 pub fn create_store_with_consensus_and_validators_and_config(
     rules: ConsensusManager,
     validators: Validators<TempDatabase>,
     config: BlockchainDatabaseConfig,
+    smt: Arc<RwLock<OutputSmt>>,
 ) -> BlockchainDatabase<TempDatabase> {
     let backend = create_test_db();
-    BlockchainDatabase::new(
+    BlockchainDatabase::start_new(
         backend,
         rules.clone(),
         validators,
         config,
         DifficultyCalculator::new(rules, Default::default()),
+        smt,
     )
     .unwrap()
 }
@@ -136,11 +140,12 @@ pub fn create_store_with_consensus_and_validators_and_config(
 pub fn create_store_with_consensus(rules: ConsensusManager) -> BlockchainDatabase<TempDatabase> {
     let factories = CryptoFactories::default();
     let validators = Validators::new(
-        BodyOnlyValidator::new(rules.clone()),
+        BlockBodyFullValidator::new(rules.clone(), true),
         MockValidator::new(true),
-        OrphanBlockValidator::new(rules.clone(), false, factories),
+        BlockBodyInternalConsistencyValidator::new(rules.clone(), false, factories),
     );
-    create_store_with_consensus_and_validators(rules, validators)
+    let smt = Arc::new(RwLock::new(OutputSmt::new()));
+    create_store_with_consensus_and_validators(rules, validators, smt)
 }
 pub fn create_test_blockchain_db() -> BlockchainDatabase<TempDatabase> {
     let rules = create_consensus_rules();
@@ -163,7 +168,7 @@ impl TempDatabase {
         let rules = create_consensus_rules();
 
         Self {
-            db: Some(create_lmdb_database(&temp_path, LMDBConfig::default(), rules).unwrap()),
+            db: Some(create_lmdb_database(&temp_path, LMDBConfig::default(), 0, rules).unwrap()),
             path: temp_path,
             delete_on_drop: true,
         }
@@ -172,7 +177,7 @@ impl TempDatabase {
     pub fn from_path<P: AsRef<Path>>(temp_path: P) -> Self {
         let rules = create_consensus_rules();
         Self {
-            db: Some(create_lmdb_database(&temp_path, LMDBConfig::default(), rules).unwrap()),
+            db: Some(create_lmdb_database(&temp_path, LMDBConfig::default(), 0, rules).unwrap()),
             path: temp_path.as_ref().to_path_buf(),
             delete_on_drop: true,
         }
@@ -247,10 +252,6 @@ impl BlockchainBackend for TempDatabase {
             .fetch_header_containing_kernel_mmr(mmr_position)
     }
 
-    fn fetch_header_containing_utxo_mmr(&self, mmr_position: u64) -> Result<ChainHeader, ChainStorageError> {
-        self.db.as_ref().unwrap().fetch_header_containing_utxo_mmr(mmr_position)
-    }
-
     fn is_empty(&self) -> Result<bool, ChainStorageError> {
         self.db.as_ref().unwrap().is_empty()
     }
@@ -273,13 +274,6 @@ impl BlockchainBackend for TempDatabase {
         self.db.as_ref().unwrap().fetch_kernels_in_block(header_hash)
     }
 
-    fn fetch_kernel_by_excess(
-        &self,
-        excess: &[u8],
-    ) -> Result<Option<(TransactionKernel, HashOutput)>, ChainStorageError> {
-        self.db.as_ref().unwrap().fetch_kernel_by_excess(excess)
-    }
-
     fn fetch_kernel_by_excess_sig(
         &self,
         excess_sig: &Signature,
@@ -287,16 +281,23 @@ impl BlockchainBackend for TempDatabase {
         self.db.as_ref().unwrap().fetch_kernel_by_excess_sig(excess_sig)
     }
 
-    fn fetch_utxos_in_block(
+    fn fetch_outputs_in_block_with_spend_state(
         &self,
         header_hash: &HashOutput,
-        deleted: Option<&Bitmap>,
-    ) -> Result<(Vec<PrunedOutput>, Bitmap), ChainStorageError> {
-        self.db.as_ref().unwrap().fetch_utxos_in_block(header_hash, deleted)
+        spend_status_at_header: Option<&HashOutput>,
+    ) -> Result<Vec<(TransactionOutput, bool)>, ChainStorageError> {
+        self.db
+            .as_ref()
+            .unwrap()
+            .fetch_outputs_in_block_with_spend_state(header_hash, spend_status_at_header)
     }
 
-    fn fetch_output(&self, output_hash: &HashOutput) -> Result<Option<UtxoMinedInfo>, ChainStorageError> {
+    fn fetch_output(&self, output_hash: &HashOutput) -> Result<Option<OutputMinedInfo>, ChainStorageError> {
         self.db.as_ref().unwrap().fetch_output(output_hash)
+    }
+
+    fn fetch_input(&self, output_hash: &HashOutput) -> Result<Option<InputMinedInfo>, ChainStorageError> {
+        self.db.as_ref().unwrap().fetch_input(output_hash)
     }
 
     fn fetch_unspent_output_hash_by_commitment(
@@ -309,7 +310,7 @@ impl BlockchainBackend for TempDatabase {
             .fetch_unspent_output_hash_by_commitment(commitment)
     }
 
-    fn fetch_outputs_in_block(&self, header_hash: &HashOutput) -> Result<Vec<PrunedOutput>, ChainStorageError> {
+    fn fetch_outputs_in_block(&self, header_hash: &HashOutput) -> Result<Vec<TransactionOutput>, ChainStorageError> {
         self.db.as_ref().unwrap().fetch_outputs_in_block(header_hash)
     }
 
@@ -319,10 +320,6 @@ impl BlockchainBackend for TempDatabase {
 
     fn fetch_mmr_size(&self, tree: MmrTree) -> Result<u64, ChainStorageError> {
         self.db.as_ref().unwrap().fetch_mmr_size(tree)
-    }
-
-    fn fetch_mmr_leaf_index(&self, tree: MmrTree, hash: &HashOutput) -> Result<Option<u32>, ChainStorageError> {
-        self.db.as_ref().unwrap().fetch_mmr_leaf_index(tree, hash)
     }
 
     fn orphan_count(&self) -> Result<usize, ChainStorageError> {
@@ -361,8 +358,8 @@ impl BlockchainBackend for TempDatabase {
         self.db.as_ref().unwrap().fetch_orphan_chain_tip_by_hash(hash)
     }
 
-    fn fetch_all_orphan_chain_tips(&self) -> Result<Vec<ChainHeader>, ChainStorageError> {
-        self.db.as_ref().unwrap().fetch_all_orphan_chain_tips()
+    fn fetch_strongest_orphan_chain_tips(&self) -> Result<Vec<ChainHeader>, ChainStorageError> {
+        self.db.as_ref().unwrap().fetch_strongest_orphan_chain_tips()
     }
 
     fn fetch_orphan_children_of(&self, hash: HashOutput) -> Result<Vec<Block>, ChainStorageError> {
@@ -371,10 +368,6 @@ impl BlockchainBackend for TempDatabase {
 
     fn fetch_orphan_chain_block(&self, hash: HashOutput) -> Result<Option<ChainBlock>, ChainStorageError> {
         self.db.as_ref().unwrap().fetch_orphan_chain_block(hash)
-    }
-
-    fn fetch_deleted_bitmap(&self) -> Result<DeletedBitmap, ChainStorageError> {
-        self.db.as_ref().unwrap().fetch_deleted_bitmap()
     }
 
     fn delete_oldest_orphans(
@@ -404,17 +397,7 @@ impl BlockchainBackend for TempDatabase {
         self.db.as_ref().unwrap().fetch_total_size_stats()
     }
 
-    fn fetch_header_hash_by_deleted_mmr_positions(
-        &self,
-        mmr_positions: Vec<u32>,
-    ) -> Result<Vec<Option<(u64, HashOutput)>>, ChainStorageError> {
-        self.db
-            .as_ref()
-            .unwrap()
-            .fetch_header_hash_by_deleted_mmr_positions(mmr_positions)
-    }
-
-    fn bad_block_exists(&self, block_hash: HashOutput) -> Result<bool, ChainStorageError> {
+    fn bad_block_exists(&self, block_hash: HashOutput) -> Result<(bool, String), ChainStorageError> {
         self.db.as_ref().unwrap().bad_block_exists(block_hash)
     }
 
@@ -440,24 +423,41 @@ impl BlockchainBackend for TempDatabase {
             .unwrap()
             .fetch_template_registrations(start_height, end_height)
     }
+
+    fn calculate_tip_smt(&self) -> Result<OutputSmt, ChainStorageError> {
+        self.db.as_ref().unwrap().calculate_tip_smt()
+    }
 }
 
-pub fn create_chained_blocks<T: Into<BlockSpecs>>(
+pub async fn create_chained_blocks<T: Into<BlockSpecs>>(
     blocks: T,
     genesis_block: Arc<ChainBlock>,
+    output_smt: &mut OutputSmt,
 ) -> (Vec<String>, HashMap<String, Arc<ChainBlock>>) {
     let mut block_hashes = HashMap::new();
     block_hashes.insert("GB".to_string(), genesis_block);
-    let rules = ConsensusManager::builder(Network::LocalNet).build();
+    let rules = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+    let km = create_memory_db_key_manager().unwrap();
     let blocks: BlockSpecs = blocks.into();
     let mut block_names = Vec::with_capacity(blocks.len());
+    let (script_key_id, wallet_payment_address) = default_coinbase_entities(&km).await;
     for block_spec in blocks {
         let prev_block = block_hashes
             .get(block_spec.parent)
             .unwrap_or_else(|| panic!("Could not find block {}", block_spec.parent));
         let name = block_spec.name;
         let difficulty = block_spec.difficulty;
-        let (block, _) = create_block(&rules, prev_block.block(), block_spec);
+        let (mut block, _) = create_block(
+            &rules,
+            prev_block.block(),
+            block_spec,
+            &km,
+            &script_key_id,
+            &wallet_payment_address,
+            None,
+        )
+        .await;
+        update_block_and_smt(&mut block, output_smt);
         let block = mine_block(block, prev_block.accumulated_data(), difficulty);
         block_names.push(name.to_string());
         block_hashes.insert(name.to_string(), block);
@@ -470,8 +470,7 @@ fn mine_block(block: Block, prev_block_accum: &BlockHeaderAccumulatedData, diffi
     let accum = BlockHeaderAccumulatedData::builder(prev_block_accum)
         .with_hash(block.hash())
         .with_achieved_target_difficulty(
-            AchievedTargetDifficulty::try_construct(PowAlgorithm::Sha3, (difficulty.as_u64() - 1).into(), difficulty)
-                .unwrap(),
+            AchievedTargetDifficulty::try_construct(PowAlgorithm::Sha3x, difficulty, difficulty).unwrap(),
         )
         .with_total_kernel_offset(block.header.total_kernel_offset.clone())
         .build()
@@ -479,7 +478,7 @@ fn mine_block(block: Block, prev_block_accum: &BlockHeaderAccumulatedData, diffi
     Arc::new(ChainBlock::try_construct(Arc::new(block), accum).unwrap())
 }
 
-pub fn create_main_chain<T: Into<BlockSpecs>>(
+pub async fn create_main_chain<T: Into<BlockSpecs>>(
     db: &BlockchainDatabase<TempDatabase>,
     blocks: T,
 ) -> (Vec<String>, HashMap<String, Arc<ChainBlock>>) {
@@ -489,7 +488,10 @@ pub fn create_main_chain<T: Into<BlockSpecs>>(
         .try_into_chain_block()
         .map(Arc::new)
         .unwrap();
-    let (names, chain) = create_chained_blocks(blocks, genesis_block);
+    let (names, chain) = {
+        let mut smt = db.smt_read_access().unwrap().clone();
+        create_chained_blocks(blocks, genesis_block, &mut smt).await
+    };
     names.iter().for_each(|name| {
         let block = chain.get(name).unwrap();
         db.add_block(block.to_arc_block()).unwrap();
@@ -498,12 +500,13 @@ pub fn create_main_chain<T: Into<BlockSpecs>>(
     (names, chain)
 }
 
-pub fn create_orphan_chain<T: Into<BlockSpecs>>(
+pub async fn create_orphan_chain<T: Into<BlockSpecs>>(
     db: &BlockchainDatabase<TempDatabase>,
     blocks: T,
     root_block: Arc<ChainBlock>,
+    smt: &mut OutputSmt,
 ) -> (Vec<String>, HashMap<String, Arc<ChainBlock>>) {
-    let (names, chain) = create_chained_blocks(blocks, root_block);
+    let (names, chain) = create_chained_blocks(blocks, root_block, smt).await;
     let mut txn = DbTransaction::new();
     for name in &names {
         let block = chain.get(name).unwrap().clone();
@@ -514,50 +517,77 @@ pub fn create_orphan_chain<T: Into<BlockSpecs>>(
     (names, chain)
 }
 
+pub fn update_block_and_smt(block: &mut Block, smt: &mut OutputSmt) {
+    for output in block.body.outputs() {
+        let smt_key = NodeKey::try_from(output.commitment.as_bytes()).unwrap();
+        let smt_node = ValueHash::try_from(output.smt_hash(block.header.height).as_slice()).unwrap();
+        // suppress this error as some unit tests rely on this not being completely correct.
+        let _result = smt.insert(smt_key, smt_node);
+    }
+    for input in block.body.inputs() {
+        let smt_key = NodeKey::try_from(input.commitment().unwrap().as_bytes()).unwrap();
+        smt.delete(&smt_key).unwrap();
+    }
+    let root = FixedHash::try_from(smt.hash().as_slice()).unwrap();
+    block.header.output_mr = root;
+}
+
 pub struct TestBlockchain {
     db: BlockchainDatabase<TempDatabase>,
-    chain: Vec<(&'static str, Arc<ChainBlock>)>,
+    chain: Vec<(&'static str, Arc<ChainBlock>, OutputSmt)>,
     rules: ConsensusManager,
+    pub km: MemoryDbKeyManager,
+    script_key_id: TariKeyId,
+    wallet_payment_address: TariAddress,
+    range_proof_type: RangeProofType,
 }
 
 impl TestBlockchain {
-    pub fn new(db: BlockchainDatabase<TempDatabase>, rules: ConsensusManager) -> Self {
+    pub async fn new(db: BlockchainDatabase<TempDatabase>, rules: ConsensusManager) -> Self {
         let genesis = db
             .fetch_block(0, true)
             .unwrap()
             .try_into_chain_block()
             .map(Arc::new)
             .unwrap();
+        let km = create_memory_db_key_manager().unwrap();
+        let (script_key_id, wallet_payment_address) = default_coinbase_entities(&km).await;
         let mut blockchain = Self {
             db,
             chain: Default::default(),
             rules,
+            km,
+            script_key_id,
+            wallet_payment_address,
+            range_proof_type: RangeProofType::BulletProofPlus,
         };
+        let smt = blockchain.db.smt_read_access().unwrap().clone();
 
-        blockchain.chain.push(("GB", genesis));
+        blockchain.chain.push(("GB", genesis, smt));
         blockchain
     }
 
-    pub fn create(rules: ConsensusManager) -> Self {
-        Self::new(create_custom_blockchain(rules.clone()), rules)
+    pub async fn create(rules: ConsensusManager) -> Self {
+        Self::new(create_custom_blockchain(rules.clone()), rules).await
     }
 
-    pub fn append_chain(
+    pub async fn append_chain(
         &mut self,
         block_specs: BlockSpecs,
-    ) -> Result<Vec<(Arc<ChainBlock>, UnblindedOutput)>, ChainStorageError> {
+    ) -> Result<Vec<(Arc<ChainBlock>, WalletOutput)>, ChainStorageError> {
         let mut blocks = Vec::with_capacity(block_specs.len());
         for spec in block_specs {
-            blocks.push(self.append(spec)?);
+            blocks.push(self.append(spec).await?);
         }
         Ok(blocks)
     }
 
-    pub fn create_chain(&self, block_specs: BlockSpecs) -> Vec<(Arc<ChainBlock>, UnblindedOutput)> {
-        block_specs
-            .into_iter()
-            .map(|spec| self.create_chained_block(spec))
-            .collect()
+    pub async fn create_chain(&self, block_specs: BlockSpecs) -> Vec<(Arc<ChainBlock>, WalletOutput)> {
+        let mut result = Vec::new();
+        for spec in block_specs {
+            result.push(self.create_chained_block(spec).await);
+        }
+        result
     }
 
     pub fn add_blocks(&self, blocks: Vec<Arc<ChainBlock>>) -> Result<(), ChainStorageError> {
@@ -568,10 +598,10 @@ impl TestBlockchain {
         Ok(())
     }
 
-    pub fn with_validators(validators: Validators<TempDatabase>) -> Self {
-        let rules = ConsensusManager::builder(Network::LocalNet).build();
-        let db = create_store_with_consensus_and_validators(rules.clone(), validators);
-        Self::new(db, rules)
+    pub async fn with_validators(validators: Validators<TempDatabase>, smt: Arc<RwLock<OutputSmt>>) -> Self {
+        let rules = ConsensusManager::builder(Network::LocalNet).build().unwrap();
+        let db = create_store_with_consensus_and_validators(rules.clone(), validators, smt);
+        Self::new(db, rules).await
     }
 
     pub fn rules(&self) -> &ConsensusManager {
@@ -582,20 +612,23 @@ impl TestBlockchain {
         &self.db
     }
 
-    pub fn add_block(
+    pub async fn add_block(
         &mut self,
         block_spec: BlockSpec,
-    ) -> Result<(Arc<ChainBlock>, UnblindedOutput), ChainStorageError> {
+    ) -> Result<(Arc<ChainBlock>, WalletOutput), ChainStorageError> {
         let name = block_spec.name;
-        let (block, coinbase) = self.create_chained_block(block_spec);
+        let (block, coinbase) = self.create_chained_block(block_spec).await;
         let result = self.append_block(name, block.clone())?;
         assert!(result.is_added());
         Ok((block, coinbase))
     }
 
-    pub fn add_next_tip(&mut self, spec: BlockSpec) -> Result<(Arc<ChainBlock>, UnblindedOutput), ChainStorageError> {
+    pub async fn add_next_tip(
+        &mut self,
+        spec: BlockSpec,
+    ) -> Result<(Arc<ChainBlock>, WalletOutput), ChainStorageError> {
         let name = spec.name;
-        let (block, coinbase) = self.create_next_tip(spec);
+        let (block, coinbase) = self.create_next_tip(spec).await;
         let result = self.append_block(name, block.clone())?;
         assert!(result.is_added());
         Ok((block, coinbase))
@@ -607,69 +640,90 @@ impl TestBlockchain {
         block: Arc<ChainBlock>,
     ) -> Result<BlockAddResult, ChainStorageError> {
         let result = self.db.add_block(block.to_arc_block())?;
-        self.chain.push((name, block));
+        let smt = self.db.smt().read().unwrap().clone();
+        self.chain.push((name, block, smt));
         Ok(result)
     }
 
-    pub fn get_block_by_name(&self, name: &'static str) -> Option<Arc<ChainBlock>> {
-        self.chain.iter().find(|(n, _)| *n == name).map(|(_, ch)| ch.clone())
+    pub fn get_block_and_smt_by_name(&self, name: &'static str) -> Option<(Arc<ChainBlock>, OutputSmt)> {
+        self.chain
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, ch, smt)| (ch.clone(), smt.clone()))
     }
 
-    pub fn get_tip_block(&self) -> (&'static str, Arc<ChainBlock>) {
+    pub fn get_tip_block(&self) -> (&'static str, Arc<ChainBlock>, OutputSmt) {
         self.chain.last().cloned().unwrap()
     }
 
-    pub fn create_chained_block(&self, block_spec: BlockSpec) -> (Arc<ChainBlock>, UnblindedOutput) {
-        let parent = self
-            .get_block_by_name(block_spec.parent)
+    pub async fn create_chained_block(&self, block_spec: BlockSpec) -> (Arc<ChainBlock>, WalletOutput) {
+        let (parent, mut parent_smt) = self
+            .get_block_and_smt_by_name(block_spec.parent)
             .ok_or_else(|| format!("Parent block not found with name '{}'", block_spec.parent))
             .unwrap();
         let difficulty = block_spec.difficulty;
-        let (block, coinbase) = create_block(&self.rules, parent.block(), block_spec);
+        let (mut block, coinbase) = create_block(
+            &self.rules,
+            parent.block(),
+            block_spec,
+            &self.km,
+            &self.script_key_id,
+            &self.wallet_payment_address,
+            Some(self.range_proof_type),
+        )
+        .await;
+        update_block_and_smt(&mut block, &mut parent_smt);
         let block = mine_block(block, parent.accumulated_data(), difficulty);
         (block, coinbase)
     }
 
-    pub fn create_unmined_block(&self, block_spec: BlockSpec) -> (Block, UnblindedOutput) {
-        let parent = self
-            .get_block_by_name(block_spec.parent)
+    pub async fn create_unmined_block(&self, block_spec: BlockSpec) -> (Block, WalletOutput) {
+        let (parent, mut parent_smt) = self
+            .get_block_and_smt_by_name(block_spec.parent)
             .ok_or_else(|| format!("Parent block not found with name '{}'", block_spec.parent))
             .unwrap();
-        let (mut block, outputs) = create_block(&self.rules, parent.block(), block_spec);
+        let (mut block, outputs) = create_block(
+            &self.rules,
+            parent.block(),
+            block_spec,
+            &self.km,
+            &self.script_key_id,
+            &self.wallet_payment_address,
+            Some(self.range_proof_type),
+        )
+        .await;
+        update_block_and_smt(&mut block, &mut parent_smt);
         block.body.sort();
         (block, outputs)
     }
 
-    pub fn mine_block(&self, parent_name: &'static str, block: Block, difficulty: Difficulty) -> Arc<ChainBlock> {
-        let parent = self.get_block_by_name(parent_name).unwrap();
+    pub fn mine_block(&self, parent_name: &'static str, mut block: Block, difficulty: Difficulty) -> Arc<ChainBlock> {
+        let (parent, mut parent_smt) = self.get_block_and_smt_by_name(parent_name).unwrap();
+        update_block_and_smt(&mut block, &mut parent_smt);
         mine_block(block, parent.accumulated_data(), difficulty)
     }
 
-    pub fn create_next_tip(&self, spec: BlockSpec) -> (Arc<ChainBlock>, UnblindedOutput) {
-        let (name, _) = self.get_tip_block();
-        self.create_chained_block(spec.with_parent_block(name))
+    pub async fn create_next_tip(&self, spec: BlockSpec) -> (Arc<ChainBlock>, WalletOutput) {
+        let (name, _, _) = self.get_tip_block();
+        self.create_chained_block(spec.with_parent_block(name)).await
     }
 
-    pub fn append_to_tip(&mut self, spec: BlockSpec) -> Result<(Arc<ChainBlock>, UnblindedOutput), ChainStorageError> {
-        let (tip, _) = self.get_tip_block();
-        self.append(spec.with_parent_block(tip))
+    pub async fn append_to_tip(
+        &mut self,
+        spec: BlockSpec,
+    ) -> Result<(Arc<ChainBlock>, WalletOutput), ChainStorageError> {
+        let (tip, _, _) = self.get_tip_block();
+        self.append(spec.with_parent_block(tip)).await
     }
 
-    pub fn append(&mut self, spec: BlockSpec) -> Result<(Arc<ChainBlock>, UnblindedOutput), ChainStorageError> {
+    pub async fn append(&mut self, spec: BlockSpec) -> Result<(Arc<ChainBlock>, WalletOutput), ChainStorageError> {
         let name = spec.name;
-        let (block, outputs) = self.create_chained_block(spec);
+        let (block, outputs) = self.create_chained_block(spec).await;
         self.append_block(name, block.clone())?;
         Ok((block, outputs))
     }
 
     pub fn get_genesis_block(&self) -> Arc<ChainBlock> {
-        self.chain.first().map(|(_, block)| block).unwrap().clone()
-    }
-}
-
-impl Default for TestBlockchain {
-    fn default() -> Self {
-        let rules = ConsensusManager::builder(Network::LocalNet).build();
-        TestBlockchain::create(rules)
+        self.chain.first().map(|(_, block, _)| block).unwrap().clone()
     }
 }

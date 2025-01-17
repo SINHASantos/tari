@@ -51,7 +51,7 @@ use crate::{
     crypt,
     dedup,
     discovery::DhtDiscoveryRequester,
-    envelope::{datetime_to_epochtime, datetime_to_timestamp, DhtMessageFlags, DhtMessageHeader, NodeDestination},
+    envelope::{datetime_to_epochtime, DhtMessageFlags, DhtMessageHeader, NodeDestination},
     message_signature::MessageSignature,
     outbound::{
         message::{DhtOutboundMessage, OutboundEncryption, SendFailure},
@@ -204,7 +204,7 @@ where S: Service<DhtOutboundMessage, Response = (), Error = PipelineError>
 
     pub async fn handle(mut self) -> Result<(), PipelineError> {
         let request = self.request.take().expect("request cannot be None");
-        debug!(target: LOG_TARGET, "Processing outbound request {}", request);
+        trace!(target: LOG_TARGET, "Processing outbound request {}", request);
         let messages = self.generate_outbound_messages(request).await?;
         trace!(
             target: LOG_TARGET,
@@ -431,7 +431,7 @@ where S: Service<DhtOutboundMessage, Response = (), Error = PipelineError>
         // Construct a DhtOutboundMessage for each recipient
         let messages = selected_peers.into_iter().map(|node_id| {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let tag = tag.unwrap_or_else(MessageTag::new);
+            let tag = tag.unwrap_or_default();
             let send_state = MessageSendState::new(tag, reply_rx);
             (
                 DhtOutboundMessage {
@@ -447,7 +447,7 @@ where S: Service<DhtOutboundMessage, Response = (), Error = PipelineError>
                     ephemeral_public_key: ephemeral_public_key.clone(),
                     message_signature: message_signature.clone(),
                     is_broadcast,
-                    expires: expires.map(datetime_to_timestamp),
+                    expires: expires_epochtime.map(EpochTime::as_u64),
                 },
                 send_state,
             )
@@ -489,52 +489,52 @@ where S: Service<DhtOutboundMessage, Response = (), Error = PipelineError>
         mut body: BytesMut,
     ) -> Result<FinalMessageParts, DhtOutboundError> {
         match encryption {
-            OutboundEncryption::EncryptFor(public_key) => {
-                trace!(target: LOG_TARGET, "Encrypting message for {}", public_key);
-                // Generate ephemeral public/private key pair and ECDH shared secret
-                let (e_secret_key, e_public_key) = CommsPublicKey::random_keypair(&mut OsRng);
-                let shared_ephemeral_secret = CommsDHKE::new(&e_secret_key, &**public_key);
+            // Encrypt the message, protecting the sender identity
+            OutboundEncryption::EncryptFor(recipient_public_key) => {
+                trace!(target: LOG_TARGET, "Encrypting message for {}", recipient_public_key);
 
-                // Generate key message for encryption of message
+                // Perform an ephemeral ECDH exchange against the recipient public key
+                let (ephemeral_secret_key, ephemeral_public_key) = CommsPublicKey::random_keypair(&mut OsRng);
+                let shared_ephemeral_secret = CommsDHKE::new(&ephemeral_secret_key, &**recipient_public_key);
+
+                // Produce a masked sender public key using an offset mask derived from the ECDH exchange
+                let mask = crypt::generate_key_mask(&shared_ephemeral_secret)
+                    .map_err(|e| DhtOutboundError::CipherError(e.to_string()))?;
+                let masked_sender_public_key = &mask * self.node_identity.public_key();
+
+                // Pad and encrypt the message using the masked sender public key
                 let key_message = crypt::generate_key_message(&shared_ephemeral_secret);
-                // Encrypt the message with the body with key message above
-                crypt::encrypt(&key_message, &mut body)?;
+                crypt::encrypt_message(&key_message, &mut body, masked_sender_public_key.as_bytes())?;
                 let encrypted_body = body.freeze();
 
-                // Produce domain separated signature signature
-                let mac_signature = crypt::create_message_domain_separated_hash_parts(
+                // Produce a hash that binds the message and metadata
+                let binding_hash = crypt::create_message_domain_separated_hash_parts(
                     self.protocol_version,
                     destination,
                     message_type,
                     flags,
                     expires,
-                    Some(&e_public_key),
+                    Some(&ephemeral_public_key),
                     &encrypted_body,
                 );
 
-                // Generate key signature for encryption of signature
-                let key_signature =
-                    crypt::generate_key_signature_for_authenticated_encryption(&shared_ephemeral_secret);
-
-                // Sign the encrypted message
-                let signature =
-                    MessageSignature::new_signed(self.node_identity.secret_key().clone(), &mac_signature).to_proto();
-
-                // Perform authenticated encryption with ChaCha20-Poly1305 and set the origin field
-                let encrypted_message_signature =
-                    crypt::encrypt_with_chacha20_poly1305(&key_signature, &signature.to_encoded_bytes())?;
+                // Sign the encrypted message using the masked sender key
+                let masked_sender_secret_key = mask * self.node_identity.secret_key();
+                let signature = MessageSignature::new_signed(masked_sender_secret_key, &binding_hash).to_proto();
 
                 Ok((
-                    Some(Arc::new(e_public_key)),
-                    Some(encrypted_message_signature.into()),
+                    Some(Arc::new(ephemeral_public_key)),
+                    Some(signature.to_encoded_bytes().into()), // this includes the masked signer public key
                     encrypted_body,
                 ))
             },
+            // Keep the message unencrypted
             OutboundEncryption::ClearText => {
                 trace!(target: LOG_TARGET, "Encryption not requested for message");
 
+                // We may or may not sign it
                 if include_origin {
-                    let binding_message_representation = crypt::create_message_domain_separated_hash_parts(
+                    let binding_hash = crypt::create_message_domain_separated_hash_parts(
                         self.protocol_version,
                         destination,
                         message_type,
@@ -543,12 +543,10 @@ where S: Service<DhtOutboundMessage, Response = (), Error = PipelineError>
                         None,
                         &body,
                     );
-                    let signature = MessageSignature::new_signed(
-                        self.node_identity.secret_key().clone(),
-                        &binding_message_representation,
-                    )
-                    .to_proto();
-                    Ok((None, Some(signature.to_encoded_bytes().into()), body.freeze()))
+                    let signature =
+                        MessageSignature::new_signed(self.node_identity.secret_key().clone(), &binding_hash).to_proto();
+                    Ok((None, Some(signature.to_encoded_bytes().into()), body.freeze())) // this includes the signer
+                                                                                         // public key
                 } else {
                     Ok((None, None, body.freeze()))
                 }
@@ -561,16 +559,13 @@ where S: Service<DhtOutboundMessage, Response = (), Error = PipelineError>
 mod test {
     use std::time::Duration;
 
-    use rand::rngs::OsRng;
     use tari_comms::{
         multiaddr::Multiaddr,
-        peer_manager::{NodeId, Peer, PeerFeatures, PeerFlags},
-        runtime,
-        types::CommsPublicKey,
+        net_address::{MultiaddressesWithStats, PeerAddressSource},
+        peer_manager::{PeerFeatures, PeerFlags},
     };
-    use tari_crypto::keys::PublicKey;
     use tari_test_utils::unpack_enum;
-    use tokio::{sync::oneshot, task};
+    use tokio::task;
 
     use super::*;
     use crate::{
@@ -584,13 +579,16 @@ mod test {
         },
     };
 
-    #[runtime::test]
+    #[tokio::test]
     async fn test_send_message_flood() {
         let pk = CommsPublicKey::default();
         let example_peer = Peer::new(
             pk.clone(),
             NodeId::from_key(&pk),
-            vec!["/ip4/127.0.0.1/tcp/9999".parse::<Multiaddr>().unwrap()].into(),
+            MultiaddressesWithStats::from_addresses_with_source(
+                vec!["/ip4/127.0.0.1/tcp/9999".parse::<Multiaddr>().unwrap()],
+                &PeerAddressSource::Config,
+            ),
             PeerFlags::empty(),
             PeerFeatures::COMMUNICATION_NODE,
             Default::default(),
@@ -649,7 +647,7 @@ mod test {
         assert!(requests.iter().any(|msg| msg.destination_node_id == other_peer.node_id));
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn test_send_message_direct_not_found() {
         // Test for issue https://github.com/tari-project/tari/issues/959
 
@@ -694,7 +692,7 @@ mod test {
         assert_eq!(spy.call_count(), 0);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn test_send_message_direct_dht_discovery() {
         let node_identity = NodeIdentity::random(
             &mut OsRng,

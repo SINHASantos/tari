@@ -22,14 +22,18 @@
 
 use diesel::result::Error as DieselError;
 use tari_common::exit_codes::{ExitCode, ExitError};
+use tari_common_sqlite::error::SqliteStorageError;
 use tari_comms::{connectivity::ConnectivityError, peer_manager::node_id::NodeIdError, protocol::rpc::RpcError};
 use tari_comms_dht::outbound::DhtOutboundError;
 use tari_core::transactions::{
-    transaction_components::{EncryptionError, TransactionError},
+    transaction_components::{EncryptedDataError, TransactionError},
     transaction_protocol::TransactionProtocolError,
-    CoinbaseBuildError,
 };
-use tari_key_manager::error::{KeyManagerError, MnemonicError};
+use tari_crypto::errors::RangeProofError;
+use tari_key_manager::{
+    error::{KeyManagerError, MnemonicError},
+    key_manager_service::KeyManagerServiceError,
+};
 use tari_script::ScriptError;
 use tari_service_framework::reply_channel::TransportChannelError;
 use tari_utilities::{hex::HexError, ByteArrayError};
@@ -38,7 +42,6 @@ use thiserror::Error;
 use crate::{
     base_node_service::error::BaseNodeServiceError,
     error::WalletStorageError,
-    key_manager_service::KeyManagerServiceError,
     output_manager_service::UtxoSelectionCriteria,
 };
 
@@ -47,7 +50,7 @@ pub enum OutputManagerError {
     #[error("Build error: `{0}`")]
     BuildError(String),
     #[error("Byte array error: `{0}`")]
-    ByteArrayError(#[from] ByteArrayError),
+    ByteArrayError(String),
     #[error("Transaction protocol error: `{0}`")]
     TransactionProtocolError(#[from] TransactionProtocolError),
     #[error("Transport channel error: `{0}`")]
@@ -98,8 +101,6 @@ pub enum OutputManagerError {
     BaseNodeChanged,
     #[error("Invalid Sender Message Type")]
     InvalidSenderMessage,
-    #[error("Coinbase build error: `{0}`")]
-    CoinbaseBuildError(#[from] CoinbaseBuildError),
     #[error("TXO Validation protocol cancelled")]
     Cancellation,
     #[error("Base NodeService Error: `{0}`")]
@@ -112,7 +113,15 @@ pub enum OutputManagerError {
     NodeIdError(#[from] NodeIdError),
     #[error("Script hash does not match expected script")]
     InvalidScriptHash,
-    #[error("Tari script error : {0}")]
+    #[error("Unsupported Covenant")]
+    InvalidCovenant,
+    #[error("Unsupported Output Features")]
+    InvalidOutputFeatures,
+    #[error("Unsupported Kernel Features")]
+    InvalidKernelFeatures,
+    #[error("Unsupported Lock Height")]
+    InvalidLockHeight,
+    #[error("Tari script error: {0}")]
     ScriptError(#[from] ScriptError),
     #[error("Master secret key does not match persisted key manager state")]
     MasterSeedMismatch,
@@ -125,18 +134,36 @@ pub enum OutputManagerError {
         #[from]
         source: ConnectivityError,
     },
-    #[error("Invalid message received:{0}")]
+    #[error("Invalid message received: {0}")]
     InvalidMessageError(String),
-    #[error("Key manager service error : {0}")]
+    #[error("Key manager service error: {0}")]
     KeyManagerServiceError(#[from] KeyManagerServiceError),
     #[error("Value can't be encrypted/decrypted")]
-    ValueEncryptionError(#[from] EncryptionError),
+    ValueEncryptionError(#[from] EncryptedDataError),
     #[error("No commitments were provided")]
     NoCommitmentsProvided,
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
     #[error("Validation in progress")]
     ValidationInProgress,
+    #[error("Invalid data: `{0}`")]
+    RangeProofError(String),
+    #[error("Transaction is over sized: `{0}`")]
+    TooManyInputsToFulfillTransaction(String),
+    #[error("Std I/O error: {0}")]
+    StdIoError(#[from] std::io::Error),
+}
+
+impl From<RangeProofError> for OutputManagerError {
+    fn from(e: RangeProofError) -> Self {
+        OutputManagerError::RangeProofError(e.to_string())
+    }
+}
+
+impl From<ByteArrayError> for OutputManagerError {
+    fn from(e: ByteArrayError) -> Self {
+        OutputManagerError::ByteArrayError(e.to_string())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -178,19 +205,35 @@ pub enum OutputManagerStorageError {
     #[error("Wallet db is already encrypted and cannot be encrypted until the previous encryption is removed")]
     AlreadyEncrypted,
     #[error("Byte array error: `{0}`")]
-    ByteArrayError(#[from] ByteArrayError),
+    ByteArrayError(String),
     #[error("Aead error: `{0}`")]
     AeadError(String),
     #[error("Tried to insert a script that already exists in the database")]
     DuplicateScript,
-    #[error("Tari script error : {0}")]
+    #[error("Tari script error: {0}")]
     ScriptError(#[from] ScriptError),
     #[error("Binary not stored as valid hex:{0}")]
-    HexError(#[from] HexError),
+    HexError(String),
     #[error("Key Manager Service Error: `{0}`")]
     KeyManagerServiceError(#[from] KeyManagerServiceError),
     #[error("IO Error: `{0}`")]
     IoError(#[from] std::io::Error),
+    #[error("Error: `{0}`")]
+    SqliteStorageError(#[from] SqliteStorageError),
+    #[error("Encryption error: `{0}`")]
+    EncryptedOpeningsError(#[from] EncryptedDataError),
+}
+
+impl From<HexError> for OutputManagerStorageError {
+    fn from(err: HexError) -> Self {
+        OutputManagerStorageError::HexError(err.to_string())
+    }
+}
+
+impl From<ByteArrayError> for OutputManagerStorageError {
+    fn from(e: ByteArrayError) -> Self {
+        OutputManagerStorageError::ByteArrayError(e.to_string())
+    }
 }
 
 impl From<OutputManagerError> for ExitError {

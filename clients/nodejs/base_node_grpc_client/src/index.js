@@ -9,7 +9,7 @@ const path = require("path");
 const packageDefinition = protoLoader.loadSync(
   path.resolve(
     __dirname,
-    "../../../../applications/tari_app_grpc/proto/base_node.proto"
+    process.env.BASE_NODE_PROTO || "../../../../applications/minotari_app_grpc/proto/base_node.proto"
   ),
   {
     keepCase: true,
@@ -44,6 +44,8 @@ function Client(address = "127.0.0.1:18142") {
     "getTokens",
     "getNetworkDifficulty",
     "getActiveValidatorNodes",
+    "getHeaderByHash",
+    "searchKernels",
   ];
   methods.forEach((method) => {
     this[method] = (arg) => this.inner[method]().sendMessage(arg);

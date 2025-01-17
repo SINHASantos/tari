@@ -27,10 +27,10 @@ mod unconfirmed_pool;
 // Public re-exports
 pub use error::UnconfirmedPoolError;
 use tari_crypto::hash_domain;
-pub use unconfirmed_pool::{UnconfirmedPool, UnconfirmedPoolConfig};
+pub use unconfirmed_pool::{RetrieveResults, TransactionKey, UnconfirmedPool, UnconfirmedPoolConfig};
 
 hash_domain!(
     UnconfirmedPoolOutputTokenIdHashDomain,
-    "com.tari.tari-project.base_layer.core.mempool.unconfirmed_pool_output_token_id",
+    "com.tari.base_layer.core.mempool.unconfirmed_pool_output_token_id",
     1
 );

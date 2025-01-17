@@ -20,29 +20,32 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{fmt, fmt::Formatter, sync::Arc};
+use std::{collections::HashMap, fmt, fmt::Formatter, sync::Arc};
 
 use tari_common_types::{
+    tari_address::TariAddress,
     transaction::TxId,
-    types::{Commitment, HashOutput, PublicKey},
+    types::{Commitment, FixedHash, HashOutput, PublicKey},
 };
 use tari_core::{
     covenants::Covenant,
     transactions::{
-        tari_amount::MicroTari,
+        tari_amount::MicroMinotari,
         transaction_components::{
+            encrypted_data::PaymentId,
             OutputFeatures,
             Transaction,
             TransactionOutput,
-            UnblindedOutput,
-            UnblindedOutputBuilder,
+            WalletOutput,
+            WalletOutputBuilder,
         },
-        transaction_protocol::{sender::TransactionSenderMessage, RewindData, TransactionMetadata},
+        transaction_protocol::{sender::TransactionSenderMessage, TransactionMetadata},
         ReceiverTransactionProtocol,
         SenderTransactionProtocol,
     },
 };
-use tari_script::TariScript;
+use tari_crypto::ristretto::pedersen::PedersenCommitment;
+use tari_script::{CheckSigSchnorrSignature, TariScript};
 use tari_service_framework::reply_channel::SenderService;
 use tari_utilities::hex::Hex;
 use tokio::sync::broadcast;
@@ -50,11 +53,8 @@ use tower::Service;
 
 use crate::output_manager_service::{
     error::OutputManagerError,
-    service::{Balance, OutputStatusesByTxId},
-    storage::{
-        database::OutputBackendQuery,
-        models::{KnownOneSidedPaymentScript, SpendingPriority},
-    },
+    service::{Balance, OutputInfoByTxId, UseOutput},
+    storage::models::{DbWalletOutput, KnownOneSidedPaymentScript, SpendingPriority},
     UtxoSelectionCriteria,
 };
 
@@ -62,98 +62,112 @@ use crate::output_manager_service::{
 #[allow(clippy::large_enum_variant)]
 pub enum OutputManagerRequest {
     GetBalance,
-    AddOutput((Box<UnblindedOutput>, Option<SpendingPriority>)),
-    // ToDo: This API request could probably be removed by expanding test utils if only needed for testing
-    AddRewindableOutput((Box<UnblindedOutput>, Option<SpendingPriority>, Option<RewindData>)),
-    AddOutputWithTxId((TxId, Box<UnblindedOutput>, Option<SpendingPriority>)),
-    AddRewindableOutputWithTxId((TxId, Box<UnblindedOutput>, Option<SpendingPriority>, Option<RewindData>)),
-    // ToDo: This API request could probably be removed by expanding test utils if only needed for testing
-    ConvertToRewindableTransactionOutput(Box<UnblindedOutput>),
-    AddUnvalidatedOutput((TxId, Box<UnblindedOutput>, Option<SpendingPriority>)),
+    AddOutput((Box<WalletOutput>, Option<SpendingPriority>)),
+    AddOutputWithTxId((TxId, Box<WalletOutput>, Option<SpendingPriority>)),
+    AddUnvalidatedOutput((TxId, Box<WalletOutput>, Option<SpendingPriority>)),
     UpdateOutputMetadataSignature(Box<TransactionOutput>),
     GetRecipientTransaction(TransactionSenderMessage),
-    GetCoinbaseTransaction {
-        tx_id: TxId,
-        reward: MicroTari,
-        fees: MicroTari,
-        block_height: u64,
-        extra: Vec<u8>,
-    },
     ConfirmPendingTransaction(TxId),
+    EncumberAggregateUtxo {
+        tx_id: TxId,
+        fee_per_gram: MicroMinotari,
+        expected_commitment: PedersenCommitment,
+        script_input_shares: HashMap<PublicKey, CheckSigSchnorrSignature>,
+        script_signature_public_nonces: Vec<PublicKey>,
+        sender_offset_public_key_shares: Vec<PublicKey>,
+        metadata_ephemeral_public_key_shares: Vec<PublicKey>,
+        dh_shared_secret_shares: Vec<PublicKey>,
+        recipient_address: TariAddress,
+        original_maturity: u64,
+        use_output: UseOutput,
+        payment_id: PaymentId,
+    },
+    SpendBackupPreMineUtxo {
+        tx_id: TxId,
+        fee_per_gram: MicroMinotari,
+        output_hash: HashOutput,
+        expected_commitment: PedersenCommitment,
+        recipient_address: TariAddress,
+    },
     PrepareToSendTransaction {
         tx_id: TxId,
-        amount: MicroTari,
+        amount: MicroMinotari,
         selection_criteria: UtxoSelectionCriteria,
         output_features: Box<OutputFeatures>,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         tx_meta: TransactionMetadata,
-        message: String,
         script: TariScript,
         covenant: Covenant,
-        minimum_value_promise: MicroTari,
+        minimum_value_promise: MicroMinotari,
+        recipient_address: TariAddress,
+        payment_id: PaymentId,
     },
     CreatePayToSelfTransaction {
         tx_id: TxId,
-        amount: MicroTari,
+        amount: MicroMinotari,
         selection_criteria: UtxoSelectionCriteria,
         output_features: Box<OutputFeatures>,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         lock_height: Option<u64>,
+        payment_id: PaymentId,
     },
     CreatePayToSelfWithOutputs {
-        outputs: Vec<UnblindedOutputBuilder>,
-        fee_per_gram: MicroTari,
+        outputs: Vec<WalletOutputBuilder>,
+        fee_per_gram: MicroMinotari,
         selection_criteria: UtxoSelectionCriteria,
+        payment_id: PaymentId,
     },
     CancelTransaction(TxId),
     GetSpentOutputs,
     GetUnspentOutputs,
-    GetOutputsBy(OutputBackendQuery),
     GetInvalidOutputs,
     ValidateUtxos,
     RevalidateTxos,
-    CreateCoinSplit((Vec<Commitment>, MicroTari, usize, MicroTari)),
-    CreateCoinSplitEven((Vec<Commitment>, usize, MicroTari)),
-    PreviewCoinJoin((Vec<Commitment>, MicroTari)),
-    PreviewCoinSplitEven((Vec<Commitment>, usize, MicroTari)),
+    CreateCoinSplit((Vec<Commitment>, MicroMinotari, usize, MicroMinotari)),
+    CreateCoinSplitEven((Vec<Commitment>, usize, MicroMinotari)),
+    PreviewCoinJoin((Vec<Commitment>, MicroMinotari)),
+    PreviewCoinSplitEven((Vec<Commitment>, usize, MicroMinotari)),
+    ScrapeWallet {
+        tx_id: TxId,
+        fee_per_gram: MicroMinotari,
+        recipient_address: TariAddress,
+    },
     CreateCoinJoin {
         commitments: Vec<Commitment>,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
+        payment_id: PaymentId,
     },
     FeeEstimate {
-        amount: MicroTari,
+        amount: MicroMinotari,
         selection_criteria: UtxoSelectionCriteria,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         num_kernels: usize,
         num_outputs: usize,
     },
 
-    ScanForRecoverableOutputs(Vec<TransactionOutput>),
-    ScanOutputs(Vec<TransactionOutput>),
+    ScanForRecoverableOutputs(Vec<(TransactionOutput, Option<TxId>)>),
+    ScanOutputs(Vec<(TransactionOutput, Option<TxId>)>),
     AddKnownOneSidedPaymentScript(KnownOneSidedPaymentScript),
     CreateOutputWithFeatures {
-        value: MicroTari,
+        value: MicroMinotari,
         features: Box<OutputFeatures>,
     },
 
     ReinstateCancelledInboundTx(TxId),
-    SetCoinbaseAbandoned(TxId, bool),
-    CreateClaimShaAtomicSwapTransaction(HashOutput, PublicKey, MicroTari),
-    CreateHtlcRefundTransaction(HashOutput, MicroTari),
-    GetOutputStatusesByTxId(TxId),
+    CreateClaimShaAtomicSwapTransaction(HashOutput, PublicKey, MicroMinotari),
+    CreateHtlcRefundTransaction(HashOutput, MicroMinotari),
+    GetOutputInfoByTxId(TxId),
 }
 
 impl fmt::Display for OutputManagerRequest {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         #[allow(clippy::enum_glob_use)]
         use OutputManagerRequest::*;
         match self {
             GetBalance => write!(f, "GetBalance"),
             AddOutput((v, _)) => write!(f, "AddOutput ({})", v.value),
-            AddRewindableOutput((v, _, _)) => write!(f, "AddRewindableOutput ({})", v.value),
             AddOutputWithTxId((t, v, _)) => write!(f, "AddOutputWithTxId ({}: {})", t, v.value),
-            AddRewindableOutputWithTxId((t, v, _, _)) => write!(f, "AddRewindableOutputWithTxId ({}: {})", t, v.value),
-            ConvertToRewindableTransactionOutput(v) => write!(f, "GetUnblindedOutputAsRewindableOutput ({})", v.value),
             AddUnvalidatedOutput((t, v, _)) => {
                 write!(f, "AddUnvalidatedOutput ({}: {})", t, v.value)
             },
@@ -166,14 +180,56 @@ impl fmt::Display for OutputManagerRequest {
                 v.metadata_signature.u_y().to_hex(),
                 v.metadata_signature.u_a().to_hex(),
             ),
+            ScrapeWallet {
+                tx_id,
+                fee_per_gram,
+                recipient_address,
+            } => {
+                write!(
+                    f,
+                    "ScrapeWallet (tx_id: {}, fee_per_gram: {}, recipient_address {})",
+                    tx_id, fee_per_gram, recipient_address
+                )
+            },
+            EncumberAggregateUtxo {
+                tx_id,
+                expected_commitment,
+                original_maturity,
+                use_output,
+                ..
+            } => {
+                let output_hash = match use_output {
+                    UseOutput::FromBlockchain(hash) => *hash,
+                    UseOutput::AsProvided(output) => output.hash(),
+                };
+                write!(
+                    f,
+                    "Encumber aggregate utxo with tx_id: {} and output: ({},{}) with original maturity: {}",
+                    tx_id,
+                    expected_commitment.to_hex(),
+                    output_hash,
+                    original_maturity,
+                )
+            },
+            SpendBackupPreMineUtxo {
+                tx_id,
+                output_hash,
+                expected_commitment,
+                ..
+            } => write!(
+                f,
+                "spending backup pre-mine utxo with tx_id: {} and output: ({},{})",
+                tx_id,
+                expected_commitment.to_hex(),
+                output_hash
+            ),
             GetRecipientTransaction(_) => write!(f, "GetRecipientTransaction"),
             ConfirmPendingTransaction(v) => write!(f, "ConfirmPendingTransaction ({})", v),
-            PrepareToSendTransaction { message, .. } => write!(f, "PrepareToSendTransaction ({})", message),
+            PrepareToSendTransaction { payment_id, .. } => write!(f, "PrepareToSendTransaction ({})", payment_id),
             CreatePayToSelfTransaction { .. } => write!(f, "CreatePayToSelfTransaction",),
             CancelTransaction(v) => write!(f, "CancelTransaction ({})", v),
             GetSpentOutputs => write!(f, "GetSpentOutputs"),
             GetUnspentOutputs => write!(f, "GetUnspentOutputs"),
-            GetOutputsBy(q) => write!(f, "GetOutputs({:#?})", q),
             GetInvalidOutputs => write!(f, "GetInvalidOutputs"),
             ValidateUtxos => write!(f, "ValidateUtxos"),
             RevalidateTxos => write!(f, "RevalidateTxos"),
@@ -192,12 +248,12 @@ impl fmt::Display for OutputManagerRequest {
             CreateCoinJoin {
                 commitments,
                 fee_per_gram,
+                ..
             } => write!(
                 f,
                 "CreateCoinJoin: commitments={:#?}, fee_per_gram={}",
                 commitments, fee_per_gram,
             ),
-            GetCoinbaseTransaction { .. } => write!(f, "GetCoinbaseTransaction"),
             FeeEstimate {
                 amount,
                 selection_criteria,
@@ -217,22 +273,18 @@ impl fmt::Display for OutputManagerRequest {
             },
             CreatePayToSelfWithOutputs { .. } => write!(f, "CreatePayToSelfWithOutputs"),
             ReinstateCancelledInboundTx(_) => write!(f, "ReinstateCancelledInboundTx"),
-            SetCoinbaseAbandoned(_, _) => write!(f, "SetCoinbaseAbandoned"),
             CreateClaimShaAtomicSwapTransaction(output, pre_image, fee_per_gram) => write!(
                 f,
                 "ClaimShaAtomicSwap(output hash: {}, pre_image: {}, fee_per_gram: {} )",
-                output.to_hex(),
-                pre_image,
-                fee_per_gram,
+                output, pre_image, fee_per_gram,
             ),
             CreateHtlcRefundTransaction(output, fee_per_gram) => write!(
                 f,
                 "CreateHtlcRefundTransaction(output hash: {}, , fee_per_gram: {} )",
-                output.to_hex(),
-                fee_per_gram,
+                output, fee_per_gram,
             ),
 
-            GetOutputStatusesByTxId(t) => write!(f, "GetOutputStatusesByTxId: {}", t),
+            GetOutputInfoByTxId(t) => write!(f, "GetOutputInfoByTxId: {}", t),
         }
     }
 }
@@ -245,32 +297,47 @@ pub enum OutputManagerResponse {
     ConvertedToTransactionOutput(Box<TransactionOutput>),
     OutputMetadataSignatureUpdated,
     RecipientTransactionGenerated(ReceiverTransactionProtocol),
-    CoinbaseTransaction(Transaction),
+    EncumberAggregateUtxo(
+        (
+            Transaction,
+            MicroMinotari,
+            MicroMinotari,
+            PublicKey,
+            PublicKey,
+            PublicKey,
+            PublicKey,
+        ),
+    ),
+    SpendBackupPreMineUtxo((Transaction, MicroMinotari, MicroMinotari)),
     OutputConfirmed,
     PendingTransactionConfirmed,
-    PayToSelfTransaction((MicroTari, Transaction)),
+    PayToSelfTransaction((MicroMinotari, Transaction)),
     TransactionToSend(SenderTransactionProtocol),
     TransactionCancelled,
-    SpentOutputs(Vec<UnblindedOutput>),
-    UnspentOutputs(Vec<UnblindedOutput>),
-    Outputs(Vec<UnblindedOutput>),
-    InvalidOutputs(Vec<UnblindedOutput>),
+    SpentOutputs(Vec<DbWalletOutput>),
+    UnspentOutputs(Vec<DbWalletOutput>),
+    Outputs(Vec<WalletOutput>),
+    InvalidOutputs(Vec<WalletOutput>),
     BaseNodePublicKeySet,
     TxoValidationStarted(u64),
-    Transaction((TxId, Transaction, MicroTari)),
+    Transaction((TxId, Transaction, MicroMinotari)),
     PublicRewindKeys(Box<PublicRewindKeys>),
     RecoveryByte(u8),
-    FeeEstimate(MicroTari),
+    FeeEstimate(MicroMinotari),
     RewoundOutputs(Vec<RecoveredOutput>),
     ScanOutputs(Vec<RecoveredOutput>),
     AddKnownOneSidedPaymentScript,
-    CreateOutputWithFeatures { output: Box<UnblindedOutputBuilder> },
-    CreatePayToSelfWithOutputs { transaction: Box<Transaction>, tx_id: TxId },
+    CreateOutputWithFeatures {
+        output: Box<WalletOutputBuilder>,
+    },
+    CreatePayToSelfWithOutputs {
+        transaction: Box<Transaction>,
+        tx_id: TxId,
+    },
     ReinstatedCancelledInboundTx,
-    CoinbaseAbandonedSet,
-    ClaimHtlcTransaction((TxId, MicroTari, MicroTari, Transaction)),
-    OutputStatusesByTxId(OutputStatusesByTxId),
-    CoinPreview((Vec<MicroTari>, MicroTari)),
+    ClaimHtlcTransaction((TxId, MicroMinotari, MicroMinotari, Transaction)),
+    OutputInfoByTxId(OutputInfoByTxId),
+    CoinPreview((Vec<MicroMinotari>, MicroMinotari)),
 }
 
 pub type OutputManagerEventSender = broadcast::Sender<Arc<OutputManagerEvent>>;
@@ -312,7 +379,8 @@ pub struct PublicRewindKeys {
 #[derive(Debug, Clone)]
 pub struct RecoveredOutput {
     pub tx_id: TxId,
-    pub output: UnblindedOutput,
+    pub output: WalletOutput,
+    pub hash: FixedHash,
 }
 
 #[derive(Clone)]
@@ -338,7 +406,7 @@ impl OutputManagerHandle {
 
     pub async fn add_output(
         &mut self,
-        output: UnblindedOutput,
+        output: WalletOutput,
         spend_priority: Option<SpendingPriority>,
     ) -> Result<(), OutputManagerError> {
         match self
@@ -351,31 +419,10 @@ impl OutputManagerHandle {
         }
     }
 
-    // ToDo: This API method call could probably be removed by expanding test utils if only needed for testing
-    pub async fn add_rewindable_output(
-        &mut self,
-        output: UnblindedOutput,
-        spend_priority: Option<SpendingPriority>,
-        custom_rewind_data: Option<RewindData>,
-    ) -> Result<(), OutputManagerError> {
-        match self
-            .handle
-            .call(OutputManagerRequest::AddRewindableOutput((
-                Box::new(output),
-                spend_priority,
-                custom_rewind_data,
-            )))
-            .await??
-        {
-            OutputManagerResponse::OutputAdded => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
-        }
-    }
-
     pub async fn add_output_with_tx_id(
         &mut self,
         tx_id: TxId,
-        output: UnblindedOutput,
+        output: WalletOutput,
         spend_priority: Option<SpendingPriority>,
     ) -> Result<(), OutputManagerError> {
         match self
@@ -392,49 +439,10 @@ impl OutputManagerHandle {
         }
     }
 
-    pub async fn add_rewindable_output_with_tx_id(
-        &mut self,
-        tx_id: TxId,
-        output: UnblindedOutput,
-        spend_priority: Option<SpendingPriority>,
-        custom_rewind_data: Option<RewindData>,
-    ) -> Result<(), OutputManagerError> {
-        match self
-            .handle
-            .call(OutputManagerRequest::AddRewindableOutputWithTxId((
-                tx_id,
-                Box::new(output),
-                spend_priority,
-                custom_rewind_data,
-            )))
-            .await??
-        {
-            OutputManagerResponse::OutputAdded => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
-        }
-    }
-
-    // ToDo: This API method call could probably be removed by expanding test utils if only needed for testing
-    pub async fn convert_to_rewindable_transaction_output(
-        &mut self,
-        output: UnblindedOutput,
-    ) -> Result<TransactionOutput, OutputManagerError> {
-        match self
-            .handle
-            .call(OutputManagerRequest::ConvertToRewindableTransactionOutput(Box::new(
-                output,
-            )))
-            .await??
-        {
-            OutputManagerResponse::ConvertedToTransactionOutput(val) => Ok(*val),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
-        }
-    }
-
     pub async fn add_unvalidated_output(
         &mut self,
         tx_id: TxId,
-        output: UnblindedOutput,
+        output: WalletOutput,
         spend_priority: Option<SpendingPriority>,
     ) -> Result<(), OutputManagerError> {
         match self
@@ -453,9 +461,9 @@ impl OutputManagerHandle {
 
     pub async fn create_output_with_features(
         &mut self,
-        value: MicroTari,
+        value: MicroMinotari,
         features: OutputFeatures,
-    ) -> Result<UnblindedOutputBuilder, OutputManagerError> {
+    ) -> Result<WalletOutputBuilder, OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreateOutputWithFeatures {
@@ -511,42 +519,19 @@ impl OutputManagerHandle {
         }
     }
 
-    pub async fn get_coinbase_transaction(
-        &mut self,
-        tx_id: TxId,
-        reward: MicroTari,
-        fees: MicroTari,
-        block_height: u64,
-        extra: Vec<u8>,
-    ) -> Result<Transaction, OutputManagerError> {
-        match self
-            .handle
-            .call(OutputManagerRequest::GetCoinbaseTransaction {
-                tx_id,
-                reward,
-                fees,
-                block_height,
-                extra,
-            })
-            .await??
-        {
-            OutputManagerResponse::CoinbaseTransaction(tx) => Ok(tx),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
-        }
-    }
-
     pub async fn prepare_transaction_to_send(
         &mut self,
         tx_id: TxId,
-        amount: MicroTari,
+        amount: MicroMinotari,
         utxo_selection: UtxoSelectionCriteria,
         output_features: OutputFeatures,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         tx_meta: TransactionMetadata,
-        message: String,
         script: TariScript,
         covenant: Covenant,
-        minimum_value_promise: MicroTari,
+        minimum_value_promise: MicroMinotari,
+        recipient_address: TariAddress,
+        payment_id: PaymentId,
     ) -> Result<SenderTransactionProtocol, OutputManagerError> {
         match self
             .handle
@@ -557,10 +542,11 @@ impl OutputManagerHandle {
                 output_features: Box::new(output_features),
                 fee_per_gram,
                 tx_meta,
-                message,
                 script,
                 covenant,
                 minimum_value_promise,
+                recipient_address,
+                payment_id,
             })
             .await??
         {
@@ -569,16 +555,36 @@ impl OutputManagerHandle {
         }
     }
 
-    /// Get a fee estimate for an amount of MicroTari, at a specified fee per gram and given number of kernels and
+    pub async fn scrape_wallet(
+        &mut self,
+        tx_id: TxId,
+        fee_per_gram: MicroMinotari,
+        recipient_address: TariAddress,
+    ) -> Result<SenderTransactionProtocol, OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::ScrapeWallet {
+                tx_id,
+                fee_per_gram,
+                recipient_address,
+            })
+            .await??
+        {
+            OutputManagerResponse::TransactionToSend(stp) => Ok(stp),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
+    /// Get a fee estimate for an amount of MicroMinotari, at a specified fee per gram and given number of kernels and
     /// outputs.
     pub async fn fee_estimate(
         &mut self,
-        amount: MicroTari,
+        amount: MicroMinotari,
         selection_criteria: UtxoSelectionCriteria,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         num_kernels: usize,
         num_outputs: usize,
-    ) -> Result<MicroTari, OutputManagerError> {
+    ) -> Result<MicroMinotari, OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::FeeEstimate {
@@ -617,7 +623,7 @@ impl OutputManagerHandle {
         }
     }
 
-    pub async fn get_spent_outputs(&mut self) -> Result<Vec<UnblindedOutput>, OutputManagerError> {
+    pub async fn get_spent_outputs(&mut self) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::GetSpentOutputs).await?? {
             OutputManagerResponse::SpentOutputs(s) => Ok(s),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
@@ -625,15 +631,14 @@ impl OutputManagerHandle {
     }
 
     /// Sorted from lowest value to highest
-    pub async fn get_unspent_outputs(&mut self) -> Result<Vec<UnblindedOutput>, OutputManagerError> {
+    pub async fn get_unspent_outputs(&mut self) -> Result<Vec<DbWalletOutput>, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::GetUnspentOutputs).await?? {
             OutputManagerResponse::UnspentOutputs(s) => Ok(s),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
         }
     }
 
-    // ToDo: This API method call could probably be removed by expanding test utils if only needed for testing
-    pub async fn get_invalid_outputs(&mut self) -> Result<Vec<UnblindedOutput>, OutputManagerError> {
+    pub async fn get_invalid_outputs(&mut self) -> Result<Vec<WalletOutput>, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::GetInvalidOutputs).await?? {
             OutputManagerResponse::InvalidOutputs(s) => Ok(s),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
@@ -650,8 +655,8 @@ impl OutputManagerHandle {
     pub async fn preview_coin_join_with_commitments(
         &mut self,
         commitments: Vec<Commitment>,
-        fee_per_gram: MicroTari,
-    ) -> Result<(Vec<MicroTari>, MicroTari), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+    ) -> Result<(Vec<MicroMinotari>, MicroMinotari), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::PreviewCoinJoin((commitments, fee_per_gram)))
@@ -666,8 +671,8 @@ impl OutputManagerHandle {
         &mut self,
         commitments: Vec<Commitment>,
         split_count: usize,
-        fee_per_gram: MicroTari,
-    ) -> Result<(Vec<MicroTari>, MicroTari), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+    ) -> Result<(Vec<MicroMinotari>, MicroMinotari), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::PreviewCoinSplitEven((
@@ -687,10 +692,10 @@ impl OutputManagerHandle {
     pub async fn create_coin_split(
         &mut self,
         commitments: Vec<Commitment>,
-        amount_per_split: MicroTari,
+        amount_per_split: MicroMinotari,
         split_count: usize,
-        fee_per_gram: MicroTari,
-    ) -> Result<(TxId, Transaction, MicroTari), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+    ) -> Result<(TxId, Transaction, MicroMinotari), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreateCoinSplit((
@@ -710,8 +715,8 @@ impl OutputManagerHandle {
         &mut self,
         commitments: Vec<Commitment>,
         split_count: usize,
-        fee_per_gram: MicroTari,
-    ) -> Result<(TxId, Transaction, MicroTari), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+    ) -> Result<(TxId, Transaction, MicroMinotari), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreateCoinSplitEven((
@@ -729,13 +734,15 @@ impl OutputManagerHandle {
     pub async fn create_coin_join(
         &mut self,
         commitments: Vec<Commitment>,
-        fee_per_gram: MicroTari,
-    ) -> Result<(TxId, Transaction, MicroTari), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+        payment_id: PaymentId,
+    ) -> Result<(TxId, Transaction, MicroMinotari), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreateCoinJoin {
                 commitments,
                 fee_per_gram,
+                payment_id,
             })
             .await??
         {
@@ -747,8 +754,8 @@ impl OutputManagerHandle {
     pub async fn create_htlc_refund_transaction(
         &mut self,
         output: HashOutput,
-        fee_per_gram: MicroTari,
-    ) -> Result<(TxId, MicroTari, MicroTari, Transaction), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+    ) -> Result<(TxId, MicroMinotari, MicroMinotari, Transaction), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreateHtlcRefundTransaction(output, fee_per_gram))
@@ -763,8 +770,8 @@ impl OutputManagerHandle {
         &mut self,
         output: HashOutput,
         pre_image: PublicKey,
-        fee_per_gram: MicroTari,
-    ) -> Result<(TxId, MicroTari, MicroTari, Transaction), OutputManagerError> {
+        fee_per_gram: MicroMinotari,
+    ) -> Result<(TxId, MicroMinotari, MicroMinotari, Transaction), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreateClaimShaAtomicSwapTransaction(
@@ -781,7 +788,7 @@ impl OutputManagerHandle {
 
     pub async fn scan_for_recoverable_outputs(
         &mut self,
-        outputs: Vec<TransactionOutput>,
+        outputs: Vec<(TransactionOutput, Option<TxId>)>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
         match self
             .handle
@@ -795,7 +802,7 @@ impl OutputManagerHandle {
 
     pub async fn scan_outputs_for_one_sided_payments(
         &mut self,
-        outputs: Vec<TransactionOutput>,
+        outputs: Vec<(TransactionOutput, Option<TxId>)>,
     ) -> Result<Vec<RecoveredOutput>, OutputManagerError> {
         match self.handle.call(OutputManagerRequest::ScanOutputs(outputs)).await?? {
             OutputManagerResponse::ScanOutputs(outputs) => Ok(outputs),
@@ -816,9 +823,10 @@ impl OutputManagerHandle {
 
     pub async fn create_send_to_self_with_output(
         &mut self,
-        outputs: Vec<UnblindedOutputBuilder>,
-        fee_per_gram: MicroTari,
+        outputs: Vec<WalletOutputBuilder>,
+        fee_per_gram: MicroMinotari,
         input_selection: UtxoSelectionCriteria,
+        payment_id: PaymentId,
     ) -> Result<(TxId, Transaction), OutputManagerError> {
         match self
             .handle
@@ -826,6 +834,7 @@ impl OutputManagerHandle {
                 outputs,
                 fee_per_gram,
                 selection_criteria: input_selection,
+                payment_id,
             })
             .await??
         {
@@ -834,15 +843,106 @@ impl OutputManagerHandle {
         }
     }
 
+    #[allow(clippy::mutable_key_type)]
+    pub async fn encumber_aggregate_utxo(
+        &mut self,
+        tx_id: TxId,
+        fee_per_gram: MicroMinotari,
+        expected_commitment: PedersenCommitment,
+        script_input_shares: HashMap<PublicKey, CheckSigSchnorrSignature>,
+        script_signature_public_nonces: Vec<PublicKey>,
+        sender_offset_public_key_shares: Vec<PublicKey>,
+        metadata_ephemeral_public_key_shares: Vec<PublicKey>,
+        dh_shared_secret_shares: Vec<PublicKey>,
+        recipient_address: TariAddress,
+        original_maturity: u64,
+        use_output: UseOutput,
+        payment_id: PaymentId,
+    ) -> Result<
+        (
+            Transaction,
+            MicroMinotari,
+            MicroMinotari,
+            PublicKey,
+            PublicKey,
+            PublicKey,
+            PublicKey,
+        ),
+        OutputManagerError,
+    > {
+        match self
+            .handle
+            .call(OutputManagerRequest::EncumberAggregateUtxo {
+                tx_id,
+                fee_per_gram,
+                expected_commitment,
+                script_input_shares,
+                script_signature_public_nonces,
+                sender_offset_public_key_shares,
+                metadata_ephemeral_public_key_shares,
+                dh_shared_secret_shares,
+                recipient_address,
+                original_maturity,
+                use_output,
+                payment_id,
+            })
+            .await??
+        {
+            OutputManagerResponse::EncumberAggregateUtxo((
+                transaction,
+                amount,
+                fee,
+                total_script_key,
+                total_metadata_ephemeral_public_key,
+                total_script_nonce,
+                shared_secret,
+            )) => Ok((
+                transaction,
+                amount,
+                fee,
+                total_script_key,
+                total_metadata_ephemeral_public_key,
+                total_script_nonce,
+                shared_secret,
+            )),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
+    pub async fn spend_backup_pre_mine_utxo(
+        &mut self,
+        tx_id: TxId,
+        fee_per_gram: MicroMinotari,
+        output_hash: HashOutput,
+        expected_commitment: PedersenCommitment,
+        recipient_address: TariAddress,
+    ) -> Result<(Transaction, MicroMinotari, MicroMinotari), OutputManagerError> {
+        match self
+            .handle
+            .call(OutputManagerRequest::SpendBackupPreMineUtxo {
+                tx_id,
+                fee_per_gram,
+                output_hash,
+                expected_commitment,
+                recipient_address,
+            })
+            .await??
+        {
+            OutputManagerResponse::SpendBackupPreMineUtxo((transaction, amount, fee)) => Ok((transaction, amount, fee)),
+            _ => Err(OutputManagerError::UnexpectedApiResponse),
+        }
+    }
+
     pub async fn create_pay_to_self_transaction(
         &mut self,
         tx_id: TxId,
-        amount: MicroTari,
+        amount: MicroMinotari,
         utxo_selection: UtxoSelectionCriteria,
         output_features: OutputFeatures,
-        fee_per_gram: MicroTari,
+        fee_per_gram: MicroMinotari,
         lock_height: Option<u64>,
-    ) -> Result<(MicroTari, Transaction), OutputManagerError> {
+        payment_id: PaymentId,
+    ) -> Result<(MicroMinotari, Transaction), OutputManagerError> {
         match self
             .handle
             .call(OutputManagerRequest::CreatePayToSelfTransaction {
@@ -852,6 +952,7 @@ impl OutputManagerHandle {
                 output_features: Box::new(output_features),
                 fee_per_gram,
                 lock_height,
+                payment_id,
             })
             .await??
         {
@@ -874,27 +975,13 @@ impl OutputManagerHandle {
         }
     }
 
-    pub async fn set_coinbase_abandoned(&mut self, tx_id: TxId, abandoned: bool) -> Result<(), OutputManagerError> {
+    pub async fn get_output_info_for_tx_id(&mut self, tx_id: TxId) -> Result<OutputInfoByTxId, OutputManagerError> {
         match self
             .handle
-            .call(OutputManagerRequest::SetCoinbaseAbandoned(tx_id, abandoned))
+            .call(OutputManagerRequest::GetOutputInfoByTxId(tx_id))
             .await??
         {
-            OutputManagerResponse::CoinbaseAbandonedSet => Ok(()),
-            _ => Err(OutputManagerError::UnexpectedApiResponse),
-        }
-    }
-
-    pub async fn get_output_statuses_by_tx_id(
-        &mut self,
-        tx_id: TxId,
-    ) -> Result<OutputStatusesByTxId, OutputManagerError> {
-        match self
-            .handle
-            .call(OutputManagerRequest::GetOutputStatusesByTxId(tx_id))
-            .await??
-        {
-            OutputManagerResponse::OutputStatusesByTxId(output_statuses_by_tx_id) => Ok(output_statuses_by_tx_id),
+            OutputManagerResponse::OutputInfoByTxId(output_info_by_tx_id) => Ok(output_info_by_tx_id),
             _ => Err(OutputManagerError::UnexpectedApiResponse),
         }
     }

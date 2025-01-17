@@ -20,70 +20,72 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::{
-    convert::{TryFrom, TryInto},
-    mem,
-};
+use std::convert::{TryFrom, TryInto};
 
+use primitive_types::U256;
 use tari_common_types::{chain_metadata::ChainMetadata, types::FixedHash};
 
 use crate::proto::base_node as proto;
 
+const ACCUMULATED_DIFFICULTY_BYTE_SIZE: usize = 32;
 impl TryFrom<proto::ChainMetadata> for ChainMetadata {
     type Error = String;
 
     fn try_from(metadata: proto::ChainMetadata) -> Result<Self, Self::Error> {
-        const ACC_DIFFICULTY_ARRAY_LEN: usize = mem::size_of::<u128>();
-        if metadata.accumulated_difficulty.len() != ACC_DIFFICULTY_ARRAY_LEN {
+        if metadata.accumulated_difficulty.len() != ACCUMULATED_DIFFICULTY_BYTE_SIZE {
             return Err(format!(
                 "Invalid accumulated difficulty byte length. {} was expected but the actual length was {}",
-                ACC_DIFFICULTY_ARRAY_LEN,
+                ACCUMULATED_DIFFICULTY_BYTE_SIZE,
                 metadata.accumulated_difficulty.len()
             ));
         }
 
-        let mut acc_diff = [0; ACC_DIFFICULTY_ARRAY_LEN];
-        acc_diff.copy_from_slice(&metadata.accumulated_difficulty[0..ACC_DIFFICULTY_ARRAY_LEN]);
-        let accumulated_difficulty = u128::from_be_bytes(acc_diff);
-        let height_of_longest_chain = metadata
-            .height_of_longest_chain
-            .ok_or_else(|| "Height of longest chain is missing".to_string())?;
+        let accumulated_difficulty = U256::from_big_endian(&metadata.accumulated_difficulty);
+        let best_block_height = metadata.best_block_height;
+
         let pruning_horizon = if metadata.pruned_height == 0 {
             metadata.pruned_height
         } else {
-            height_of_longest_chain.saturating_sub(metadata.pruned_height)
+            best_block_height.saturating_sub(metadata.pruned_height)
         };
+
+        if metadata.best_block_hash.is_empty() {
+            return Err("Best block is missing".to_string());
+        }
         let hash: FixedHash = metadata
-            .best_block
-            .ok_or_else(|| "Best block is missing".to_string())?
+            .best_block_hash
             .try_into()
             .map_err(|e| format!("Malformed best block: {}", e))?;
-        Ok(ChainMetadata::new(
-            height_of_longest_chain,
+        ChainMetadata::new(
+            best_block_height,
             hash,
             pruning_horizon,
             metadata.pruned_height,
             accumulated_difficulty,
-            metadata.timestamp.unwrap_or_default(),
-        ))
+            metadata.timestamp,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
 impl From<ChainMetadata> for proto::ChainMetadata {
     fn from(metadata: ChainMetadata) -> Self {
-        let accumulated_difficulty = metadata.accumulated_difficulty().to_be_bytes().to_vec();
+        let mut accumulated_difficulty = [0u8; ACCUMULATED_DIFFICULTY_BYTE_SIZE];
+        metadata
+            .accumulated_difficulty()
+            .to_big_endian(&mut accumulated_difficulty);
         Self {
-            height_of_longest_chain: Some(metadata.height_of_longest_chain()),
-            best_block: Some(metadata.best_block().to_vec()),
+            best_block_height: metadata.best_block_height(),
+            best_block_hash: metadata.best_block_hash().to_vec(),
             pruned_height: metadata.pruned_height(),
-            accumulated_difficulty,
-            timestamp: Some(metadata.timestamp()),
+            accumulated_difficulty: accumulated_difficulty.to_vec(),
+            timestamp: metadata.timestamp(),
         }
     }
 }
 
 impl proto::ChainMetadata {
-    pub fn height_of_longest_chain(&self) -> u64 {
-        self.height_of_longest_chain.unwrap_or(0)
+    pub fn best_block_height(&self) -> u64 {
+        self.best_block_height
     }
 }

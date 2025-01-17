@@ -25,6 +25,7 @@ book/
 
 # Ignore Code Coverage Report files
 report
+lcov.info
 
 # On development branch only. This should be removed for point releases
 *.log
@@ -62,3 +63,12 @@ clients/base_node_grpc_client/package-lock.json
 clients/validator_node_grpc_client/package-lock.json
 clients/wallet_grpc_client/package-lock.json
 pie/
+/integration_tests/.husky/_/husky.sh
+/integration_tests/tests/temp
+integration_tests/cucumber-output-junit.xml
+
+integration_tests/log/
+
+# Ignore MinoTari Ledger Wallet
+app_nanosplus.json
+app_nanos.json

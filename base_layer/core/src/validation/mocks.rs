@@ -23,26 +23,27 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
+    RwLock,
 };
 
-use async_trait::async_trait;
 use tari_common_types::{chain_metadata::ChainMetadata, types::Commitment};
+use tari_utilities::epoch_time::EpochTime;
 
+use super::{
+    traits::CandidateBlockValidator,
+    BlockBodyValidator,
+    HeaderChainLinkedValidator,
+    InternalConsistencyValidator,
+    TransactionValidator,
+};
 use crate::{
     blocks::{Block, BlockHeader, ChainBlock},
     chain_storage::BlockchainBackend,
-    proof_of_work::{sha3x_difficulty, AchievedTargetDifficulty, Difficulty, PowAlgorithm},
+    proof_of_work::{randomx_factory::RandomXFactory, AchievedTargetDifficulty, Difficulty},
+    test_helpers::create_consensus_rules,
     transactions::transaction_components::Transaction,
-    validation::{
-        error::ValidationError,
-        BlockSyncBodyValidation,
-        DifficultyCalculator,
-        FinalHorizonStateValidation,
-        HeaderValidation,
-        MempoolTransactionValidation,
-        OrphanValidation,
-        PostOrphanBodyValidation,
-    },
+    validation::{error::ValidationError, DifficultyCalculator, FinalHorizonStateValidation},
+    OutputSmt,
 };
 
 #[derive(Clone)]
@@ -70,73 +71,78 @@ impl MockValidator {
     }
 }
 
-#[async_trait]
-impl BlockSyncBodyValidation for MockValidator {
-    async fn validate_body(&self, block: Block) -> Result<Block, ValidationError> {
+impl<B: BlockchainBackend> BlockBodyValidator<B> for MockValidator {
+    fn validate_body(&self, _: &B, block: &Block, _: Arc<RwLock<OutputSmt>>) -> Result<Block, ValidationError> {
         if self.is_valid.load(Ordering::SeqCst) {
-            Ok(block)
+            Ok(block.clone())
         } else {
-            Err(ValidationError::custom_error(
-                "This mock validator always returns an error",
+            Err(ValidationError::ConsensusError(
+                "This mock validator always returns an error".to_string(),
             ))
         }
     }
 }
 
-impl<B: BlockchainBackend> PostOrphanBodyValidation<B> for MockValidator {
-    fn validate_body_for_valid_orphan(&self, _: &B, _: &ChainBlock, _: &ChainMetadata) -> Result<(), ValidationError> {
+impl<B: BlockchainBackend> CandidateBlockValidator<B> for MockValidator {
+    fn validate_body_with_metadata(
+        &self,
+        _: &B,
+        _: &ChainBlock,
+        _: &ChainMetadata,
+        _: Arc<RwLock<OutputSmt>>,
+    ) -> Result<(), ValidationError> {
         if self.is_valid.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(ValidationError::custom_error(
-                "This mock validator always returns an error",
+            Err(ValidationError::ConsensusError(
+                "This mock validator always returns an error".to_string(),
             ))
         }
     }
 }
 
 // #[async_trait]
-impl OrphanValidation for MockValidator {
-    fn validate(&self, _item: &Block) -> Result<(), ValidationError> {
+impl InternalConsistencyValidator for MockValidator {
+    fn validate_internal_consistency(&self, _item: &Block) -> Result<(), ValidationError> {
         if self.is_valid.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(ValidationError::custom_error(
-                "This mock validator always returns an error",
+            Err(ValidationError::ConsensusError(
+                "This mock validator always returns an error".to_string(),
             ))
         }
     }
 }
 
-impl<B: BlockchainBackend> HeaderValidation<B> for MockValidator {
+impl<B: BlockchainBackend> HeaderChainLinkedValidator<B> for MockValidator {
     fn validate(
         &self,
-        _: &B,
+        db: &B,
         header: &BlockHeader,
-        _: &DifficultyCalculator,
+        _: &BlockHeader,
+        _: &[EpochTime],
+        _: Option<Difficulty>,
     ) -> Result<AchievedTargetDifficulty, ValidationError> {
         if self.is_valid.load(Ordering::SeqCst) {
-            let achieved = sha3x_difficulty(header);
-
-            let achieved_target =
-                AchievedTargetDifficulty::try_construct(PowAlgorithm::Sha3, achieved - Difficulty::from(1), achieved)
-                    .unwrap();
-            Ok(achieved_target)
+            // this assumes consensus rules are the same as the test rules which is a little brittle
+            let difficulty_calculator = DifficultyCalculator::new(create_consensus_rules(), RandomXFactory::default());
+            let achieved_target_diff = difficulty_calculator.check_achieved_and_target_difficulty(db, header)?;
+            Ok(achieved_target_diff)
         } else {
-            Err(ValidationError::custom_error(
-                "This mock validator always returns an error",
+            Err(ValidationError::ConsensusError(
+                "This mock validator always returns an error".to_string(),
             ))
         }
     }
 }
 
-impl MempoolTransactionValidation for MockValidator {
+impl TransactionValidator for MockValidator {
     fn validate(&self, _transaction: &Transaction) -> Result<(), ValidationError> {
         if self.is_valid.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(ValidationError::custom_error(
-                "This mock validator always returns an error",
+            Err(ValidationError::ConsensusError(
+                "This mock validator always returns an error".to_string(),
             ))
         }
     }
@@ -154,8 +160,8 @@ impl<B: BlockchainBackend> FinalHorizonStateValidation<B> for MockValidator {
         if self.is_valid.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            Err(ValidationError::custom_error(
-                "This mock validator always returns an error",
+            Err(ValidationError::ConsensusError(
+                "This mock validator always returns an error".to_string(),
             ))
         }
     }

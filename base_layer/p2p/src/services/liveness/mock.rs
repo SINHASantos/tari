@@ -123,10 +123,13 @@ impl LivenessMock {
         let (req, reply) = req.split();
         trace!(target: LOG_TARGET, "LivenessMock received request {:?}", req);
         self.mock_state.add_request_call(req.clone());
-        // TODO: Make these responses configurable
         match req {
             SendPing(_) => {
-                reply.send(Ok(LivenessResponse::Ok)).unwrap();
+                reply.send(Ok(LivenessResponse::Ok(Some(vec![0])))).unwrap();
+            },
+            SendPings(node_ids) => {
+                let nonces: Vec<u64> = (0..node_ids.len() as u64).collect();
+                reply.send(Ok(LivenessResponse::Ok(Some(nonces)))).unwrap();
             },
             GetPingCount => {
                 reply.send(Ok(LivenessResponse::Count(1))).unwrap();
@@ -141,13 +144,13 @@ impl LivenessMock {
                 reply.send(Ok(LivenessResponse::AvgLatency(None))).unwrap();
             },
             SetMetadataEntry(_, _) => {
-                reply.send(Ok(LivenessResponse::Ok)).unwrap();
+                reply.send(Ok(LivenessResponse::Ok(None))).unwrap();
             },
             AddMonitoredPeer(_) => {
-                reply.send(Ok(LivenessResponse::Ok)).unwrap();
+                reply.send(Ok(LivenessResponse::Ok(None))).unwrap();
             },
             RemoveMonitoredPeer(_) => {
-                reply.send(Ok(LivenessResponse::Ok)).unwrap();
+                reply.send(Ok(LivenessResponse::Ok(None))).unwrap();
             },
         }
     }

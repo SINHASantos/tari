@@ -41,14 +41,21 @@ use super::{
     peer_connection::PeerConnection,
     requester::ConnectionManagerRequest,
 };
+#[cfg(feature = "metrics")]
+use crate::connection_manager::metrics;
+#[cfg(feature = "metrics")]
+use crate::connection_manager::ConnectionDirection;
 use crate::{
     backoff::Backoff,
-    connection_manager::{metrics, ConnectionDirection, ConnectionId},
+    connection_manager::ConnectionId,
     multiplexing::Substream,
+    net_address::MultiaddrRange,
     noise::NoiseConfig,
     peer_manager::{NodeId, NodeIdentity, PeerManagerError},
+    peer_validator::PeerValidatorConfig,
     protocol::{NodeNetworkInfo, ProtocolEvent, ProtocolId, Protocols},
     transports::{TcpTransport, Transport},
+    Minimized,
     PeerManager,
 };
 
@@ -61,13 +68,16 @@ const DIALER_REQUEST_CHANNEL_SIZE: usize = 32;
 #[derive(Debug)]
 pub enum ConnectionManagerEvent {
     // Peer connection
-    PeerConnected(PeerConnection),
-    PeerDisconnected(ConnectionId, NodeId),
+    PeerConnected(Box<PeerConnection>),
+    PeerDisconnected(ConnectionId, NodeId, Minimized),
     PeerConnectFailed(NodeId, ConnectionManagerError),
     PeerInboundConnectFailed(ConnectionManagerError),
 
     // Substreams
     NewInboundSubstream(NodeId, ProtocolId, Substream),
+
+    // Other
+    PeerViolation { peer_node_id: NodeId, details: String },
 }
 
 impl fmt::Display for ConnectionManagerEvent {
@@ -76,7 +86,9 @@ impl fmt::Display for ConnectionManagerEvent {
         use ConnectionManagerEvent::*;
         match self {
             PeerConnected(conn) => write!(f, "PeerConnected({})", conn),
-            PeerDisconnected(id, node_id) => write!(f, "PeerDisconnected({}, {})", id, node_id.short_str()),
+            PeerDisconnected(id, node_id, minimized) => {
+                write!(f, "PeerDisconnected({}, {}, {:?})", id, node_id.short_str(), minimized)
+            },
             PeerConnectFailed(node_id, err) => write!(f, "PeerConnectFailed({}, {:?})", node_id.short_str(), err),
             PeerInboundConnectFailed(err) => write!(f, "PeerInboundConnectFailed({:?})", err),
             NewInboundSubstream(node_id, protocol, _) => write!(
@@ -85,6 +97,9 @@ impl fmt::Display for ConnectionManagerEvent {
                 node_id.short_str(),
                 String::from_utf8_lossy(protocol)
             ),
+            PeerViolation { peer_node_id, details } => {
+                write!(f, "PeerViolation({}, {})", peer_node_id.short_str(), details)
+            },
         }
     }
 }
@@ -100,22 +115,27 @@ pub struct ConnectionManagerConfig {
     /// The maximum number of connection tasks that will be spawned at the same time. Once this limit is reached, peers
     /// attempting to connect will have to wait for another connection attempt to complete. Default: 100
     pub max_simultaneous_inbound_connects: usize,
-    /// Set to true to allow peers to send loopback, local-link and other addresses normally not considered valid for
-    /// peer-to-peer comms. Default: false
-    pub allow_test_addresses: bool,
     /// Version information for this node
     pub network_info: NodeNetworkInfo,
-    /// The maximum time to wait for the first byte before closing the connection. Default: 45s
+    /// The maximum time to wait for the first byte before closing the connection. Default: 3s
     pub time_to_first_byte: Duration,
+    /// The maximum time to wait for a noise protocol handshake message before timing out. For 1.5 RTT XX handshake,
+    /// the responder will wait 2 x this value (1 per receive) before timing out.
+    /// Default: 3s
+    pub noise_handshake_recv_timeout: Duration,
     /// The number of liveness check sessions to allow. Default: 0
     pub liveness_max_sessions: usize,
     /// CIDR blocks that allowlist liveness checks. Default: Localhost only (127.0.0.1/32)
     pub liveness_cidr_allowlist: Vec<cidr::AnyIpCidr>,
     /// Interval to perform self-liveness ping-pong tests. Default: None/disabled
-    pub liveness_self_check_interval: Option<Duration>,
+    pub self_liveness_self_check_interval: Option<Duration>,
     /// If set, an additional TCP-only p2p listener will be started. This is useful for local wallet connections.
     /// Default: None (disabled)
     pub auxiliary_tcp_listener_address: Option<Multiaddr>,
+    /// Peer validation configuration. See [PeerValidatorConfig]
+    pub peer_validation_config: PeerValidatorConfig,
+    /// Addresses that should never be dialed
+    pub excluded_dial_addresses: Vec<MultiaddrRange>,
 }
 
 impl Default for ConnectionManagerConfig {
@@ -130,16 +150,14 @@ impl Default for ConnectionManagerConfig {
             max_dial_attempts: 1,
             max_simultaneous_inbound_connects: 100,
             network_info: Default::default(),
-            #[cfg(not(test))]
-            allow_test_addresses: false,
-            // This must always be true for internal crate tests
-            #[cfg(test)]
-            allow_test_addresses: true,
             liveness_max_sessions: 1,
-            time_to_first_byte: Duration::from_secs(45),
+            time_to_first_byte: Duration::from_secs(6),
             liveness_cidr_allowlist: vec![cidr::AnyIpCidr::V4("127.0.0.1/32".parse().unwrap())],
-            liveness_self_check_interval: None,
+            self_liveness_self_check_interval: None,
             auxiliary_tcp_listener_address: None,
+            peer_validation_config: PeerValidatorConfig::default(),
+            noise_handshake_recv_timeout: Duration::from_secs(6),
+            excluded_dial_addresses: vec![],
         }
     }
 }
@@ -190,7 +208,6 @@ where
     pub(crate) fn new(
         mut config: ConnectionManagerConfig,
         transport: TTransport,
-        noise_config: NoiseConfig,
         backoff: TBackoff,
         request_rx: mpsc::Receiver<ConnectionManagerRequest>,
         node_identity: Arc<NodeIdentity>,
@@ -200,6 +217,9 @@ where
     ) -> Self {
         let (internal_event_tx, internal_event_rx) = mpsc::channel(EVENT_CHANNEL_SIZE);
         let (dialer_tx, dialer_rx) = mpsc::channel(DIALER_REQUEST_CHANNEL_SIZE);
+
+        let noise_config =
+            NoiseConfig::new(node_identity.clone()).with_recv_timeout(config.noise_handshake_recv_timeout);
 
         let listener = PeerListener::new(
             config.clone(),
@@ -216,7 +236,7 @@ where
             info!(target: LOG_TARGET, "Starting auxiliary listener on {}", addr);
             let aux_config = ConnectionManagerConfig {
                 // Disable liveness checks on the auxiliary listener
-                liveness_self_check_interval: None,
+                self_liveness_self_check_interval: None,
                 ..config.clone()
             };
             PeerListener::new(
@@ -401,7 +421,7 @@ where
     }
 
     async fn handle_event(&mut self, event: ConnectionManagerEvent) {
-        use ConnectionManagerEvent::{NewInboundSubstream, PeerConnectFailed, PeerConnected, PeerInboundConnectFailed};
+        use ConnectionManagerEvent::*;
 
         match event {
             NewInboundSubstream(node_id, protocol, stream) => {
@@ -412,6 +432,7 @@ where
                     node_id.short_str(),
                     proto_str
                 );
+                #[cfg(feature = "metrics")]
                 metrics::inbound_substream_counter(&node_id, &protocol).inc();
                 let notify_fut = self
                     .protocols
@@ -443,14 +464,17 @@ where
                         .send(DialerRequest::NotifyNewInboundConnection(conn.clone()))
                         .await;
                 }
+                #[cfg(feature = "metrics")]
                 metrics::successful_connections(conn.peer_node_id(), conn.direction()).inc();
                 self.publish_event(PeerConnected(conn));
             },
             PeerConnectFailed(peer, err) => {
+                #[cfg(feature = "metrics")]
                 metrics::failed_connections(&peer, ConnectionDirection::Outbound).inc();
                 self.publish_event(PeerConnectFailed(peer, err));
             },
             PeerInboundConnectFailed(err) => {
+                #[cfg(feature = "metrics")]
                 metrics::failed_connections(&Default::default(), ConnectionDirection::Inbound).inc();
                 self.publish_event(PeerInboundConnectFailed(err));
             },
@@ -472,7 +496,6 @@ where
         let _result = self.connection_manager_events_tx.send(Arc::new(event));
     }
 
-    #[tracing::instrument(level = "trace", skip(self, reply))]
     async fn dial_peer(
         &mut self,
         node_id: NodeId,

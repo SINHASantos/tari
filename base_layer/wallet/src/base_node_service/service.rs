@@ -22,10 +22,11 @@
 
 use std::{sync::Arc, time::Duration};
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use futures::{future, StreamExt};
 use log::*;
 use tari_common_types::chain_metadata::ChainMetadata;
+use tari_comms::peer_manager::NodeId;
 use tari_service_framework::reply_channel::Receiver;
 use tari_shutdown::ShutdownSignal;
 use tokio::sync::RwLock;
@@ -46,9 +47,10 @@ const LOG_TARGET: &str = "wallet::base_node_service::service";
 /// State determined from Base Node Service Requests
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct BaseNodeState {
+    pub node_id: Option<NodeId>,
     pub chain_metadata: Option<ChainMetadata>,
     pub is_synced: Option<bool>,
-    pub updated: Option<NaiveDateTime>,
+    pub updated: Option<DateTime<Utc>>,
     pub latency: Option<Duration>,
 }
 
@@ -110,9 +112,8 @@ where T: WalletBackend + 'static
                 error!(target: LOG_TARGET, "Error handling request: {:?}", e);
                 e
             });
-            let _result = reply_tx.send(response).map_err(|e| {
+            let _result = reply_tx.send(response).inspect_err(|_| {
                 warn!(target: LOG_TARGET, "Failed to send reply");
-                e
             });
         }
 
@@ -125,7 +126,7 @@ where T: WalletBackend + 'static
 
     fn spawn_monitor(&self) {
         let monitor = BaseNodeMonitor::new(
-            self.config.base_node_monitor_refresh_interval,
+            self.config.base_node_monitor_max_refresh_interval,
             self.state.clone(),
             self.db.clone(),
             self.wallet_connectivity.clone(),

@@ -217,12 +217,12 @@ impl<C: SubConfigPath> ConfigPath for C {
 /// ```
 pub trait ConfigLoader: ConfigPath + Sized {
     /// Try to load configuration from supplied Config by `main_key_prefix()`
-    /// with values overloaded from `overload_key_prefix()`.
+    /// with values overloaded from `overload_key_prefix()`. For automated inheritance of Default values use
+    /// DefaultConfigLoader
     ///
     /// Default values will be taken from
     /// - `#[serde(default="value")]` field attribute
     /// - value defined in Config::set_default()
-    /// For automated inheritance of Default values use DefaultConfigLoader.
     fn load_from(config: &Config) -> Result<Self, ConfigurationError>;
 }
 
@@ -255,7 +255,10 @@ pub trait ConfigLoader: ConfigPath + Sized {
 /// config.set("my_node.goodbye_message", "see you later");
 /// let my_config = MyNodeConfig::load_from(&config).unwrap();
 /// assert_eq!(my_config.goodbye_message, "see you later".to_string());
-/// assert_eq!(my_config.welcome_message, MyNodeConfig::default().welcome_message);
+/// assert_eq!(
+///     my_config.welcome_message,
+///     MyNodeConfig::default().welcome_message
+/// );
 /// ```
 pub trait DefaultConfigLoader: ConfigPath + Sized {
     /// Try to load configuration from supplied Config by `main_key_prefix()`
@@ -364,6 +367,7 @@ mod test {
     use super::*;
 
     // test SubConfigPath both with Default and without Default
+    #[allow(dead_code)]
     #[derive(Serialize, Deserialize)]
     struct SubTari {
         monero: String,
@@ -375,6 +379,8 @@ mod test {
             }
         }
     }
+
+    #[allow(dead_code)]
     #[derive(Default, Serialize, Deserialize)]
     struct SuperTari {
         #[serde(flatten)]
@@ -383,6 +389,7 @@ mod test {
         #[serde(default = "serde_default_string")]
         bitcoin: String,
     }
+    #[allow(dead_code)]
     fn serde_default_string() -> String {
         "ispublic".into()
     }

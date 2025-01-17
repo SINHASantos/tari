@@ -24,9 +24,8 @@ use std::{convert::TryInto, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use tari_comms::{
-    peer_manager::{NodeDistance, NodeId, Peer, PeerFeatures},
+    peer_manager::{NodeDistance, NodeId, PeerFeatures},
     protocol::rpc::{mock::RpcRequestMock, RpcStatusCode},
-    runtime,
     test_utils::node_identity::{build_node_identity, ordered_node_identities_by_distance},
     PeerManager,
 };
@@ -49,9 +48,12 @@ fn setup() -> (DhtRpcServiceImpl, RpcRequestMock, Arc<PeerManager>) {
 
 // Unit tests for get_closer_peers request
 mod get_closer_peers {
-    use super::*;
+    use std::borrow::BorrowMut;
 
-    #[runtime::test]
+    use super::*;
+    use crate::rpc::UnvalidatedPeerInfo;
+
+    #[tokio::test]
     async fn it_returns_empty_peer_stream() {
         let (service, mock, _) = setup();
         let node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
@@ -60,6 +62,8 @@ mod get_closer_peers {
             excluded: vec![],
             closer_to: node_identity.node_id().to_vec(),
             include_clients: false,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let req = mock.request_with_context(node_identity.node_id().clone(), req);
@@ -69,19 +73,26 @@ mod get_closer_peers {
         assert!(next.is_none());
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn it_returns_closest_peers() {
         let (service, mock, peer_manager) = setup();
         let node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
         let peers = ordered_node_identities_by_distance(node_identity.node_id(), 10, PeerFeatures::COMMUNICATION_NODE);
         for peer in &peers {
-            peer_manager.add_peer(peer.to_peer()).await.unwrap();
+            let mut peer = peer.to_peer();
+            let good_addresses = peer.addresses.borrow_mut();
+            let good_address = good_addresses.addresses()[0].address().clone();
+            good_addresses.mark_last_seen_now(&good_address);
+
+            peer_manager.add_peer(peer).await.unwrap();
         }
         let req = GetCloserPeersRequest {
             n: 15,
             excluded: vec![],
             closer_to: node_identity.node_id().to_vec(),
             include_clients: false,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let req = mock.request_with_context(node_identity.node_id().clone(), req);
@@ -94,30 +105,37 @@ mod get_closer_peers {
             .map(Result::unwrap)
             .map(|r| r.peer.unwrap())
             .map(|p| p.try_into().unwrap())
-            .collect::<Vec<Peer>>();
+            .collect::<Vec<UnvalidatedPeerInfo>>();
 
         let mut dist = NodeDistance::zero();
         for p in &peers {
-            let current = p.node_id.distance(node_identity.node_id());
+            let current = NodeId::from_public_key(&p.public_key).distance(node_identity.node_id());
             assert!(dist < current);
             dist = current;
         }
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn it_returns_n_peers() {
         let (service, mock, peer_manager) = setup();
 
         let node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
         let peers = ordered_node_identities_by_distance(node_identity.node_id(), 6, PeerFeatures::COMMUNICATION_NODE);
         for peer in &peers {
-            peer_manager.add_peer(peer.to_peer()).await.unwrap();
+            let mut peer = peer.to_peer();
+            let good_addresses = peer.addresses.borrow_mut();
+            let good_address = good_addresses.addresses()[0].address().clone();
+            good_addresses.mark_last_seen_now(&good_address);
+
+            peer_manager.add_peer(peer).await.unwrap();
         }
         let req = GetCloserPeersRequest {
             n: 5,
             excluded: vec![],
             closer_to: node_identity.node_id().to_vec(),
             include_clients: false,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let req = mock.request_with_context(node_identity.node_id().clone(), req);
@@ -126,14 +144,19 @@ mod get_closer_peers {
         assert_eq!(results.len(), 5);
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn it_skips_excluded_peers() {
         let (service, mock, peer_manager) = setup();
 
         let node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
         let peers = ordered_node_identities_by_distance(node_identity.node_id(), 5, PeerFeatures::COMMUNICATION_NODE);
         for peer in &peers {
-            peer_manager.add_peer(peer.to_peer()).await.unwrap();
+            let mut peer = peer.to_peer();
+            let good_addresses = peer.addresses.borrow_mut();
+            let good_address = good_addresses.addresses()[0].address().clone();
+            good_addresses.mark_last_seen_now(&good_address);
+
+            peer_manager.add_peer(peer).await.unwrap();
         }
         let excluded_peer = peers.last().unwrap();
         let req = GetCloserPeersRequest {
@@ -141,6 +164,8 @@ mod get_closer_peers {
             excluded: vec![excluded_peer.node_id().to_vec()],
             closer_to: node_identity.node_id().to_vec(),
             include_clients: true,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let req = mock.request_with_context(node_identity.node_id().clone(), req);
@@ -150,7 +175,7 @@ mod get_closer_peers {
         assert!(peers.all(|p| p.public_key != excluded_peer.public_key().as_bytes()));
     }
 
-    #[runtime::test]
+    #[tokio::test]
     async fn it_errors_if_maximum_n_exceeded() {
         let (service, mock, _) = setup();
         let req = GetCloserPeersRequest {
@@ -166,20 +191,22 @@ mod get_closer_peers {
 }
 
 mod get_peers {
-    use std::time::Duration;
+    use std::borrow::BorrowMut;
 
-    use tari_comms::{peer_manager::Peer, test_utils::node_identity::build_many_node_identities};
+    use tari_comms::test_utils::node_identity::build_many_node_identities;
 
     use super::*;
-    use crate::proto::rpc::GetPeersRequest;
+    use crate::{proto::rpc::GetPeersRequest, rpc::UnvalidatedPeerInfo};
 
-    #[runtime::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_returns_empty_peer_stream() {
         let (service, mock, _) = setup();
         let node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
         let req = GetPeersRequest {
             n: 10,
             include_clients: false,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let req = mock.request_with_context(node_identity.node_id().clone(), req);
@@ -189,17 +216,24 @@ mod get_peers {
         assert!(next.is_none());
     }
 
-    #[runtime::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_returns_all_peers() {
         let (service, mock, peer_manager) = setup();
         let nodes = build_many_node_identities(3, PeerFeatures::COMMUNICATION_NODE);
         let clients = build_many_node_identities(2, PeerFeatures::COMMUNICATION_CLIENT);
         for peer in nodes.iter().chain(clients.iter()) {
-            peer_manager.add_peer(peer.to_peer()).await.unwrap();
+            let mut peer = peer.to_peer();
+            let good_addresses = peer.addresses.borrow_mut();
+            let good_address = good_addresses.addresses()[0].address().clone();
+            good_addresses.mark_last_seen_now(&good_address);
+
+            peer_manager.add_peer(peer).await.unwrap();
         }
         let req = GetPeersRequest {
-            n: 0,
+            n: 5,
             include_clients: true,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let peers_stream = service
@@ -214,23 +248,30 @@ mod get_peers {
             .map(Result::unwrap)
             .map(|r| r.peer.unwrap())
             .map(|p| p.try_into().unwrap())
-            .collect::<Vec<Peer>>();
+            .collect::<Vec<UnvalidatedPeerInfo>>();
 
-        assert_eq!(peers.iter().filter(|p| p.features.is_client()).count(), 2);
-        assert_eq!(peers.iter().filter(|p| p.features.is_node()).count(), 3);
+        assert_eq!(peers.iter().filter(|p| p.claims[0].features.is_client()).count(), 2);
+        assert_eq!(peers.iter().filter(|p| p.claims[0].features.is_node()).count(), 3);
     }
 
-    #[runtime::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_excludes_clients() {
         let (service, mock, peer_manager) = setup();
         let nodes = build_many_node_identities(3, PeerFeatures::COMMUNICATION_NODE);
         let clients = build_many_node_identities(2, PeerFeatures::COMMUNICATION_CLIENT);
         for peer in nodes.iter().chain(clients.iter()) {
-            peer_manager.add_peer(peer.to_peer()).await.unwrap();
+            let mut peer = peer.to_peer();
+            let good_addresses = peer.addresses.borrow_mut();
+            let good_address = good_addresses.addresses()[0].address().clone();
+            good_addresses.mark_last_seen_now(&good_address);
+
+            peer_manager.add_peer(peer).await.unwrap();
         }
         let req = GetPeersRequest {
-            n: 0,
+            n: 3,
             include_clients: false,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let peers_stream = service
@@ -245,23 +286,30 @@ mod get_peers {
             .map(Result::unwrap)
             .map(|r| r.peer.unwrap())
             .map(|p| p.try_into().unwrap())
-            .collect::<Vec<Peer>>();
+            .collect::<Vec<UnvalidatedPeerInfo>>();
 
-        assert!(peers.iter().all(|p| p.features.is_node()));
+        assert!(peers.iter().all(|p| p.claims[0].features.is_node()));
     }
 
-    #[runtime::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn it_returns_n_peers() {
         let (service, mock, peer_manager) = setup();
 
         let node_identity = build_node_identity(PeerFeatures::COMMUNICATION_NODE);
         let peers = build_many_node_identities(3, PeerFeatures::COMMUNICATION_NODE);
         for peer in &peers {
-            peer_manager.add_peer(peer.to_peer()).await.unwrap();
+            let mut peer = peer.to_peer();
+            let good_addresses = peer.addresses.borrow_mut();
+            let good_address = good_addresses.addresses()[0].address().clone();
+            good_addresses.mark_last_seen_now(&good_address);
+
+            peer_manager.add_peer(peer).await.unwrap();
         }
         let req = GetPeersRequest {
             n: 2,
             include_clients: false,
+            max_claims: 5,
+            max_addresses_per_claim: 5,
         };
 
         let req = mock.request_with_context(node_identity.node_id().clone(), req);

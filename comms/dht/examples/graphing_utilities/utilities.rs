@@ -22,7 +22,7 @@
 
 use std::{collections::HashMap, fs, fs::File, io::Write, path::Path, process::Command, sync::Mutex};
 
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use petgraph::{
     dot::Dot,
     stable_graph::{NodeIndex, StableGraph},
@@ -38,14 +38,12 @@ use crate::memory_net::{
 
 const TEMP_GRAPH_OUTPUT_DIR: &str = "/tmp/memorynet_temp";
 
-lazy_static! {
-    static ref GRAPH_FRAME_NUM: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
-}
+static GRAPH_FRAME_NUM: Lazy<Mutex<HashMap<String, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn get_next_frame_num(name: &str) -> usize {
     let mut map = GRAPH_FRAME_NUM.lock().unwrap();
     let current: usize;
-    match (*map).get_mut(&name.to_string()) {
+    match (*map).get_mut(name) {
         None => {
             current = 0;
             (*map).insert(name.to_string(), 1);

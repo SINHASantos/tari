@@ -26,12 +26,12 @@ use rand::{rngs::OsRng, seq::SliceRandom};
 use tari_comms::{
     connectivity::ConnectivityEvent,
     peer_manager::{Peer, PeerFeatures},
-    runtime,
     test_utils::{
         count_string_occurrences,
         mocks::{create_connectivity_mock, create_dummy_peer_connection, ConnectivityManagerMockState},
         node_identity::ordered_node_identities_by_distance,
     },
+    Minimized,
     NodeIdentity,
     PeerManager,
 };
@@ -92,7 +92,7 @@ async fn setup(
     )
 }
 
-#[runtime::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn initialize() {
     let config = DhtConfig {
         num_neighbouring_nodes: 4,
@@ -124,7 +124,7 @@ async fn initialize() {
     }
 }
 
-#[runtime::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn added_neighbours() {
     let node_identity = make_node_identity();
     let mut node_identities =
@@ -152,7 +152,7 @@ async fn added_neighbours() {
     assert_eq!(count_string_occurrences(&calls, &["DialPeer"]), 5);
 
     let (conn, _) = create_dummy_peer_connection(closer_peer.node_id().clone());
-    connectivity.publish_event(ConnectivityEvent::PeerConnected(conn.clone()));
+    connectivity.publish_event(ConnectivityEvent::PeerConnected(conn.clone().into()));
 
     async_assert!(
         connectivity.get_dialed_peers().await.len() >= 5,
@@ -164,7 +164,7 @@ async fn added_neighbours() {
     assert_eq!(conn.handle_count(), 2);
 }
 
-#[runtime::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn replace_peer_when_peer_goes_offline() {
     let node_identity = make_node_identity();
     let node_identities =
@@ -193,6 +193,7 @@ async fn replace_peer_when_peer_goes_offline() {
 
     connectivity.publish_event(ConnectivityEvent::PeerDisconnected(
         node_identities[4].node_id().clone(),
+        Minimized::No,
     ));
 
     async_assert!(
@@ -223,7 +224,7 @@ async fn replace_peer_when_peer_goes_offline() {
     assert_eq!(dialed[0], *node_identities[5].node_id());
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn insert_neighbour() {
     let node_identity = make_node_identity();
     let node_identities =
@@ -243,12 +244,16 @@ async fn insert_neighbour() {
 
     // First 8 inserts should not remove a peer (because num_neighbouring_nodes == 8)
     for ni in shuffled.iter().take(8) {
-        assert!(dht_connectivity.insert_neighbour(ni.node_id().clone()).is_none());
+        assert!(dht_connectivity
+            .insert_neighbour_ordered_by_distance(ni.node_id().clone())
+            .is_none());
     }
 
     // Next 2 inserts will always remove a node id
     for ni in shuffled.iter().skip(8) {
-        assert!(dht_connectivity.insert_neighbour(ni.node_id().clone()).is_some())
+        assert!(dht_connectivity
+            .insert_neighbour_ordered_by_distance(ni.node_id().clone())
+            .is_some())
     }
 
     // Check the first 7 node ids match our neighbours, the last element depends on distance and ordering of inserts
@@ -265,14 +270,12 @@ async fn insert_neighbour() {
 }
 
 mod metrics {
-    use super::*;
     mod collector {
         use tari_comms::peer_manager::NodeId;
 
-        use super::*;
         use crate::connectivity::MetricsCollector;
 
-        #[runtime::test]
+        #[tokio::test]
         async fn it_adds_message_received() {
             let mut metric_collector = MetricsCollector::spawn();
             let node_id = NodeId::default();
@@ -287,7 +290,7 @@ mod metrics {
             assert_eq!(ts.count(), 100);
         }
 
-        #[runtime::test]
+        #[tokio::test]
         async fn it_clears_the_metrics() {
             let mut metric_collector = MetricsCollector::spawn();
             let node_id = NodeId::default();

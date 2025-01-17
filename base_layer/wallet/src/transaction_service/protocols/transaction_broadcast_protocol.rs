@@ -37,7 +37,7 @@ use tari_core::{
         proto::wallet_rpc::{TxLocation, TxQueryResponse, TxSubmissionRejectionReason, TxSubmissionResponse},
         rpc::BaseNodeWalletRpcClient,
     },
-    transactions::transaction_components::Transaction,
+    transactions::{key_manager::TransactionKeyManagerInterface, transaction_components::Transaction},
 };
 use tari_utilities::hex::Hex;
 use tokio::{sync::watch, time::sleep};
@@ -47,6 +47,7 @@ use crate::{
     transaction_service::{
         error::{TransactionServiceError, TransactionServiceProtocolError},
         handle::TransactionEvent,
+        protocols::check_transaction_size,
         service::TransactionServiceResources,
         storage::{
             database::TransactionBackend,
@@ -57,22 +58,24 @@ use crate::{
 
 const LOG_TARGET: &str = "wallet::transaction_service::protocols::broadcast_protocol";
 
-pub struct TransactionBroadcastProtocol<TBackend, TWalletConnectivity> {
+pub struct TransactionBroadcastProtocol<TBackend, TWalletConnectivity, TKeyManagerInterface> {
     tx_id: TxId,
     mode: TxBroadcastMode,
-    resources: TransactionServiceResources<TBackend, TWalletConnectivity>,
+    resources: TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
     timeout_update_receiver: watch::Receiver<Duration>,
     last_rejection: Option<Instant>,
 }
 
-impl<TBackend, TWalletConnectivity> TransactionBroadcastProtocol<TBackend, TWalletConnectivity>
+impl<TBackend, TWalletConnectivity, TKeyManagerInterface>
+    TransactionBroadcastProtocol<TBackend, TWalletConnectivity, TKeyManagerInterface>
 where
     TBackend: TransactionBackend + 'static,
     TWalletConnectivity: WalletConnectivityInterface,
+    TKeyManagerInterface: TransactionKeyManagerInterface,
 {
     pub fn new(
         tx_id: TxId,
-        resources: TransactionServiceResources<TBackend, TWalletConnectivity>,
+        resources: TransactionServiceResources<TBackend, TWalletConnectivity, TKeyManagerInterface>,
         timeout_update_receiver: watch::Receiver<Duration>,
     ) -> Self {
         Self {
@@ -125,14 +128,20 @@ where
                 );
                 return Ok(self.tx_id);
             }
+            if let Err(e) = check_transaction_size(&completed_tx.transaction, self.tx_id) {
+                self.cancel_transaction(TxCancellationReason::Oversized).await;
+                return Err(e);
+            }
 
             loop {
                 tokio::select! {
                     _ = current_base_node_watcher.changed() => {
-                            if let Some(peer) = &*current_base_node_watcher.borrow() {
+                            if let Some(selected_peer) = &*current_base_node_watcher.borrow() {
                                 info!(
                                     target: LOG_TARGET,
-                                    "Transaction Broadcast protocol (TxId: {}) Base Node Public key updated to {} (NodeID: {})", self.tx_id, peer.public_key, peer.node_id
+                                    "Transaction Broadcast protocol (TxId: {}) Base Node Public key updated to {} (NodeID: {})",
+                                    self.tx_id, selected_peer.get_current_peer().public_key,
+                                    selected_peer.get_current_peer().node_id,
                                 );
                             }
                             self.last_rejection = None;
@@ -147,7 +156,10 @@ where
                             },
                             TxBroadcastMode::TransactionQuery => {
                                 if result? {
-                                    debug!(target: LOG_TARGET, "Transaction broadcast, transaction validation protocol will continue from here");
+                                    debug!(
+                                        target: LOG_TARGET,
+                                        "Transaction broadcast, transaction validation protocol will continue from here"
+                                    );
                                     return Ok(self.tx_id)
                                 }
                             },
@@ -186,7 +198,7 @@ where
         client: &mut BaseNodeWalletRpcClient,
     ) -> Result<bool, TransactionServiceProtocolError<TxId>> {
         let response = match client
-            .submit_transaction(tx.try_into().map_err(|e| {
+            .submit_transaction(tx.clone().try_into().map_err(|e| {
                 TransactionServiceProtocolError::new(self.tx_id, TransactionServiceError::InvalidMessageError(e))
             })?)
             .await
@@ -272,6 +284,7 @@ where
                 target: LOG_TARGET,
                 "Transaction (TxId: {}) successfully submitted to UnconfirmedPool", self.tx_id
             );
+            trace!(target: LOG_TARGET, "submit_transaction ({}) - {}", self.tx_id, tx,);
             self.resources
                 .db
                 .broadcast_completed_transaction(self.tx_id)
@@ -323,7 +336,7 @@ where
 
         if !(response.is_synced ||
             (response.location == TxLocation::Mined &&
-                response.confirmations >= self.resources.config.num_confirmations_required as u64))
+                response.confirmations >= self.resources.config.num_confirmations_required))
         {
             info!(
                 target: LOG_TARGET,

@@ -34,17 +34,14 @@ use tokio::{
 use crate::{
     backoff::ConstantBackoff,
     connection_manager::{
-        error::ConnectionManagerError,
-        manager::ConnectionManagerEvent,
         ConnectionManager,
+        ConnectionManagerError,
+        ConnectionManagerEvent,
         ConnectionManagerRequester,
-        PeerConnectionError,
     },
-    noise::NoiseConfig,
+    net_address::{MultiaddressesWithStats, PeerAddressSource},
     peer_manager::{NodeId, Peer, PeerFeatures, PeerFlags, PeerManagerError},
     protocol::{ProtocolEvent, ProtocolId, Protocols},
-    runtime,
-    runtime::task,
     test_utils::{
         build_peer_manager,
         count_string_occurrences,
@@ -52,13 +49,13 @@ use crate::{
         test_node::{build_connection_manager, TestNodeConfig},
     },
     transports::{MemoryTransport, TcpTransport},
+    PeerConnectionError,
 };
 
-#[runtime::test]
+#[tokio::test]
 async fn connect_to_nonexistent_peer() {
     let rt_handle = Handle::current();
     let node_identity = build_node_identity(PeerFeatures::empty());
-    let noise_config = NoiseConfig::new(node_identity.clone());
     let (request_tx, request_rx) = mpsc::channel(1);
     let (event_tx, _) = broadcast::channel(1);
     let mut requester = ConnectionManagerRequester::new(request_tx, event_tx.clone());
@@ -69,7 +66,6 @@ async fn connect_to_nonexistent_peer() {
     let connection_manager = ConnectionManager::new(
         Default::default(),
         MemoryTransport,
-        noise_config,
         ConstantBackoff::new(Duration::from_secs(1)),
         request_rx,
         node_identity,
@@ -81,13 +77,12 @@ async fn connect_to_nonexistent_peer() {
     rt_handle.spawn(connection_manager.run());
 
     let err = requester.dial_peer(NodeId::default()).await.unwrap_err();
-    unpack_enum!(ConnectionManagerError::PeerManagerError(err) = err);
-    unpack_enum!(PeerManagerError::PeerNotFoundError = err);
+    unpack_enum!(ConnectionManagerError::PeerManagerError(PeerManagerError::PeerNotFoundError) = err);
 
     shutdown.trigger();
 }
 
-#[runtime::test]
+#[tokio::test]
 #[allow(clippy::similar_names)]
 async fn dial_success() {
     static TEST_PROTO: ProtocolId = ProtocolId::from_static(b"/test/valid");
@@ -146,7 +141,7 @@ async fn dial_success() {
         .add_peer(Peer::new(
             node_identity2.public_key().clone(),
             node_identity2.node_id().clone(),
-            vec![public_address2].into(),
+            MultiaddressesWithStats::from_addresses_with_source(vec![public_address2], &PeerAddressSource::Config),
             PeerFlags::empty(),
             PeerFeatures::COMMUNICATION_CLIENT,
             Default::default(),
@@ -199,7 +194,7 @@ async fn dial_success() {
     assert_eq!(buf, MSG);
 }
 
-#[runtime::test]
+#[tokio::test]
 #[allow(clippy::similar_names)]
 async fn dial_success_aux_tcp_listener() {
     static TEST_PROTO: ProtocolId = ProtocolId::from_static(b"/test/valid");
@@ -249,7 +244,7 @@ async fn dial_success_aux_tcp_listener() {
         .add_peer(Peer::new(
             node_identity1.public_key().clone(),
             node_identity1.node_id().clone(),
-            vec![tcp_listener_addr].into(),
+            MultiaddressesWithStats::from_addresses_with_source(vec![tcp_listener_addr], &PeerAddressSource::Config),
             PeerFlags::empty(),
             PeerFeatures::COMMUNICATION_CLIENT,
             Default::default(),
@@ -295,7 +290,7 @@ async fn dial_success_aux_tcp_listener() {
     assert_eq!(buf, MSG);
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn simultaneous_dial_events() {
     let mut shutdown = Shutdown::new();
 
@@ -337,7 +332,7 @@ async fn simultaneous_dial_events() {
         .add_peer(Peer::new(
             node_identities[1].public_key().clone(),
             node_identities[1].node_id().clone(),
-            vec![public_address2].into(),
+            MultiaddressesWithStats::from_addresses_with_source(vec![public_address2], &PeerAddressSource::Config),
             PeerFlags::empty(),
             PeerFeatures::COMMUNICATION_CLIENT,
             Default::default(),
@@ -350,7 +345,7 @@ async fn simultaneous_dial_events() {
         .add_peer(Peer::new(
             node_identities[0].public_key().clone(),
             node_identities[0].node_id().clone(),
-            vec![public_address1].into(),
+            MultiaddressesWithStats::from_addresses_with_source(vec![public_address1], &PeerAddressSource::Config),
             PeerFlags::empty(),
             PeerFeatures::COMMUNICATION_CLIENT,
             Default::default(),
@@ -383,13 +378,9 @@ async fn simultaneous_dial_events() {
 
     let _events1 = collect_try_recv!(subscription1, timeout = Duration::from_secs(5));
     let _events2 = collect_try_recv!(subscription2, timeout = Duration::from_secs(5));
-
-    // TODO: Investigate why two PeerDisconnected events are sometimes received
-    // assert!(count_string_occurrences(&events1, &["PeerDisconnected"]) >= 1);
-    // assert!(count_string_occurrences(&events2, &["PeerDisconnected"]) >= 1);
 }
 
-#[runtime::test]
+#[tokio::test]
 async fn dial_cancelled() {
     let mut shutdown = Shutdown::new();
 
@@ -424,7 +415,7 @@ async fn dial_cancelled() {
     peer_manager1.add_peer(node_identity2.to_peer()).await.unwrap();
 
     let (ready_tx, ready_rx) = oneshot::channel();
-    let dial_result = task::spawn({
+    let dial_result = tokio::spawn({
         let mut cm = conn_man1.clone();
         let node_id = node_identity2.node_id().clone();
         async move {
@@ -445,6 +436,6 @@ async fn dial_cancelled() {
 
     assert_eq!(events1.len(), 1);
     unpack_enum!(ConnectionManagerEvent::PeerConnectFailed(node_id, err) = &*events1[0]);
-    assert_eq!(&*node_id, node_identity2.node_id());
+    assert_eq!(node_id, node_identity2.node_id());
     unpack_enum!(ConnectionManagerError::DialCancelled = err);
 }

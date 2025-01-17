@@ -35,6 +35,9 @@ use monero::{
 
 use crate::proof_of_work::monero_rx::error::MergeMineError;
 
+// Binary tree of depth 32 means u32::MAX tree, this is more than large enough to support most trees.
+const MAX_MERKLE_TREE_PROOF_SIZE: usize = 32;
+
 /// Returns the Keccak 256 hash of the byte input
 fn cn_fast_hash(data: &[u8]) -> Hash {
     Hash::new(data)
@@ -121,11 +124,11 @@ pub fn tree_hash(hashes: &[Hash]) -> Result<Hash, MergeMineError> {
     }
 }
 
+/// The Monero merkle proof
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct MerkleProof {
     branch: Vec<Hash>,
-    depth: u16,
     path_bitmap: u32,
 }
 
@@ -135,65 +138,116 @@ impl BorshSerialize for MerkleProof {
         for hash in &self.branch {
             hash.consensus_encode(writer)?;
         }
-        BorshSerialize::serialize(&self.depth, writer)?;
-        BorshSerialize::serialize(&self.path_bitmap, writer)?;
+        writer.write_varint(self.path_bitmap)?;
         Ok(())
     }
 }
 
 impl BorshDeserialize for MerkleProof {
-    fn deserialize(buf: &mut &[u8]) -> io::Result<Self> {
-        let len = buf.read_varint()?;
+    fn deserialize_reader<R>(reader: &mut R) -> Result<Self, io::Error>
+    where R: io::Read {
+        let len = reader.read_varint()?;
+        if len >= MAX_MERKLE_TREE_PROOF_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Larger than max merkle tree length".to_string(),
+            ));
+        }
         let mut branch = Vec::with_capacity(len);
         for _ in 0..len {
             branch.push(
-                Hash::consensus_decode(buf)
+                Hash::consensus_decode(reader)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?,
             );
         }
-        let depth = BorshDeserialize::deserialize(buf)?;
-        let path_bitmap = BorshDeserialize::deserialize(buf)?;
-        Ok(Self {
-            branch,
-            depth,
-            path_bitmap,
-        })
+        let path_bitmap = reader.read_varint()?;
+        Ok(Self { branch, path_bitmap })
     }
 }
 
 impl MerkleProof {
-    fn try_construct(branch: Vec<Hash>, depth: u16, path_bitmap: u32) -> Option<Self> {
-        if branch.is_empty() {
+    fn try_construct(branch: Vec<Hash>, path_bitmap: u32) -> Option<Self> {
+        if branch.len() >= MAX_MERKLE_TREE_PROOF_SIZE {
             return None;
         }
-
-        Some(Self {
-            branch,
-            depth,
-            path_bitmap,
-        })
+        Some(Self { branch, path_bitmap })
     }
 
+    /// Returns the merkle proof branch as a list of Monero hashes
     #[inline]
     pub fn branch(&self) -> &[Hash] {
         &self.branch
     }
 
+    /// returns the path bitmap of the proof
+    pub fn path(&self) -> u32 {
+        self.path_bitmap
+    }
+
+    /// The coinbase must be the first transaction in the block, so
+    /// that you can't have multiple coinbases in a block. That means the coinbase
+    /// is always the leftmost branch in the merkle tree, this test if the given proof is for the left most branch in
+    /// the merkle tree
+    pub fn check_coinbase_path(&self) -> bool {
+        if self.path_bitmap == 0b00000000 {
+            return true;
+        }
+        false
+    }
+
+    /// Calculates the merkle root hash from the provide Monero hash
+    pub fn calculate_root_with_pos(&self, hash: &Hash, aux_chain_count: u8) -> (Hash, u32) {
+        let root = self.calculate_root(hash);
+        let pos = self.get_position_from_path(u32::from(aux_chain_count));
+        (root, pos)
+    }
+
     pub fn calculate_root(&self, hash: &Hash) -> Hash {
-        if self.depth == 0 {
-            return self.branch[0];
+        if self.branch.is_empty() {
+            return *hash;
         }
 
         let mut root = *hash;
-        for d in 0..self.depth {
-            if (self.path_bitmap >> (self.depth - d - 1)) & 1 > 0 {
-                root = cn_fast_hash2(&self.branch[d as usize], &root);
+        let depth = self.branch.len();
+        for d in 0..depth {
+            if (self.path_bitmap >> (depth - d - 1)) & 1 > 0 {
+                root = cn_fast_hash2(&self.branch[d], &root);
             } else {
-                root = cn_fast_hash2(&root, &self.branch[d as usize]);
+                root = cn_fast_hash2(&root, &self.branch[d]);
             }
         }
 
         root
+    }
+
+    pub fn get_position_from_path(&self, aux_chain_count: u32) -> u32 {
+        if aux_chain_count <= 1 {
+            return 0;
+        }
+
+        let mut depth = 0;
+        let mut k = 1;
+
+        while k < aux_chain_count {
+            depth += 1;
+            k <<= 1;
+        }
+
+        k -= aux_chain_count;
+
+        let mut pos = 0;
+        let mut path = self.path_bitmap;
+
+        for _i in 1..depth {
+            pos = (pos << 1) | (path & 1);
+            path >>= 1;
+        }
+
+        if pos < k {
+            return pos;
+        }
+
+        (((pos - k) << 1) | (path & 1)) + k
     }
 }
 
@@ -201,7 +255,6 @@ impl Default for MerkleProof {
     fn default() -> Self {
         Self {
             branch: vec![Hash::null()],
-            depth: 0,
             path_bitmap: 0,
         }
     }
@@ -209,7 +262,6 @@ impl Default for MerkleProof {
 
 /// Creates a merkle proof for the given hash within the set of hashes. This function returns None if the hash is not in
 /// hashes. This is a port of Monero's tree_branch function
-// TODO: Reduce the cognitive complexity of this function
 #[allow(clippy::cognitive_complexity)]
 pub fn create_merkle_proof(hashes: &[Hash], hash: &Hash) -> Option<MerkleProof> {
     match hashes.len() {
@@ -218,14 +270,14 @@ pub fn create_merkle_proof(hashes: &[Hash], hash: &Hash) -> Option<MerkleProof> 
             if hashes[0] != *hash {
                 return None;
             }
-            MerkleProof::try_construct(vec![hashes[0]], 0, 0)
+            MerkleProof::try_construct(vec![], 0)
         },
         2 => hashes.iter().enumerate().find_map(|(pos, h)| {
             if h != hash {
                 return None;
             }
-            let i = if pos == 0 { 1 } else { 0 };
-            MerkleProof::try_construct(vec![hashes[i]], 1, if pos == 0 { 0 } else { 1 })
+            let i = usize::from(pos == 0);
+            MerkleProof::try_construct(vec![hashes[i]], u32::from(pos != 0))
         }),
         len => {
             let mut idx = hashes.iter().position(|node| node == hash)?;
@@ -237,7 +289,6 @@ pub fn create_merkle_proof(hashes: &[Hash], hash: &Hash) -> Option<MerkleProof> 
             ints[..c].copy_from_slice(&hashes[..c]);
 
             let mut branch = Vec::new();
-            let mut depth = 0u16;
             let mut path = 0u32;
             let mut i = c;
             for (j, val) in ints.iter_mut().enumerate().take(count).skip(c) {
@@ -245,8 +296,7 @@ pub fn create_merkle_proof(hashes: &[Hash], hash: &Hash) -> Option<MerkleProof> 
                 if idx == i || idx == i + 1 {
                     let ii = if idx == i { i + 1 } else { i };
                     branch.push(hashes[ii]);
-                    depth += 1;
-                    path = (path << 1) | (if idx == i { 0 } else { 1 });
+                    path = (path << 1) | u32::from(idx != i);
                     idx = j;
                 }
                 *val = cn_fast_hash2(&hashes[i], &hashes[i + 1]);
@@ -262,8 +312,7 @@ pub fn create_merkle_proof(hashes: &[Hash], hash: &Hash) -> Option<MerkleProof> 
                     if idx == i || idx == i + 1 {
                         let ii = if idx == i { i + 1 } else { i };
                         branch.push(ints[ii]);
-                        depth += 1;
-                        path = (path << 1) | (if idx == i { 0 } else { 1 });
+                        path = (path << 1) | u32::from(idx != i);
                         idx = j;
                     }
                     ints[j] = cn_fast_hash2(&ints[i], &ints[i + 1]);
@@ -272,13 +321,12 @@ pub fn create_merkle_proof(hashes: &[Hash], hash: &Hash) -> Option<MerkleProof> 
             }
 
             if idx == 0 || idx == 1 {
-                let ii = if idx == 0 { 1 } else { 0 };
+                let ii = usize::from(idx == 0);
                 branch.push(ints[ii]);
-                depth += 1;
-                path = (path << 1) | (if idx == 0 { 0 } else { 1 });
+                path = (path << 1) | u32::from(idx != 0);
             }
 
-            MerkleProof::try_construct(branch, depth, path)
+            MerkleProof::try_construct(branch, path)
         },
     }
 }
@@ -296,14 +344,86 @@ mod test {
 
     use super::*;
     use crate::proof_of_work::randomx_factory::RandomXFactory;
+    mod quicktest {
+        use monero::Hash;
+        use quickcheck::{quickcheck, Arbitrary, Gen};
 
+        use crate::proof_of_work::monero_rx::merkle_tree::{MerkleProof, MAX_MERKLE_TREE_PROOF_SIZE};
+
+        #[derive(Clone, Debug)]
+        struct QuickHash {
+            pub bits: Vec<u8>,
+        }
+
+        impl Arbitrary for QuickHash {
+            fn arbitrary(g: &mut Gen) -> QuickHash {
+                let mut hash = Vec::new();
+                for _ in 0..32 {
+                    hash.push(u8::arbitrary(g));
+                }
+                QuickHash { bits: hash }
+            }
+        }
+
+        fn create_monero_hashes(input_vec: Vec<QuickHash>) -> Vec<Hash> {
+            input_vec
+                .into_iter()
+                .map(|v| Hash::from_slice(v.bits.as_slice()))
+                .collect()
+        }
+        #[test]
+        fn test_create() {
+            fn try_create(input_vec: Vec<QuickHash>, path: u32) -> bool {
+                let hashes = create_monero_hashes(input_vec);
+                let length = hashes.len();
+                let res = MerkleProof::try_construct(hashes, path);
+                if length >= MAX_MERKLE_TREE_PROOF_SIZE {
+                    return res.is_none();
+                }
+                res.is_some()
+            }
+            quickcheck(try_create as fn(Vec<QuickHash>, u32) -> bool)
+        }
+
+        #[test]
+        fn test_proof() {
+            fn proof_first(input_vec: Vec<QuickHash>, path: u32) -> bool {
+                if input_vec.is_empty() {
+                    return true;
+                }
+                let hashes = create_monero_hashes(input_vec);
+                let hash = hashes[0];
+                let length = hashes.len();
+                if length >= MAX_MERKLE_TREE_PROOF_SIZE {
+                    return true;
+                }
+                let proof = MerkleProof::try_construct(hashes, path).unwrap();
+                proof.calculate_root(&hash);
+                true
+            }
+
+            fn proof_random(input_vec: Vec<QuickHash>, hash: QuickHash, path: u32) -> bool {
+                let hashes = create_monero_hashes(input_vec);
+                let hash = Hash::from_slice(hash.bits.as_slice());
+                let length = hashes.len();
+                if length >= MAX_MERKLE_TREE_PROOF_SIZE {
+                    return true;
+                }
+                let proof = MerkleProof::try_construct(hashes, path).unwrap();
+                proof.calculate_root(&hash);
+                true
+            }
+            quickcheck(proof_first as fn(Vec<QuickHash>, u32) -> bool);
+            quickcheck(proof_random as fn(Vec<QuickHash>, QuickHash, u32) -> bool);
+        }
+    }
     mod tree_hash {
         use super::*;
 
         fn randomx_hash(input: &[u8], key: &str) -> String {
             let key = from_hex(key).unwrap();
             RandomXFactory::default()
-                .create(&key)
+                .create(&key, None, None)
                 .unwrap()
                 .calculate_hash(input)
                 .unwrap()
@@ -481,9 +601,8 @@ mod test {
             let tx_hashes =
                 &[Hash::from_str("fa58575f7d1d377709f1621fac98c758860ca6dc5f2262be9ce5fd131c370d1a").unwrap()];
             let proof = create_merkle_proof(&tx_hashes[..], &tx_hashes[0]).unwrap();
-            assert_eq!(proof.depth, 0);
+            assert_eq!(proof.branch.len(), 0);
             assert_eq!(proof.calculate_root(&tx_hashes[0]), tx_hashes[0]);
-            assert_eq!(proof.branch(), tx_hashes);
 
             assert!(create_merkle_proof(&tx_hashes[..], &Hash::null()).is_none());
         }
@@ -501,6 +620,9 @@ mod test {
             let expected_root = cn_fast_hash2(&tx_hashes[0], &tx_hashes[1]);
             let proof = create_merkle_proof(tx_hashes, &tx_hashes[0]).unwrap();
             assert_eq!(proof.branch()[0], tx_hashes[1]);
+            assert_eq!(proof.branch.len(), 1);
+            assert_eq!(proof.branch[0], tx_hashes[1]);
+            assert_eq!(proof.path_bitmap, 0b00000000);
             assert_eq!(proof.calculate_root(&tx_hashes[0]), expected_root);
 
             let proof = create_merkle_proof(tx_hashes, &tx_hashes[1]).unwrap();
@@ -520,7 +642,7 @@ mod test {
             //            /  \    /  \
             //          h2    h3 h4   h5
 
-            let hashes = (1..=6).map(|i| Hash::from([i; 32])).collect::<Vec<_>>();
+            let hashes = (1..=6).map(|i| Hash::from([i - 1; 32])).collect::<Vec<_>>();
             let h23 = cn_fast_hash2(&hashes[2], &hashes[3]);
             let h45 = cn_fast_hash2(&hashes[4], &hashes[5]);
             let h01 = cn_fast_hash2(&hashes[0], &hashes[1]);
@@ -530,7 +652,6 @@ mod test {
             // Proof for h0
             let proof = create_merkle_proof(&hashes, &hashes[0]).unwrap();
             assert_eq!(proof.calculate_root(&hashes[0]), expected_root);
-            assert_eq!(proof.depth, 2);
             assert_eq!(proof.branch().len(), 2);
             assert_eq!(proof.branch()[0], hashes[1]);
             assert_eq!(proof.branch()[1], h2345);
@@ -549,9 +670,21 @@ mod test {
             // Proof for h5
             let proof = create_merkle_proof(&hashes, &hashes[5]).unwrap();
             assert_eq!(proof.calculate_root(&hashes[5]), expected_root);
+            assert_eq!(proof.branch.len(), 3);
             assert_eq!(proof.path_bitmap, 0b00000111);
             let branch = proof.branch();
             assert_eq!(branch[0], hashes[4]);
+            assert_eq!(branch[1], h23);
+            assert_eq!(branch[2], h01);
+            assert_eq!(branch.len(), 3);
+
+            // Proof for h4
+            let proof = create_merkle_proof(&hashes, &hashes[4]).unwrap();
+            assert_eq!(proof.calculate_root(&hashes[4]), expected_root);
+            assert_eq!(proof.branch.len(), 3);
+            assert_eq!(proof.path_bitmap, 0b00000011);
+            let branch = proof.branch();
+            assert_eq!(branch[0], hashes[5]);
             assert_eq!(branch[1], h23);
             assert_eq!(branch[2], h01);
             assert_eq!(branch.len(), 3);
@@ -583,7 +716,6 @@ mod test {
             let hash = Hash::from_str("fa58575f7d1d377709f1621fac98c758860ca6dc5f2262be9ce5fd131c370d1a").unwrap();
             let proof = create_merkle_proof(tx_hashes, &hash).unwrap();
 
-            assert_eq!(proof.depth, 4);
             assert_eq!(proof.path_bitmap, 0b00001111);
 
             assert_eq!(proof.calculate_root(&hash), expected_root);
@@ -611,7 +743,7 @@ mod test {
             let hash = tx_hashes.last().unwrap();
             let proof = create_merkle_proof(&tx_hashes, hash).unwrap();
 
-            assert_eq!(proof.depth, 16);
+            assert_eq!(proof.branch.len(), 16);
             assert_eq!(proof.path_bitmap, 0b1111_1111_1111_1111);
 
             assert_eq!(proof.calculate_root(hash), expected_root);
@@ -631,6 +763,15 @@ mod test {
             let buf = &mut buf.as_slice();
             assert_eq!(proof, MerkleProof::deserialize(buf).unwrap());
             assert_eq!(buf, &[1, 2, 3]);
+        }
+
+        #[tokio::test]
+        async fn test_borsh_de_serialization_too_large() {
+            // We dont care about the actual merkle tree here, just that its not too large on the varint size
+            // We lie about the size to try and get a mem panic, and say this merkle tree is u64::max large.
+            let buf = vec![255, 255, 255, 255, 255, 255, 255, 255, 255, 1, 49, 8, 2, 5, 6];
+            let buf = &mut buf.as_slice();
+            assert!(MerkleProof::deserialize(buf).is_err());
         }
     }
 }

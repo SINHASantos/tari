@@ -31,8 +31,9 @@ use tari_comms::{
     peer_manager::{node_id::NodeIdError, PeerManagerError},
 };
 use tari_comms_dht::store_forward::StoreAndForwardError;
+use tari_contacts::contacts_service::error::ContactsServiceError;
 use tari_core::transactions::transaction_components::TransactionError;
-use tari_key_manager::error::KeyManagerError;
+use tari_key_manager::{error::KeyManagerError, key_manager_service::KeyManagerServiceError};
 use tari_p2p::{initialization::CommsInitializationError, services::liveness::error::LivenessError};
 use tari_service_framework::{reply_channel::TransportChannelError, ServiceInitializationError};
 use tari_utilities::{hex::HexError, ByteArrayError};
@@ -40,8 +41,7 @@ use thiserror::Error;
 
 use crate::{
     base_node_service::error::BaseNodeServiceError,
-    contacts_service::error::ContactsServiceError,
-    key_manager_service::KeyManagerServiceError,
+    connectivity_service::WalletConnectivityError,
     output_manager_service::error::OutputManagerError,
     storage::database::DbKey,
     transaction_service::error::TransactionServiceError,
@@ -91,7 +91,7 @@ pub enum WalletError {
     #[error("Transaction Error: {0}")]
     TransactionError(#[from] TransactionError),
     #[error("Byte array error")]
-    ByteArrayError(#[from] tari_utilities::ByteArrayError),
+    ByteArrayError(String),
     #[error("Utxo Scanner Error: {0}")]
     UtxoScannerError(#[from] UtxoScannerError),
     #[error("Key manager error: `{0}`")]
@@ -102,9 +102,18 @@ pub enum WalletError {
     TransportChannelError(#[from] TransportChannelError),
     #[error("Unexpected API Response while calling method `{method}` on `{api}`")]
     UnexpectedApiResponse { method: String, api: String },
+    #[error("Public address not set for this wallet")]
+    PublicAddressNotSet,
+    #[error("Wallet connectivity error: `{0}`")]
+    WalletConnectivityError(#[from] WalletConnectivityError),
 }
 
-pub const LOG_TARGET: &str = "tari::application";
+pub const LOG_TARGET: &str = "minotari::application";
+impl From<ByteArrayError> for WalletError {
+    fn from(err: ByteArrayError) -> Self {
+        Self::ByteArrayError(err.to_string())
+    }
+}
 
 impl From<WalletError> for ExitError {
     fn from(err: WalletError) -> Self {
@@ -137,6 +146,8 @@ pub enum WalletStorageError {
     DatabaseMigrationError(String),
     #[error("Value not found: `{}`", .0.to_key_string())]
     ValueNotFound(DbKey),
+    #[error("Burnt proof not found: `{0}`")]
+    BurntProofNotFound(u32),
     #[error("Unexpected result: `{0}`")]
     UnexpectedResult(String),
     #[error("Blocking task spawn error: `{0}`")]
@@ -146,7 +157,7 @@ pub enum WalletStorageError {
     #[error("The storage path was invalid unicode or not supported by the host OS")]
     InvalidUnicodePath,
     #[error("Hex error: `{0}`")]
-    HexError(#[from] HexError),
+    HexError(String),
     #[error("Invalid Encryption Cipher was provided to database")]
     InvalidEncryptionCipher,
     #[error("Invalid passphrase was provided")]
@@ -158,7 +169,7 @@ pub enum WalletStorageError {
     #[error("Wallet db is already encrypted and cannot be encrypted until the previous encryption is removed")]
     AlreadyEncrypted,
     #[error("Byte array error: `{0}`")]
-    ByteArrayError(#[from] ByteArrayError),
+    ByteArrayError(String),
     #[error("Cannot acquire exclusive file lock, another instance of the application is already running")]
     CannotAcquireFileLock,
     #[error("Database file cannot be a root path")]
@@ -173,6 +184,20 @@ pub enum WalletStorageError {
     KeyManagerError(#[from] KeyManagerError),
     #[error("Recovery Seed Error: {0}")]
     RecoverySeedError(String),
+    #[error("Bad encryption version: `{0}`")]
+    BadEncryptionVersion(String),
+}
+
+impl From<HexError> for WalletStorageError {
+    fn from(err: HexError) -> Self {
+        WalletStorageError::HexError(err.to_string())
+    }
+}
+
+impl From<ByteArrayError> for WalletStorageError {
+    fn from(e: ByteArrayError) -> Self {
+        WalletStorageError::ByteArrayError(e.to_string())
+    }
 }
 
 impl From<WalletStorageError> for ExitError {
